@@ -89,6 +89,9 @@ export const roomIdParam = idParam('roomId', 'Room id')
 /** The `:subRoomId` path parameter. */
 export const subRoomIdParam = idParam('subRoomId', 'Subroom id (globally unique, not per-room)')
 
+/** The `:saveId` path parameter — a `subroom_save` id (globally unique, not per-subroom). */
+export const saveIdParam = idParam('saveId', 'The save’s id, as `…/saves` lists it')
+
 /** The `:playerId` path parameter (an account id). */
 export const playerIdParam = idParam('playerId', 'The account whose list to read')
 
@@ -159,6 +162,11 @@ export const LoadScreenDto = z.object({
  * from the PascalCase `CurrentSave` embedded in a room (no persistence/OM/UGC versions,
  * no moderation state, no asset arrays; but `unityAsset`/`unityAssetHash`/`dataBlobHash`
  * that `CurrentSave` doesn't show). The two are deliberately not unified.
+ *
+ * Also what `GET …/subrooms/{subRoomId}/saves/{saveId}` answers — one save fetched by id
+ * is the same thing the save that created it returned, so both go through
+ * `toSaveResponse`. Note the `…/saves` LIST is the third shape here: it serves the raw
+ * PascalCase rows ({@link SubRoomDataSaveDto}), not this.
  */
 export const SubRoomDataSaveResponseDto = z.object({
 	subRoomDataSaveId: z.int(),

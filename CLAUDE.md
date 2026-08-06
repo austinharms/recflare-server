@@ -102,6 +102,9 @@ inconsistency here without checking the client first.
   `…/saves` is real history and `publish_save` doubles as restore-a-save. `…/saves` is
   auth-gated and CREATOR-only (not co-owners) — it lists unpublished staged saves. There
   is no `GET …/subrooms/:sid/data`; only the POST (the room save) exists on that path.
+  `GET …/saves/:saveId` is the detail behind a list row, under the same creator-only gate,
+  but in the CAMELCASE projection the room save's response uses — not the PascalCase rows
+  the list serves. Three shapes of one save; keep them straight.
 - A room save writes ONLY to the subroom and its save row — never to the room. Everything
   the body carries describes that one revision: `Description` is the save comment shown in
   `…/saves`, and `PersistenceVersion`/`InventionUsage` describe the scene just saved (the

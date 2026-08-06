@@ -29,6 +29,7 @@ import {
 	getRoomsByIds,
 	getSimilarRooms,
 	getSubRoomPermissions,
+	getSubRoomSaveById,
 	getSubRoomSaves,
 	getVisitedRooms,
 	modifySubRoom,
@@ -92,10 +93,12 @@ import {
 	RoomLookup,
 	RoomResultEnvelope,
 	RoomSaveEnvelope,
+	saveIdParam,
 	SaveSubRoomDataRequest,
 	ServiceStatus,
 	stringQuery,
 	SubRoomAccessibilityRequest,
+	SubRoomDataSaveResponseDto,
 	subRoomIdParam,
 	SubRoomPermissionsRequest,
 	SubRoomSavesPage,
@@ -1926,6 +1929,52 @@ const app = new Hono<App>()
 			const page = saves.slice(from, Number.isNaN(take) || take < 0 ? undefined : from + take)
 
 			return c.json({ Results: page, TotalResults: saves.length, TotalCount: saves.length })
+		}
+	)
+
+	// One of a subroom's saves by id — the detail behind a row of the `…/saves` list.
+	// Same gate as that list (auth-gated, creator-only): a save id resolves whether or not
+	// it was ever published, so this exposes the same unpublished work the list does.
+	.get(
+		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves/:saveId{[0-9]+}',
+		describeRoute({
+			tags: ['Subrooms'],
+			summary: 'One of a subroom’s saves by id',
+			description: [
+				'A single save, in the SAME camelCase projection the room save that created it',
+				'returned — not the PascalCase rows `…/saves` lists. Save ids are globally',
+				'unique but resolved scoped to the subroom, so one subroom cannot read another’s',
+				'save by guessing an id: a save that belongs elsewhere is a 404, same as an unknown',
+				'one.',
+				'',
+				'Creator-only, like the list it details — a save id resolves whether or not it was',
+				'ever published, so this reads unpublished work.',
+			].join(' '),
+			security: AUTHED,
+			parameters: [roomIdParam, subRoomIdParam, saveIdParam],
+			responses: {
+				200: json(SubRoomDataSaveResponseDto, 'The save'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
+				404: { description: 'No such room, subroom, or save on that subroom' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const roomId = Number.parseInt(c.req.param('roomId'), 10)
+			const subRoomId = Number.parseInt(c.req.param('subRoomId'), 10)
+			const saveId = Number.parseInt(c.req.param('saveId'), 10)
+
+			// Scoped through the room, like the list, so a subroom id from another room can't
+			// be used to read its saves.
+			const room = await getRoomById(c.env.DB, roomId)
+			if (!room || !findSubRoom(room, subRoomId)) return c.notFound()
+			if (room.CreatorAccountId !== accountId) return c.body(null, 403)
+
+			const save = await getSubRoomSaveById(c.env.DB, subRoomId, saveId)
+			return save ? c.json(toSaveResponse(save)) : c.notFound()
 		}
 	)
 

@@ -2593,6 +2593,57 @@ describe('rooms endpoints', () => {
 		).toBe(403)
 	})
 
+	it('GET /rooms/:id/subrooms/:sid/saves/:saveId is the detail behind a history row', async () => {
+		const get = async (path: string, sub?: string) =>
+			SELF.fetch(`${ORIGIN}${path}`, sub === undefined ? {} : { headers: await bearer(sub) })
+
+		// Pick a real save off the history the previous test paged.
+		const list = (await (await get('/rooms/2/subrooms/2/saves', '1')).json()) as {
+			Results: Array<{ SubRoomDataSaveId: number; DataBlob: string; Description: string }>
+		}
+		const row = list.Results[0]!
+
+		const res = await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`, '1')
+		expect(res.status).toBe(200)
+		// The camelCase projection the room save returns — NOT the PascalCase row the list
+		// serves. Same field set, exactly: no persistence/OM/UGC versions, no asset arrays.
+		expect(await res.json()).toEqual({
+			subRoomDataSaveId: row.SubRoomDataSaveId,
+			subRoomId: 2,
+			unityAssetId: null,
+			unityAsset: null,
+			unityAssetHash: null,
+			dataBlob: row.DataBlob,
+			dataBlobHash: null,
+			savedByAccountId: expect.any(Number),
+			savedOnPlatform: 0,
+			savedOnDeviceClass: 0,
+			description: row.Description,
+			createdAt: expect.any(String),
+		})
+
+		// Unknown save, and a save that exists but belongs to ANOTHER subroom (ids are
+		// global, so an unscoped lookup would happily resolve this one) — both 404.
+		expect((await get('/rooms/2/subrooms/2/saves/99999', '1')).status).toBe(404)
+		const foreign = (
+			(await subRoomOf(5, 5)) as unknown as { CurrentSave: { SubRoomDataSaveId: number } }
+		).CurrentSave.SubRoomDataSaveId
+		expect((await get(`/rooms/2/subrooms/2/saves/${foreign}`, '1')).status).toBe(404)
+		// …and it does resolve on its own subroom, so the 404 above is the scoping, not a
+		// missing row.
+		expect((await get(`/rooms/5/subrooms/5/saves/${foreign}`, '1')).status).toBe(200)
+
+		// Unknown room or subroom is a 404 too (the LIST answers an empty page instead).
+		expect((await get('/rooms/99999/subrooms/2/saves/1', '1')).status).toBe(404)
+		expect((await get('/rooms/2/subrooms/99999/saves/1', '1')).status).toBe(404)
+
+		// Same gate as the list it details: 401 unauthed, 403 for a non-creator, and 403
+		// even for a co-owner — it reads unpublished saves.
+		expect((await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`)).status).toBe(401)
+		expect((await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`, '999')).status).toBe(403)
+		expect((await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`, '2')).status).toBe(403)
+	})
+
 	it('GET /openapi.json documents every route', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -2640,6 +2691,7 @@ describe('rooms endpoints', () => {
 			'GET /rooms/{roomId}/playerdata/me',
 			'GET /rooms/{roomId}/similar',
 			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves',
+			'GET /rooms/{roomId}/subrooms/{subRoomId}/saves/{saveId}',
 			'GET /roomserver/rooms/createdby/me',
 			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
