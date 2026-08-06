@@ -1376,6 +1376,15 @@ describe('rooms endpoints', () => {
 		})
 		expect(await envOf(await authed(2, 9999, '1'))).toMatchObject({ success: false })
 
+		// The room's own fields are read first: a save is a revision of a SUBROOM and must
+		// leave them alone. `Description` in the body is the save comment, not the room's
+		// description — that is `PUT /rooms/:id/description`'s to set.
+		const before = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
+			Description: string
+			PersistenceVersion: number
+		}
+		expect(before.Description).not.toBe('mydescription here')
+
 		// Owner saves → 200. `value` carries BOTH the updated room and the new save, and
 		// `error` is null (not ''). This fixture sends `AutoPublish: true`, so it goes live.
 		const ok = await authed(2, 2, '1')
@@ -1390,7 +1399,7 @@ describe('rooms endpoints', () => {
 		}
 		expect(saved.success).toBe(true)
 		expect(saved.error).toBeNull()
-		expect(saved.value.room).toMatchObject({ RoomId: 2, Description: 'mydescription here' })
+		expect(saved.value.room).toMatchObject({ RoomId: 2, Description: before.Description })
 
 		// The save is a camelCase projection, NOT the PascalCase CurrentSave shape.
 		expect(saved.value.subRoomDataSave).toEqual({
@@ -1430,6 +1439,7 @@ describe('rooms endpoints', () => {
 				SubRoomDataSaveId: number
 				SavedByAccountId: number
 				PersistenceVersion: number
+				Description: string
 				UnitySubAssets: unknown[]
 				Tags: unknown[]
 			}
@@ -1446,13 +1456,18 @@ describe('rooms endpoints', () => {
 		expect(sub.CurrentSave.SubRoomDataSaveId).toBeGreaterThan(0)
 		expect(sub.StagedSubRoomDataSaveId).toBeNull()
 
-		// Room-level fields land on the room too.
+		// The save comment and the scene fields land on the SUBROOM's revision, and the
+		// room's own fields are untouched — a save must never rewrite the room.
+		expect(sub.CurrentSave.Description).toBe('mydescription here')
+		expect(sub).toMatchObject({ PersistenceVersion: 41, InventionUsage: 'CAE=' })
 		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
 			Description: string
 			PersistenceVersion: number
+			InventionUsage?: string
 		}
-		expect(room.Description).toBe('mydescription here')
-		expect(room.PersistenceVersion).toBe(41)
+		expect(room.Description).toBe(before.Description)
+		expect(room.PersistenceVersion).toBe(before.PersistenceVersion)
+		expect(room.InventionUsage).toBeUndefined()
 
 		// A CoOwner (account 2 holds Role 30 in the seeded rooms) may also save — 200
 		// with the room envelope. The creator stays account 1 (not clobbered).

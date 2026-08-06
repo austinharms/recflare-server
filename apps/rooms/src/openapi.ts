@@ -238,6 +238,7 @@ export const SubRoomDto = z.object({
 	RoomDataBlob: z.string().optional().describe('Uploaded room-data key; absent until first save'),
 	DataSavedAt: z.string().optional().describe('ISO timestamp of the last save'),
 	PersistenceVersion: z.int().optional(),
+	InventionUsage: z.string().optional().describe('Recorded by a room save; absent until then'),
 })
 
 /** A room's localization settings — carried through verbatim; nothing localizes yet. */
@@ -310,7 +311,10 @@ export const RoomDto = z.object({
 	PromoExternalContent: z.array(z.unknown()),
 	LoadScreens: z.array(LoadScreenDto),
 	RestrictedCircuitsAllowListNames: z.array(z.string()),
-	InventionUsage: z.string().optional().describe('Recorded by a room save; absent until then'),
+	InventionUsage: z
+		.string()
+		.optional()
+		.describe('Legacy: room saves used to write this here; it now lives on the SUBROOM'),
 })
 
 /** A paged room list (`PagedResultsDTO<RoomDTO>`) — search, hot, similar. */
@@ -598,9 +602,12 @@ export const SaveSubRoomDataRequest = z.object({
 		.object({ Filename: z.string() })
 		.optional()
 		.describe('The uploaded room-level data blob — becomes `RoomDataBlob`'),
-	Description: z.string().optional().describe('The save comment; also written to the ROOM'),
-	PersistenceVersion: z.int().optional(),
-	InventionUsage: z.string().optional().describe('Written to the room'),
+	Description: z
+		.string()
+		.optional()
+		.describe('The save comment — a description of THIS revision, not the room’s description'),
+	PersistenceVersion: z.int().optional().describe('Recorded on the save and the subroom'),
+	InventionUsage: z.string().optional().describe('Recorded on the subroom'),
 	UnityAssetId: z.string().nullable().optional().describe('Recorded on the save when set'),
 	AutoPublish: z
 		.boolean()

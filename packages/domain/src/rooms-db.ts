@@ -447,6 +447,11 @@ export interface SaveSubRoomDataInput {
 	subRoomDataHash?: string
 	/** Uploaded blob key for the room-level METADATA blob (a separate upload). */
 	roomDataFilename?: string
+	/**
+	 * The save comment — a description of THIS revision, typed into the client's save box.
+	 * It belongs to the save (and shows up in the `…/saves` history); it is not the room's
+	 * public description, which only `PUT /rooms/:id/description` sets.
+	 */
 	description?: string
 	persistenceVersion?: number
 	inventionUsage?: string
@@ -561,9 +566,10 @@ function legacySubRoomSave(sub: SubRoom): SubRoomDataSave | null {
 }
 
 /**
- * Persist a room-save against a specific subroom and record the room-level fields the
- * save carries. Returns the updated (hydrated) room AND the save that was just created —
- * the route answers with both — or null when the room or subroom doesn't exist.
+ * Persist a room-save against a specific subroom. Everything the save carries belongs to
+ * that subroom's revision — nothing is written to the room. Returns the updated
+ * (hydrated) room AND the save that was just created — the route answers with both — or
+ * null when the room or subroom doesn't exist.
  *
  * Whether the save goes live is the client's call: `AutoPublish: true` publishes it
  * outright, otherwise it becomes the subroom's `staged_save_id` with the live
@@ -619,7 +625,7 @@ export async function saveSubRoomData(
 				input.persistenceVersion ?? (typeof priorVersion === 'number' ? priorVersion : 0),
 			savedByAccountId: accountId,
 			// The save comment — empty string, not null, when the save carries none (the
-			// reference's `roomDesc ?? ""`). Also written to the room below.
+			// reference's `roomDesc ?? ""`).
 			description: input.description ?? '',
 			createdAt: new Date().toISOString(),
 			unityAssetId: input.unityAssetId,
@@ -629,11 +635,15 @@ export async function saveSubRoomData(
 	if (input.roomDataFilename) sub.RoomDataBlob = input.roomDataFilename
 	sub.DataSavedAt = new Date().toISOString()
 	if (input.persistenceVersion !== undefined) sub.PersistenceVersion = input.persistenceVersion
+	if (input.inventionUsage !== undefined) sub.InventionUsage = input.inventionUsage
 
-	// Room-level fields carried by the save.
-	if (typeof input.description === 'string') room.Description = input.description
-	if (input.persistenceVersion !== undefined) room.PersistenceVersion = input.persistenceVersion
-	if (input.inventionUsage !== undefined) room.InventionUsage = input.inventionUsage
+	// Nothing here touches the ROOM. A room save is a revision of one SUBROOM, and every
+	// field it carries describes that revision: `Description` is the save comment shown in
+	// the `…/saves` history, `PersistenceVersion` and `InventionUsage` describe the scene
+	// just saved. They used to be copied onto the room as well, which meant each save
+	// silently replaced the room's public description with the save comment. The room's own
+	// fields are edited through their own routes (`PUT /rooms/:id/description` and
+	// friends), so the room row is not rewritten here at all.
 
 	// Publish outright when the client asked to (`AutoPublish`), or for a dorm — a dorm is
 	// the player's own private space with no publish step in the client, so staging one
@@ -653,7 +663,6 @@ export async function saveSubRoomData(
 		db
 			.prepare('UPDATE subroom SET data = ?2 WHERE sub_room_id = ?1')
 			.bind(subRoomId, serializeSubRoom(sub, roomId)),
-		db.prepare('UPDATE room SET data = ?2 WHERE room_id = ?1').bind(roomId, serializeRoom(room)),
 	])
 
 	// Re-hydrate so the returned room reflects the just-saved subroom.

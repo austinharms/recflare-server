@@ -102,6 +102,12 @@ inconsistency here without checking the client first.
   `…/saves` is real history and `publish_save` doubles as restore-a-save. `…/saves` is
   auth-gated and CREATOR-only (not co-owners) — it lists unpublished staged saves. There
   is no `GET …/subrooms/:sid/data`; only the POST (the room save) exists on that path.
+- A room save writes ONLY to the subroom and its save row — never to the room. Everything
+  the body carries describes that one revision: `Description` is the save comment shown in
+  `…/saves`, and `PersistenceVersion`/`InventionUsage` describe the scene just saved (the
+  latter lives on the SUBROOM). The room's public description is `PUT /rooms/:id/description`'s
+  alone; copying the save comment onto `room.Description` (as this once did) silently
+  replaces the room's description every time someone saves.
 - Matchmaking (`match`: `/matchmake/room/:roomId/:subRoomId`) always serves the PUBLISHED
   `CurrentSave` blob, creator included. Joining a private instance, the client itself asks
   the owner whether to load the latest or the published version and resolves it from the

@@ -1931,9 +1931,9 @@ const app = new Hono<App>()
 
 	// Save a subroom's data (room save). Auth-gated (401 with empty body). Editable
 	// by the room creator or a Creator/CoOwner role holder. Points the subroom at
-	// the uploaded data blobs and records the room-level save fields, notifies the
-	// owner, and returns the updated ROOM in the lowercase `{ success, error, value }`
-	// envelope the reference's SetRoomData uses.
+	// the uploaded data blobs and records the revision's fields against that SUBROOM,
+	// notifies the owner, and returns the updated ROOM in the lowercase
+	// `{ success, error, value }` envelope the reference's SetRoomData uses.
 	.post(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/data',
 		describeRoute({
@@ -1941,10 +1941,11 @@ const app = new Hono<App>()
 			summary: 'Save a subroom’s data (room save)',
 			description: [
 				'Records a save against the subroom from the blobs the client has already uploaded',
-				'through the `storage` worker; the room-level fields it carries (`Description`,',
-				'`PersistenceVersion`, `InventionUsage`) are written to the room. Editable by the',
-				'room’s creator or a co-owner (403 otherwise); a missing token is an EMPTY-body 401,',
-				'unlike the other room writes.',
+				'through the `storage` worker. Everything the body carries describes THAT revision',
+				'and lands on the save and its subroom — `Description` is the save comment, NOT the',
+				'room’s description (only `PUT /rooms/{roomId}/description` sets that). Nothing here',
+				'writes to the room. Editable by the room’s creator or a co-owner (403 otherwise); a',
+				'missing token is an EMPTY-body 401, unlike the other room writes.',
 				'',
 				'`AutoPublish: true` makes the save live immediately. Otherwise it is STAGED: it',
 				'lands on `StagedSubRoomDataSaveId` with the live `CurrentSave` untouched, so',
