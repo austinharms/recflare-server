@@ -50,6 +50,33 @@ async function bearer(sub: string, roles?: string[]): Promise<Record<string, str
 	return { Authorization: `Bearer ${signingInput}.${b64url(sig)}` }
 }
 
+/**
+ * Put a player in a room, the way the `match` heartbeat would — the save routes read this
+ * to decide whether a non-creator may see the room's history. `expired` writes a row that
+ * has already lapsed, which reads back as no presence at all.
+ */
+async function putInRoom(
+	accountId: number,
+	roomId: number,
+	{ expired = false }: { expired?: boolean } = {}
+): Promise<void> {
+	const now = Math.floor(Date.now() / 1000)
+	await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+		.bind(
+			JSON.stringify({
+				accountId,
+				roomInstance: { roomInstanceId: 1000000 + roomId, roomId, subRoomId: roomId },
+				expiresAt: expired ? now - 1 : now + 900,
+			})
+		)
+		.run()
+}
+
+/** Take a player back out of whatever room they were in. */
+async function clearPresence(accountId: number): Promise<void> {
+	await env.DB.prepare('DELETE FROM presence WHERE account_id = ?1').bind(accountId).run()
+}
+
 // Apply the schema + seed the imported rooms into the test D1 (mirrors the migrations).
 beforeAll(async () => {
 	// Seed the shared JWT signing key into the local Secrets Store so .get() resolves.
@@ -2579,18 +2606,41 @@ describe('rooms endpoints', () => {
 		})
 		expect(await empty.json()).toEqual({ Results: [], TotalResults: 0, TotalCount: 0 })
 
-		// The list exposes unpublished saves, so it is owner-only: no token → 401, and a
-		// valid token that isn't the room's creator → 403.
+		// The list exposes unpublished saves, so it isn't public: no token → 401, and a
+		// valid token from someone who is neither the creator nor in the room → 403. Account
+		// 2 is a co-owner (Role 30 on the seeded rooms) and is refused too — holding a role
+		// grants nothing here; being in the room does (see below).
 		expect((await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`)).status).toBe(401)
 		expect(
 			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('999') }))
 				.status
 		).toBe(403)
-		// Even a co-owner (account 2 holds Role 30 on the seeded rooms) is refused.
 		expect(
 			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('2') }))
 				.status
 		).toBe(403)
+
+		// …but a player standing IN the room reads it: the client resolves which version to
+		// load from this list, so a visitor who can't read it can't load the instance.
+		await putInRoom(999, 2)
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('999') }))
+				.status
+		).toBe(200)
+		// Presence in a DIFFERENT room is not presence in this one.
+		await putInRoom(999, 5)
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('999') }))
+				.status
+		).toBe(403)
+		// And the grant lasts only as long as the presence does — an expired row reads as
+		// absent, so the visitor is refused again the moment they leave.
+		await putInRoom(999, 2, { expired: true })
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/2/subrooms/2/saves`, { headers: await bearer('999') }))
+				.status
+		).toBe(403)
+		await clearPresence(999)
 	})
 
 	it('GET /rooms/:id/subrooms/:sid/saves/:saveId is the detail behind a history row', async () => {
@@ -2637,11 +2687,17 @@ describe('rooms endpoints', () => {
 		expect((await get('/rooms/99999/subrooms/2/saves/1', '1')).status).toBe(404)
 		expect((await get('/rooms/2/subrooms/99999/saves/1', '1')).status).toBe(404)
 
-		// Same gate as the list it details: 401 unauthed, 403 for a non-creator, and 403
-		// even for a co-owner — it reads unpublished saves.
-		expect((await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`)).status).toBe(401)
-		expect((await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`, '999')).status).toBe(403)
-		expect((await get(`/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`, '2')).status).toBe(403)
+		// Same gate as the list it details: 401 unauthed, 403 for someone who is neither the
+		// creator nor in the room (a co-owner included) — it reads unpublished saves.
+		const detail = `/rooms/2/subrooms/2/saves/${row.SubRoomDataSaveId}`
+		expect((await get(detail)).status).toBe(401)
+		expect((await get(detail, '999')).status).toBe(403)
+		expect((await get(detail, '2')).status).toBe(403)
+		// A player standing in the room reads it, for as long as they're there.
+		await putInRoom(999, 2)
+		expect((await get(detail, '999')).status).toBe(200)
+		await clearPresence(999)
+		expect((await get(detail, '999')).status).toBe(403)
 	})
 
 	it('GET /openapi.json documents every route', async () => {

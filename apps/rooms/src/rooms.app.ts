@@ -159,6 +159,7 @@ const MAKER_PEN_ACCOUNT_IDS = new Set([1, 2, 3])
  */
 interface PresenceView {
 	roomInstanceId?: number
+	roomId?: number
 	subRoomId?: number
 }
 
@@ -241,6 +242,31 @@ async function handlePhotonAccessToken(c: Context<App>) {
 			? await getSubRoomPermissions(c.env.DB, instance.subRoomId)
 			: []
 	return c.json(photonAccessToken(accountId, instance?.roomInstanceId ?? null, overrides))
+}
+
+/**
+ * May this caller read the room's saves? The room's creator always may. So may anyone
+ * whose live presence puts them IN the room: they are already loading its scene, and the
+ * client resolves which version to load — the published one or the creator's latest — from
+ * the save list, so refusing everyone but the creator leaves a visitor unable to load what
+ * the instance is actually running.
+ *
+ * Presence is the shared `presence` table the `match` heartbeat maintains, so this grant
+ * lasts only as long as the player is actually there (rows carry an absolute expiry and
+ * expired ones don't read back). Co-owners get nothing extra from being co-owners — a
+ * co-owner standing in the room passes because of where they are, not what they hold.
+ *
+ * The presence read only happens for a non-creator, so the owner's own path stays one query.
+ */
+async function canReadSaves(
+	c: Context<App>,
+	room: Record<string, unknown>,
+	roomId: number,
+	accountId: number
+): Promise<boolean> {
+	if (room.CreatorAccountId === accountId) return true
+	const instance = (await getPresence<PresenceView>(c.env.DB, accountId))?.roomInstance
+	return instance?.roomId === roomId
 }
 
 /** The Bearer token's account id (`sub`), or null when there's no valid token. */
@@ -1874,8 +1900,8 @@ const app = new Hono<App>()
 
 	// A subroom's saved-data versions — the room-history / "restore a save" list. Every
 	// save is its own `subroom_save` row (nothing is overwritten), so this is real
-	// history, newest first, paged by skip/take. Auth-gated (401) and creator-only (403):
-	// the list exposes unpublished saves, which only the owner is entitled to see.
+	// history, newest first, paged by skip/take. Auth-gated (401), and readable by the
+	// room's creator or anyone whose presence puts them in the room (see `canReadSaves`).
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves',
 		describeRoute({
@@ -1887,9 +1913,11 @@ const app = new Hono<App>()
 				'only when the subroom has never been saved.',
 				'`unityAssetTarget`/`unityAssetVersion` are accepted and ignored.',
 				'',
-				'Owner-only (403 otherwise) — the list includes STAGED saves that were never',
-				'published, so it is not public. It is what the client reads to offer the owner',
-				'“load the latest or the published version?” when they enter a private instance.',
+				'The list includes STAGED saves that were never published, so it is not public:',
+				'the room’s creator may read it, and so may anyone standing IN the room (their live',
+				'presence says so). Anyone else is a 403. It is what the client reads to resolve',
+				'“load the latest or the published version?” on entering a private instance — a',
+				'visitor who cannot read it cannot load what the instance is running.',
 				'',
 				'`TotalResults` and `TotalCount` carry the same number: the client’s paged DTO and',
 				'the reference disagree on the name, so both are emitted.',
@@ -1920,7 +1948,7 @@ const app = new Hono<App>()
 			if (!room || !findSubRoom(room, subRoomId)) {
 				return c.json({ Results: [], TotalResults: 0, TotalCount: 0 })
 			}
-			if (room.CreatorAccountId !== accountId) return c.body(null, 403)
+			if (!(await canReadSaves(c, room, roomId, accountId))) return c.body(null, 403)
 			const saves = await getSubRoomSaves(c.env.DB, subRoomId)
 
 			const skip = Number.parseInt(c.req.query('skip') ?? '', 10)
@@ -1933,8 +1961,8 @@ const app = new Hono<App>()
 	)
 
 	// One of a subroom's saves by id — the detail behind a row of the `…/saves` list.
-	// Same gate as that list (auth-gated, creator-only): a save id resolves whether or not
-	// it was ever published, so this exposes the same unpublished work the list does.
+	// Same gate as that list: a save id resolves whether or not it was ever published, so
+	// this exposes the same unpublished work, to the same readers.
 	.get(
 		'/rooms/:roomId{[0-9]+}/subrooms/:subRoomId{[0-9]+}/saves/:saveId{[0-9]+}',
 		describeRoute({
@@ -1947,8 +1975,9 @@ const app = new Hono<App>()
 				'save by guessing an id: a save that belongs elsewhere is a 404, same as an unknown',
 				'one.',
 				'',
-				'Creator-only, like the list it details — a save id resolves whether or not it was',
-				'ever published, so this reads unpublished work.',
+				'Gated like the list it details — the room’s creator, or anyone whose presence puts',
+				'them in the room. A save id resolves whether or not it was ever published, so this',
+				'reads unpublished work.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [roomIdParam, subRoomIdParam, saveIdParam],
@@ -1971,7 +2000,7 @@ const app = new Hono<App>()
 			// be used to read its saves.
 			const room = await getRoomById(c.env.DB, roomId)
 			if (!room || !findSubRoom(room, subRoomId)) return c.notFound()
-			if (room.CreatorAccountId !== accountId) return c.body(null, 403)
+			if (!(await canReadSaves(c, room, roomId, accountId))) return c.body(null, 403)
 
 			const save = await getSubRoomSaveById(c.env.DB, subRoomId, saveId)
 			return save ? c.json(toSaveResponse(save)) : c.notFound()
