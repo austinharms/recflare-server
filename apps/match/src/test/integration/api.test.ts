@@ -11,6 +11,7 @@ import { beforeAll, describe, expect, test } from 'vitest'
 import {
 	countPlayersInInstance,
 	createRoomInstance,
+	EMPTY_INSTANCE_GRACE_SECONDS,
 	GAME_VERSION,
 	getRoomInstance,
 	PRESENCE_SCHEMA_DDL,
@@ -731,14 +732,15 @@ describe('auth-gated endpoints', () => {
 		expect(await stale.text()).toBe('')
 	})
 
-	// Seed presence directly into D1 with a chosen `expiresAt` (epoch seconds) so the
-	// TTL-refresh branch can be exercised deterministically (independent of timing).
-	const seedPresence = (id: number, expiresAt: number) =>
+	// Seed presence directly into D1 with a chosen instance and `expiresAt` (epoch
+	// seconds), so the TTL branches can be exercised deterministically (independent of
+	// timing) and a player can be planted in an instance without matchmaking there.
+	const seedPresenceInInstance = (id: number, roomInstanceId: number, expiresAt: number) =>
 		env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
 			.bind(
 				JSON.stringify({
 					accountId: id,
-					roomInstance: { roomInstanceId: 1000042, roomId: 1 },
+					roomInstance: { roomInstanceId, roomId: 1 },
 					statusVisibility: 0,
 					deviceClass: 0,
 					vrMovementMode: 1,
@@ -748,6 +750,9 @@ describe('auth-gated endpoints', () => {
 				})
 			)
 			.run()
+
+	const seedPresence = (id: number, expiresAt: number) =>
+		seedPresenceInInstance(id, 1000042, expiresAt)
 
 	const storedExpiresAt = async (id: number): Promise<number> => {
 		const row = await env.DB.prepare('SELECT data FROM presence WHERE account_id = ?1')
@@ -792,24 +797,9 @@ describe('auth-gated endpoints', () => {
 
 	test('countPlayersInInstance counts live players in a room instance (excludes expired)', async () => {
 		// Three players in instance 1000099 — two live, one expired.
-		const seedInInstance = (id: number, expiresAt: number) =>
-			env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
-				.bind(
-					JSON.stringify({
-						accountId: id,
-						roomInstance: { roomInstanceId: 1000099, roomId: 2 },
-						statusVisibility: 0,
-						deviceClass: 0,
-						vrMovementMode: 1,
-						platform: 0,
-						appVersion: GAME_VERSION,
-						expiresAt,
-					})
-				)
-				.run()
-		await seedInInstance(710, nowSeconds() + 800)
-		await seedInInstance(711, nowSeconds() + 800)
-		await seedInInstance(712, nowSeconds() - 10) // already expired → not counted
+		await seedPresenceInInstance(710, 1000099, nowSeconds() + 800)
+		await seedPresenceInInstance(711, 1000099, nowSeconds() + 800)
+		await seedPresenceInInstance(712, 1000099, nowSeconds() - 10) // expired → not counted
 		expect(await countPlayersInInstance(env.DB, 1000099)).toBe(2)
 		expect(await countPlayersInInstance(env.DB, 999999)).toBe(0)
 	})
@@ -870,6 +860,89 @@ describe('auth-gated endpoints', () => {
 		// Expired row gone, and the instance is joinable again.
 		expect(await countPresenceRows(824)).toBe(0)
 		expect((await getRoomInstance(env.DB, solo))?.isFull).toBe(false)
+	})
+
+	// Age an instance past EMPTY_INSTANCE_GRACE_SECONDS by backdating its `createdAt`
+	// (the generated `created_at` column follows the blob), so the empty-instance sweep
+	// can be exercised without waiting out the grace window.
+	const backdateInstance = (id: number, secondsAgo = EMPTY_INSTANCE_GRACE_SECONDS + 60) =>
+		env.DB.prepare(
+			"UPDATE room_instance SET data = json_set(data, '$.createdAt', ?2) WHERE id = ?1"
+		)
+			.bind(id, new Date(Date.now() - secondsAgo * 1000).toISOString())
+			.run()
+
+	const expirePresence = (accountId: number) =>
+		env.DB.prepare(
+			"UPDATE presence SET data = json_set(data, '$.expiresAt', ?2) WHERE account_id = ?1"
+		)
+			.bind(accountId, nowSeconds() - 10)
+			.run()
+
+	test('the cron sweep deletes instances nobody is left standing in', async () => {
+		// Two instances built directly rather than by matchmaking, so neither is one a
+		// previous test's player is still standing in (public matchmakes reuse instances).
+		// One holds a player who crashed out — an expired row the sweep purges first,
+		// leaving the instance empty — the other a live player.
+		const abandoned = await createRoomInstance(env.DB, {
+			ownerAccountId: 830,
+			roomId: 2,
+			photonRoomId: 'abandoned-instance',
+			maxCapacity: 12,
+		})
+		await seedPresenceInInstance(830, abandoned.roomInstanceId, nowSeconds() - 10)
+		const occupied = await createRoomInstance(env.DB, {
+			ownerAccountId: 831,
+			roomId: 2,
+			photonRoomId: 'occupied-instance',
+			maxCapacity: 12,
+		})
+		await seedPresenceInInstance(831, occupied.roomInstanceId, nowSeconds() + 800)
+		await backdateInstance(abandoned.roomInstanceId)
+		await backdateInstance(occupied.roomInstanceId)
+
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		expect(await getRoomInstance(env.DB, abandoned.roomInstanceId)).toBeNull()
+		expect(await getRoomInstance(env.DB, occupied.roomInstanceId)).not.toBeNull()
+	})
+
+	test('the cron sweep spares a freshly created instance nobody has joined yet', async () => {
+		// The instance and its creator's presence are written by the same request but not
+		// atomically — a sweep landing in between must not delete the instance the player
+		// is being handed. `createdAt` is left alone, so it's inside the grace window.
+		const fresh = await createRoomInstance(env.DB, {
+			ownerAccountId: 832,
+			roomId: 2,
+			photonRoomId: 'fresh-instance',
+			maxCapacity: 12,
+		})
+
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		expect(await getRoomInstance(env.DB, fresh.roomInstanceId)).not.toBeNull()
+	})
+
+	test('the cron sweep spares an empty dorm instance', async () => {
+		// A dorm is backed by one persistent instance so its Photon room id survives
+		// re-entry — it sits empty whenever the owner is anywhere else.
+		const headers = await bearer('833')
+		const dorm = (await (
+			await exports.default.fetch(`${ORIGIN}/matchmake/dorm`, { method: 'POST', headers })
+		).json()) as { roomInstance: { roomInstanceId: number } }
+		const dormInstanceId = dorm.roomInstance.roomInstanceId
+		await expirePresence(833)
+		await backdateInstance(dormInstanceId)
+
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		expect(await getRoomInstance(env.DB, dormInstanceId)).not.toBeNull()
 	})
 
 	test('player/login and exclusivelogin preserve presence', async () => {

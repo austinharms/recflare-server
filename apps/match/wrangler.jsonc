@@ -16,9 +16,10 @@
 		}
 	],
 	// Presence sweep. Rows expire on their own TTL (15m) and reads already ignore
-	// expired ones, so this is housekeeping: it purges them and recomputes the
-	// fullness of the instances the departed players were in (a crashed player never
-	// matchmakes out, so nothing else notices they left). Every 5 minutes.
+	// expired ones, so this is housekeeping: it purges them, deletes the room
+	// instances left with nobody in them, and recomputes the fullness of the
+	// instances the departed players were in (a crashed player never matchmakes out,
+	// so nothing else notices they left). Every 5 minutes.
 	"triggers": {
 		"crons": ["*/5 * * * *"]
 	},

@@ -6,6 +6,7 @@ import {
 	areFriends,
 	canManageRoom,
 	createRoomInstance,
+	deleteEmptyRoomInstances,
 	deleteExpiredPresence,
 	deletePresence,
 	GAME_VERSION,
@@ -1475,24 +1476,33 @@ const app = new Hono<App>()
 	)
 
 /**
- * Cron: sweep presence that has aged past its TTL. Reads already ignore expired rows,
- * so this isn't about correctness of `/player` — it's that a player who crashed or
- * hard-quit never matchmakes out of their instance, so nothing recomputes that
- * instance's fullness and it can stay flagged full (and unjoinable) with nobody in it.
- * Recompute the instances the expiring rows point at, *then* delete: the sweep is the
- * only thing that notices those departures. Fullness is recomputed after the delete so
- * the head-count no longer sees them.
+ * Cron: sweep presence that has aged past its TTL, then the instances left empty.
+ *
+ * The presence purge isn't about correctness of `/player` — reads already ignore
+ * expired rows. It's that a player who crashed or hard-quit never matchmakes out of
+ * their instance, so nothing recomputes that instance's fullness and it can stay
+ * flagged full (and unjoinable) with nobody in it. Note the instances the expiring
+ * rows point at *before* deleting: the sweep is the only thing that notices those
+ * departures.
+ *
+ * Emptying an instance is what makes it garbage — nothing ever reuses it, and a
+ * joiner handed one would land alone in a Photon room everyone left — so the empty
+ * sweep runs next. It reads presence without consulting expiry, so it depends on
+ * running after the purge above: this order is what makes a lapsed row count as a
+ * departure. Fullness is recomputed last, so it works from the final head-count and
+ * skips (returns null for) the instances just deleted.
  */
 async function sweepExpiredPresence(env: Env): Promise<void> {
 	const staleInstanceIds = await getExpiredPresenceInstanceIds(env.DB)
 	const removed = await deleteExpiredPresence(env.DB)
+	const emptyInstanceIds = await deleteEmptyRoomInstances(env.DB)
 	for (const instanceId of staleInstanceIds) {
 		await refreshInstanceFullness(env.DB, instanceId)
 	}
 	// The tagged logger is request-scoped (its middleware never runs for a cron), so
 	// log plainly here — Workers observability picks it up either way.
 	console.log(
-		`presence sweep: removed ${removed} expired rows, refreshed ${staleInstanceIds.length} instances`
+		`presence sweep: removed ${removed} expired rows, deleted ${emptyInstanceIds.length} empty instances, refreshed ${staleInstanceIds.length} instances`
 	)
 }
 
@@ -1513,7 +1523,8 @@ app.get(
 						'Room backend. Rooms and room instances are D1-backed (matchmaking finds or creates a',
 						'`room_instance` per session); presence — the instance each player is currently in —',
 						'lives in the shared `presence` table and expires on a TTL. A cron sweep clears',
-						'expired presence and frees up instances a crashed player never left.',
+						'expired presence, frees up instances a crashed player never left, and deletes',
+						'instances nobody is standing in any more.',
 					].join('\n'),
 				},
 				servers: [{ url: 'https://match.recflare.net', description: 'Production' }],
