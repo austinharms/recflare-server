@@ -1250,9 +1250,9 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Toggle a tag on a room. Auth-gated (401) and owner-only. Body is the `tag`
-	// form field. There's no delete/patch endpoint, so this call toggles: it adds
-	// the tag (Type 0) if absent and removes it if present. The "main" tags
+	// Toggle a tag on a room. Auth-gated (401) and owner/co-owner-only (403). Body is
+	// the `tag` form field. There's no delete/patch endpoint, so this call toggles: it
+	// adds the tag (Type 0) if absent and removes it if present. The "main" tags
 	// (#pvp/#quest/#game/#hangout/#art) are radio buttons — setting one clears the
 	// others. Returns the `{ success, error, value }` envelope with the updated
 	// room as `value`; business failures are 200 with success:false.
@@ -1262,11 +1262,11 @@ const app = new Hono<App>()
 			tags: ['Room settings'],
 			summary: 'Toggle a tag on a room',
 			description: [
-				'Owner-only. There is no delete/patch counterpart, so this call TOGGLES: it adds the',
-				'tag (Type 0) when absent and removes it when present. The “main” tags',
-				'(`pvp`/`quest`/`game`/`hangout`/`art`) behave as radio buttons — setting one clears',
-				'the others. Answers the lowercase envelope with the updated room, which the client',
-				're-renders from.',
+				'Owner or co-owner only (403 otherwise). There is no delete/patch counterpart, so',
+				'this call TOGGLES: it adds the tag (Type 0) when absent and removes it when',
+				'present. The “main” tags (`pvp`/`quest`/`game`/`hangout`/`art`) behave as radio',
+				'buttons — setting one clears the others. Answers the lowercase envelope with the',
+				'updated room, which the client re-renders from.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [roomIdParam],
@@ -1274,6 +1274,7 @@ const app = new Hono<App>()
 			responses: {
 				200: json(RoomEnvelope, 'The updated room, or a rejection with `success: false`'),
 				401: UNAUTHORIZED_RESPONSE,
+				403: FORBIDDEN_RESPONSE,
 			},
 		}),
 		async (c) => {
@@ -1283,9 +1284,9 @@ const app = new Hono<App>()
 			const roomId = Number.parseInt(c.req.param('roomId'), 10)
 			const room = await getRoomById(c.env.DB, roomId)
 			if (!room) return roomEnvelope(c, null, 'This room does not exist!')
-			if (room.CreatorAccountId !== accountId) {
-				return roomEnvelope(c, null, 'You are not the owner of this room!')
-			}
+			// A valid token but not the room's owner/co-owner → 403 (the auth gate above
+			// already returned 401 for a missing/invalid token).
+			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
 			const tag = typeof body.tag === 'string' ? body.tag.trim() : ''

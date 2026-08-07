@@ -1743,7 +1743,7 @@ describe('rooms endpoints', () => {
 		expect(clone.CurrentSave!.SubRoomId).toBe(clone.SubRoomId)
 	})
 
-	it('PUT /rooms/:id/tags is auth-gated, owner-only, and toggles (add/remove)', async () => {
+	it('PUT /rooms/:id/tags is auth-gated, owner/co-owner-only, and toggles (add/remove)', async () => {
 		// The lowercase `{ success, error, value }` envelope this endpoint returns.
 		type TagResult = {
 			success: boolean
@@ -1755,11 +1755,8 @@ describe('rooms endpoints', () => {
 
 		// No token → 401.
 		expect((await putForm('/rooms/2/tags', { tag: 'quest' })).status).toBe(401)
-		// Not the owner → failure envelope.
-		expect(await envOf(await putForm('/rooms/2/tags', { tag: 'quest' }, '999'))).toMatchObject({
-			success: false,
-			error: 'You are not the owner of this room!',
-		})
+		// A valid token but no role on the room → 403.
+		expect((await putForm('/rooms/2/tags', { tag: 'quest' }, '999')).status).toBe(403)
 		// Unknown room → failure envelope.
 		expect(await envOf(await putForm('/rooms/99999/tags', { tag: 'quest' }, '1'))).toMatchObject({
 			success: false,
@@ -1795,6 +1792,11 @@ describe('rooms endpoints', () => {
 		const off = await envOf(await putForm('/rooms/2/tags', { tag: 'quest' }, '1'))
 		expect(tagsIn(off)).not.toContain('quest')
 		expect(tagsIn(off)).toContain('campfire')
+
+		// The co-owner (account 2, Role 30) may edit tags too.
+		const byCoOwner = await envOf(await putForm('/rooms/2/tags', { tag: 'spooky' }, '2'))
+		expect(byCoOwner).toMatchObject({ success: true, error: '' })
+		expect(tagsIn(byCoOwner)).toContain('spooky')
 	})
 
 	it('PUT /rooms/:id/name is auth-gated, owner-only, unique, and persists', async () => {
