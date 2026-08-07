@@ -69,18 +69,17 @@ function unauthorized(c: Context<App>) {
 const DEFAULT_USERNAME_CHANGES = 1
 
 /**
- * Username-change result envelope: `{ success, error, value }`. On success `value` is
- * the updated account; on a refusal `error` carries the message and `value` is an empty
- * string.
+ * Username-change result envelope: `{ success, error, value }`, always HTTP 200.
+ * On success `value` is the updated account; on error `error` carries the message
+ * and `value` is an empty string.
  *
- * A refusal is a 400. The body shape is unchanged — anything reading `error` still
- * works — but it used to come back at HTTP 200, which meant a caller keying off the
- * status read every refusal as a success. That envelope-at-200 was the reference's
- * (`RecNet`) convention and is kept by `POST /account/create`; here it was traded for a
- * status a client can actually branch on.
+ * The envelope-at-200 is the reference's (`RecNet`) convention — a refusal is a
+ * successful call that answers "no", and the player-facing sentence rides in `error`.
+ * `POST /account/create` does the same. This was briefly a 400 so a caller could branch
+ * on the status; it isn't, because that's not what the real service does.
  */
 function usernameResult(c: Context<App>, error = '', value: unknown = '') {
-	return c.json({ success: error === '', error, value }, error === '' ? 200 : 400)
+	return c.json({ success: error === '', error, value })
 }
 
 /** Read a single string field from a form-urlencoded / multipart body. */
@@ -461,8 +460,7 @@ const app = new Hono<App>()
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(UsernameResult, 'The updated account, in the result envelope'),
-				400: json(UsernameResult, 'Refused — `error` carries the reason, `value` is ""'),
+				200: json(UsernameResult, 'Result envelope (success or a validation error)'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
