@@ -257,7 +257,8 @@ app.get(
 						'`recflare-img` bucket; extensionless ones are `storage` uploads and come from the',
 						'shared `recflare-cdn` bucket under its `image/` prefix. Optional center-crop and resize',
 						'run through the Photon WASM codec; `?sig=p1` adds the RSA-SHA1 `Content-Signature`',
-						'header the client verifies against `KEY:RSA:p1.rec.net`.',
+						'header the client verifies against `KEY:RSA:p1.rec.net`, when the',
+						'`IMG_SIGNING_ENABLED` flag is on (it is off by default).',
 						'',
 						'Note that this worker only serves bytes: the image metadata the client lists (the',
 						'`SavedImage` records behind `/api/images/...`) lives in the `api` worker, which',
@@ -345,8 +346,10 @@ app.get(
 				description: [
 					'`p1` RSA-SHA1 signs the response body and returns it as',
 					'`Content-Signature: key-id=KEY:RSA:p1.rec.net; data=<base64>`. Signed over the',
-					'bytes actually returned, i.e. the resized body when a transform applies. Omitted',
-					'when the worker has no `IMG_SIGNING_KEY`.',
+					'bytes actually returned, i.e. the resized body when a transform applies.',
+					'Signing is off by default (it costs the streaming fast path): the param is',
+					'ignored, and no header returned, unless the worker sets `IMG_SIGNING_ENABLED`',
+					'and has an `IMG_SIGNING_KEY`.',
 				].join(' '),
 				schema: { type: 'string', enum: ['p1'] },
 			},
@@ -369,7 +372,12 @@ app.get(
 		const key = c.req.param('key')
 		if (key.includes('..')) return c.body(null, 400)
 
-		const wantsSignature = c.req.query('sig') === 'p1'
+		// Signing is this worker's dominant CPU cost: it forces the whole object
+		// through the isolate (`arrayBuffer()` instead of streaming `object.body`)
+		// and pays a SHA-1 over the full body plus an RSA-2048 private-key operation
+		// on every edge-cache miss. Nothing verifies the header today, so `?sig=p1`
+		// is ignored unless IMG_SIGNING_ENABLED turns it back on.
+		const wantsSignature = c.env.IMG_SIGNING_ENABLED === true && c.req.query('sig') === 'p1'
 		const transform = parseTransform(
 			c.req.query('width'),
 			c.req.query('height'),

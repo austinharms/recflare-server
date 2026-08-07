@@ -54,6 +54,12 @@
 	"vars": {
 		"ENVIRONMENT": "development", // overridden during deployment
 		"SENTRY_RELEASE": "unknown", // overridden during deployment
+		// Feature flag for `?sig=p1` response signing. OFF: signing buffers the whole
+		// object into the isolate instead of streaming it from R2, then pays a SHA-1
+		// over the full body plus an RSA-2048 private-key op on every edge-cache miss.
+		// Nothing verifies the `Content-Signature` header today. Flip to true (and set
+		// a real IMG_SIGNING_KEY) if something ever needs to.
+		"IMG_SIGNING_ENABLED": false,
 		// RSA-2048 private key (PKCS8 DER, base64) used to sign image responses
 		// requested with ?sig=p1. This is an INSECURE DEV KEY committed for local
 		// dev / tests — override in production with `wrangler secret put IMG_SIGNING_KEY`.

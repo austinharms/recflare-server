@@ -15,12 +15,25 @@ key:
   honours `?sig=p1` and returns a `Content-Signature` header.
 - `GET /<key>?sig=p1` — same, but the response body is RSA-SHA1 signed and the
   signature returned in a `Content-Signature: key-id=KEY:RSA:p1.rec.net; data=<base64>`
-  header. The client uses this to verify image integrity. Signing buffers the
-  whole object.
+  header. The client uses this to verify image integrity. **Off by default** —
+  see below.
 
 The bucket is bound in the Worker as `env.IMAGES` (see `wrangler.jsonc`).
 
-## Response signing key
+## Response signing
+
+Signing is behind the `IMG_SIGNING_ENABLED` var in `wrangler.jsonc`, and it is
+**`false`**. It is the worker's dominant CPU cost: signing has to buffer the
+whole object into the isolate rather than streaming it out of R2, then hash the
+full body with SHA-1 and run an RSA-2048 private-key operation — on every request
+the edge cache misses. Nothing verifies the header today, so with the flag off
+`?sig=p1` is accepted and ignored, and untransformed images stream through
+untouched.
+
+Flip the var to `true` to turn it back on. (Resizes still buffer regardless — the
+Photon codec needs the whole image.)
+
+### Signing key
 
 `?sig=p1` signs with the RSA-2048 key in `env.IMG_SIGNING_KEY` (PKCS8 DER,
 base64). `wrangler.jsonc` ships an **insecure dev key** for local dev / tests;

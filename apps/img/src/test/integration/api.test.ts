@@ -1,8 +1,8 @@
 import { PhotonImage } from '@cf-wasm/photon'
-import { env, SELF } from 'cloudflare:test'
+import { createExecutionContext, env, SELF, waitOnExecutionContext } from 'cloudflare:test'
 import { beforeAll, describe, expect, it } from 'vitest'
 
-import '../../img.app'
+import app from '../../img.app'
 
 import type { Env } from '../../context'
 
@@ -186,6 +186,25 @@ describe('img endpoints', () => {
 	it('does not sign without ?sig=p1', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/${R2_KEY}`)
 		expect(res.headers.get('content-signature')).toBeNull()
+	})
+
+	it('ignores ?sig=p1 when IMG_SIGNING_ENABLED is off', async () => {
+		// The deployed default (see wrangler.jsonc): the param is accepted but does
+		// nothing, so the object streams straight from R2 instead of being buffered,
+		// hashed and RSA-signed. Vitest binds the flag ON, so override it here.
+		const ctx = createExecutionContext()
+		const res = await app.fetch(
+			new Request(`${ORIGIN}/${R2_KEY}?sig=p1`),
+			{ ...env, IMG_SIGNING_ENABLED: false },
+			ctx
+		)
+		await waitOnExecutionContext(ctx)
+
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-signature')).toBeNull()
+		// Unsigned responses keep the source etag, and the body is untouched.
+		expect(res.headers.get('etag')).toBeTruthy()
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(IMAGE_BYTES)
 	})
 
 	it('resizes a static asset to ?width, preserving aspect ratio', async () => {

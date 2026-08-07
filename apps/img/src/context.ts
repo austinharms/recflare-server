@@ -19,6 +19,13 @@ export type Env = SharedHonoEnv & {
 	 * requested with `?sig=p1`. Optional — when absent, responses are unsigned.
 	 */
 	IMG_SIGNING_KEY?: string
+	/**
+	 * Feature flag for response signing. `?sig=p1` is honoured only when this is
+	 * true; when false (the default) the query param is ignored and the response
+	 * streams unsigned. Off by default because signing is this worker's dominant
+	 * CPU cost — see the `?sig=p1` handling in `img.app.ts`.
+	 */
+	IMG_SIGNING_ENABLED?: boolean
 }
 
 /** Variables can be extended */
