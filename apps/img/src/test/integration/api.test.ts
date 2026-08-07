@@ -38,6 +38,18 @@ const R2_KEY = 'user-photo.jpg'
 // upload — served from `recflare-cdn` under `image/`, not `recflare-img`.
 const CDN_NAME = '2028-06-01/12345-67890-12345'
 
+/**
+ * Fetch with real signing turned OFF — the deployed default. `vitest.config.ts`
+ * binds `IMG_SIGNING_ENABLED` on so the RSA path stays covered, so the placeholder
+ * path has to drive the app directly with an overridden env.
+ */
+async function unsignedFetch(url: string): Promise<Response> {
+	const ctx = createExecutionContext()
+	const res = await app.fetch(new Request(url), { ...env, IMG_SIGNING_ENABLED: false }, ctx)
+	await waitOnExecutionContext(ctx)
+	return res
+}
+
 beforeAll(async () => {
 	await env.IMAGES.put(R2_KEY, IMAGE_BYTES, {
 		httpMetadata: { contentType: 'image/jpeg' },
@@ -188,23 +200,46 @@ describe('img endpoints', () => {
 		expect(res.headers.get('content-signature')).toBeNull()
 	})
 
-	it('ignores ?sig=p1 when IMG_SIGNING_ENABLED is off', async () => {
-		// The deployed default (see wrangler.jsonc): the param is accepted but does
-		// nothing, so the object streams straight from R2 instead of being buffered,
-		// hashed and RSA-signed. Vitest binds the flag ON, so override it here.
-		const ctx = createExecutionContext()
-		const res = await app.fetch(
-			new Request(`${ORIGIN}/${R2_KEY}?sig=p1`),
-			{ ...env, IMG_SIGNING_ENABLED: false },
-			ctx
-		)
-		await waitOnExecutionContext(ctx)
-
+	it('returns a placeholder signature when IMG_SIGNING_ENABLED is off', async () => {
+		// The deployed default (see wrangler.jsonc). The header must still be there —
+		// the client requires it — but the value is derived from the key, so the body
+		// is neither buffered nor hashed and streams straight out of R2.
+		const res = await unsignedFetch(`${ORIGIN}/${R2_KEY}?sig=p1`)
 		expect(res.status).toBe(200)
-		expect(res.headers.get('content-signature')).toBeNull()
-		// Unsigned responses keep the source etag, and the body is untouched.
+
+		const header = res.headers.get('content-signature')
+		expect(header).toMatch(/^key-id=KEY:RSA:p1\.rec\.net; data=/)
+		// Same shape as a real RSA-2048 signature, so the client's parser sees no
+		// difference between the two modes.
+		const signature = Uint8Array.from(atob(header!.split('data=')[1]), (ch) => ch.charCodeAt(0))
+		expect(signature.length).toBe(256)
+		expect(signature.some((b) => b !== 0)).toBe(true)
+
+		// Still on the streaming path: the source etag survives and the bytes are the
+		// stored object, untouched.
 		expect(res.headers.get('etag')).toBeTruthy()
 		expect(new Uint8Array(await res.arrayBuffer())).toEqual(IMAGE_BYTES)
+	})
+
+	it('derives the placeholder signature from the key, stably', async () => {
+		const sigFor = async (path: string) =>
+			(await unsignedFetch(`${ORIGIN}/${path}?sig=p1`)).headers.get('content-signature')
+
+		// Stable for a key, so a cached response and a fresh one agree...
+		expect(await sigFor(R2_KEY)).toBe(await sigFor(R2_KEY))
+		// ...and distinct across keys, so it isn't a single hardcoded constant.
+		expect(await sigFor(R2_KEY)).not.toBe(await sigFor(CDN_NAME))
+	})
+
+	it('signs the fallback and resized bodies with a placeholder too', async () => {
+		// The fallback (missing key) and the transform path both go through
+		// serveStaticAsset/finalizeImage — the header must survive both.
+		const fallback = await unsignedFetch(`${ORIGIN}/missing.png?sig=p1`)
+		expect(fallback.headers.get('content-signature')).toMatch(/^key-id=KEY:RSA:p1\.rec\.net; /)
+
+		const resized = await unsignedFetch(`${ORIGIN}/RecCenter.jpg?width=512&sig=p1`)
+		expect(resized.headers.get('content-signature')).toMatch(/^key-id=KEY:RSA:p1\.rec\.net; /)
+		expect(jpegSize(new Uint8Array(await resized.arrayBuffer())).width).toBe(512)
 	})
 
 	it('resizes a static asset to ?width, preserving aspect ratio', async () => {

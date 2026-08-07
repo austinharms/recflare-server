@@ -20,10 +20,11 @@ export type Env = SharedHonoEnv & {
 	 */
 	IMG_SIGNING_KEY?: string
 	/**
-	 * Feature flag for response signing. `?sig=p1` is honoured only when this is
-	 * true; when false (the default) the query param is ignored and the response
-	 * streams unsigned. Off by default because signing is this worker's dominant
-	 * CPU cost — see the `?sig=p1` handling in `img.app.ts`.
+	 * Feature flag for REAL response signing. `?sig=p1` always returns a
+	 * `Content-Signature` header, but only when this is true is the value an
+	 * actual RSA-SHA1 signature over the body; when false (the default) it is a
+	 * cheap placeholder derived from the object key, which keeps the response on
+	 * the streaming path. See `stubSignature()` in `img.app.ts`.
 	 */
 	IMG_SIGNING_ENABLED?: boolean
 }
