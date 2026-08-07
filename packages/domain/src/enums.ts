@@ -68,6 +68,12 @@ export enum MessageType {
  * A room's (or image's) visibility, matching the client's `RoomAccessibility`. The
  * client declares the enum without explicit values, so these are its ordinals — and
  * it sends the NAME, not the number, on the subroom accessibility route.
+ *
+ * `Unlisted` is NOT a lesser `Public`: an unlisted room is open to anyone who has a
+ * link or an invite, it just doesn't surface in the catalogs (hot/search/
+ * recommendations/featured/similar, which all key on `Public`). `Private` is the
+ * unpublished state — a room its owner hasn't opened up at all, which is where a
+ * freshly cloned room starts.
  */
 export enum Accessibility {
 	Private = 0,

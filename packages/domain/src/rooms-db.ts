@@ -248,9 +248,10 @@ export async function isPlayerBannedFromRoom(
  * room's content (scene/subrooms/settings), assigning a fresh RoomId, the given
  * name, and the new owner. The clone starts with an empty tag set — the source's
  * tags (including the `base` template tag) do not carry over, so the owner tags the
- * clone from scratch — and `IsRRO` is cleared so the client doesn't render a virtual
- * "RRO" tag on it. Returns the new room, or null when the source isn't in D1 or
- * disallows cloning.
+ * clone from scratch — `IsRRO` is cleared so the client doesn't render a virtual
+ * "RRO" tag on it, and it starts PRIVATE rather than inheriting the source's
+ * visibility. Returns the new room, or null when the source isn't in D1 or disallows
+ * cloning.
  */
 export async function cloneRoom(
 	db: D1Database,
@@ -284,6 +285,11 @@ export async function cloneRoom(
 		// A user clone is not a Rec Room Original — clear the inherited flag, or the
 		// client renders a virtual "RRO" tag on the clone.
 		IsRRO: false,
+		// A brand-new room is unpublished: the owner publishes it by setting the room's
+		// accessibility. Inheriting the source's would put the clone straight into the
+		// public feeds (hot/search/recommendations/similar all key on Accessibility === 1)
+		// the moment it was made — every clone of a PUBLIC source, template or player room.
+		Accessibility: Accessibility.Private,
 		Roles: roles,
 		// A fresh room has no engagement of its own — don't inherit the source's counters
 		// (the derived ones are recomputed per read, but the clone is returned as-is here).

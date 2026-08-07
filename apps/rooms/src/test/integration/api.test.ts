@@ -181,6 +181,45 @@ describe('rooms endpoints', () => {
 		expect(other).toEqual([])
 	})
 
+	it('GET /rooms/ownedby|createdby/me lists the caller’s UNPUBLISHED rooms too', async () => {
+		// "My Rooms" is the owner's own list, not a catalog: it must show a room that
+		// isn't public yet, or a freshly created room (which starts Private — see
+		// cloneRoom) would be invisible to the person who just made it. Only the
+		// PUBLIC-facing `ownedby/:accountId` profile list filters on accessibility.
+		const headers = {
+			...(await bearer('804')),
+			'Content-Type': 'application/x-www-form-urlencoded',
+		}
+		await SELF.fetch(`${ORIGIN}/rooms/24/clone`, {
+			method: 'POST',
+			headers,
+			body: new URLSearchParams({ name: 'MyUnpublishedRoom' }).toString(),
+		})
+
+		const listOf = async (path: string) =>
+			(await (await SELF.fetch(`${ORIGIN}${path}`, { headers })).json()) as Array<{
+				Name: string
+				Accessibility: number
+			}>
+
+		for (const path of [
+			'/rooms/ownedby/me',
+			'/rooms/createdby/me',
+			'/roomserver/rooms/createdby/me',
+		]) {
+			const mine = await listOf(path)
+			const room = mine.find((r) => r.Name === 'MyUnpublishedRoom')
+			expect(room, `${path} must list the caller's unpublished room`).toBeDefined()
+			expect(room!.Accessibility).toBe(0)
+		}
+
+		// The same room is absent from the account's PUBLIC profile list.
+		const publicList = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/ownedby/804`)
+		).json()) as Array<{ Name: string }>
+		expect(publicList.some((r) => r.Name === 'MyUnpublishedRoom')).toBe(false)
+	})
+
 	it('GET /rooms/ownedby/:id returns an account public rooms (no auth)', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/rooms/ownedby/1`)
 		expect(res.status).toBe(200)
@@ -630,6 +669,7 @@ describe('rooms endpoints', () => {
 					CreatorAccountId: number
 					Tags?: Array<{ Tag: string }>
 					IsRRO: boolean
+					Accessibility: number
 					Roles: Array<{ AccountId: number; Role: number; InvitedRole: number }>
 				} | null
 			}
@@ -647,6 +687,8 @@ describe('rooms endpoints', () => {
 		expect(ok.value!.Tags).toEqual([])
 		// IsRRO is cleared so the client doesn't render a virtual "RRO" tag on the clone.
 		expect(ok.value!.IsRRO).toBe(false)
+		// A new room is unpublished: Private (0), never the source's visibility.
+		expect(ok.value!.Accessibility).toBe(0)
 		// Ownership is reset to the cloner: sole owner (Role 255), and none of the
 		// source base room's roles (accounts 1/2) carry over.
 		expect(ok.value!.Roles).toEqual([
@@ -663,6 +705,40 @@ describe('rooms endpoints', () => {
 		const dup = await post(24, 'MyMakerClone')
 		expect(dup).toMatchObject({ success: false, value: null })
 		expect(dup.error).toMatch(/already exists/i)
+	})
+
+	it('POST /rooms/:id/clone of a PUBLIC source stays out of the public feeds', async () => {
+		// Park (RoomId 25) is the one seeded base room that is itself public
+		// (Accessibility 1). Cloning used to inherit that, so a room appeared in
+		// hot/search/recommendations the instant it was created — before its owner had
+		// published anything.
+		const res = await SELF.fetch(`${ORIGIN}/rooms/25/clone`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('802')),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams({ name: 'ParkCloneUnpublished' }).toString(),
+		})
+		const { value } = (await res.json()) as { value: { RoomId: number; Accessibility: number } }
+		expect(value.Accessibility).toBe(0)
+
+		const namesIn = async (path: string) => {
+			const body = (await (await SELF.fetch(`${ORIGIN}${path}`)).json()) as
+				| { Results: Array<{ Name: string }> }
+				| Array<{ Name: string }>
+			return (Array.isArray(body) ? body : body.Results).map((r) => r.Name)
+		}
+		expect(await namesIn('/rooms/hot?take=200')).not.toContain('ParkCloneUnpublished')
+		expect(await namesIn('/rooms/hot?tag=new&take=200')).not.toContain('ParkCloneUnpublished')
+		expect(await namesIn('/rooms/recommendations?take=200')).not.toContain('ParkCloneUnpublished')
+		expect(await namesIn('/rooms/search?query=parkcloneunpublished')).not.toContain(
+			'ParkCloneUnpublished'
+		)
+
+		// Publishing it (owner sets Accessibility to Public) puts it in the feed.
+		await putForm('/rooms/' + value.RoomId + '/accessibility', { accessibility: '1' }, '802')
+		expect(await namesIn('/rooms/hot?take=200')).toContain('ParkCloneUnpublished')
 	})
 
 	it('POST /rooms/:id/clone requires auth (401, no account-1 fallback)', async () => {
