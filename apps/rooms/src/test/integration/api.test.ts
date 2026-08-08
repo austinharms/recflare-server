@@ -2066,7 +2066,8 @@ describe('rooms endpoints', () => {
 		expect(await searched()).toMatchObject({ CheerCount: 2, FavoriteCount: 1 })
 		expect(await direct()).toMatchObject({ CheerCount: 2, FavoriteCount: 1 })
 
-		// Clearing a cheer decrements it. Nothing records visits, so those stay 0.
+		// Clearing a cheer decrements it. Visits are counted by the `match` worker on
+		// matchmake and nobody has entered this room, so those stay 0.
 		await interact('562', 'cheer', 'DELETE')
 		expect(await direct()).toEqual({
 			CheerCount: 1,
@@ -2074,6 +2075,35 @@ describe('rooms endpoints', () => {
 			VisitorCount: 0,
 			VisitCount: 0,
 		})
+
+		// VisitCount is the `room.visits` column (what match bumps on each matchmake),
+		// served on every read of the room — here and in the search results — and it
+		// survives the cheer/favorite aggregation rather than being zeroed by it.
+		await env.DB.prepare('UPDATE room SET visits = 7 WHERE room_id = 15').run()
+		expect(await direct()).toEqual({
+			CheerCount: 1,
+			FavoriteCount: 1,
+			VisitorCount: 0,
+			VisitCount: 7,
+		})
+		expect(await searched()).toMatchObject({ VisitCount: 7 })
+
+		// A write to the room doesn't bake the count into the blob (nor reset it).
+		// Account 1 created room 15, so the description write is allowed.
+		const wrote = await SELF.fetch(`${ORIGIN}/rooms/15/description`, {
+			method: 'PUT',
+			headers: {
+				...(await bearer('1')),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams({ description: 'counted' }).toString(),
+		})
+		expect(wrote.status).toBe(200)
+		const blob = await env.DB.prepare('SELECT data FROM room WHERE room_id = 15').first<{
+			data: string
+		}>()
+		expect((JSON.parse(blob!.data) as { Stats: Stats }).Stats.VisitCount).toBe(0)
+		expect(await direct()).toMatchObject({ VisitCount: 7 })
 	})
 
 	it('DELETE /rooms/:id/interactionby/me/cheer clears the cheer (auth-gated, idempotent)', async () => {

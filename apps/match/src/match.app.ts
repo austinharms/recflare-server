@@ -26,6 +26,7 @@ import {
 	isClubMember,
 	isPlayerBannedFromRoom,
 	MessageType,
+	recordRoomVisit,
 	refreshInstanceFullness,
 	RoomInstanceType,
 	setPresence,
@@ -234,7 +235,8 @@ async function notifyFriendsPresence(c: Context<App>, playerId: number): Promise
 }
 
 /**
- * Store the room instance the player just matchmade into, preserving status.
+ * Store the room instance the player just matchmade into, preserving status, and count
+ * the visit against the room.
  *
  * With no live presence to carry forward (the player's first matchmake after login,
  * or one after their presence lapsed) the device fields would otherwise default —
@@ -259,6 +261,22 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 		// and the heartbeat can keep verifying against it.
 		loginLock: prev?.loginLock,
 	})
+
+	// Count the visit. Every matchmake route funnels through here with the instance the
+	// player landed in, and a matchmake is the only way into a room, so this is the one
+	// place a visit can be recorded once — whether they got here by room id, by subroom,
+	// by following a friend, from a club's clubhouse, or into their own dorm. Bumps the
+	// room's `visits` column, which is served as `Stats.VisitCount`. Best-effort: a
+	// counter is not worth failing the matchmake over.
+	try {
+		await recordRoomVisit(c.env.DB, roomInstance.roomId)
+	} catch (err) {
+		logger.error('failed to record room visit', {
+			roomId: roomInstance.roomId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+
 	// Keep the destination instance's is_full flag in sync with live presence (the
 	// player's own presence, just written, is counted). Then re-evaluate the
 	// instance they left — its head-count dropped — so a full room frees up when

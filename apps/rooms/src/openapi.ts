@@ -140,8 +140,10 @@ export const RoomTagDto = z.object({
 
 /**
  * A room's engagement counters. `CheerCount`/`FavoriteCount` are aggregated from the
- * per-player `interaction` rows on every read; nothing records visits yet, so
- * `VisitorCount`/`VisitCount` stay at 0.
+ * per-player `interaction` rows on every read. `VisitCount` is the room's lifetime
+ * visits — the `room.visits` column, bumped by the `match` worker on every successful
+ * matchmake into the room. Nothing records distinct visitors, so `VisitorCount` stays
+ * at 0.
  */
 export const RoomStatsDto = z.object({
 	CheerCount: z.int(),

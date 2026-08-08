@@ -278,6 +278,46 @@ describe('public endpoints', () => {
 		})
 	})
 
+	test('a matchmake counts a visit against the room', async () => {
+		const visits = async (roomId: number): Promise<number> =>
+			(await env.DB.prepare('SELECT visits FROM room WHERE room_id = ?1')
+				.bind(roomId)
+				.first<{ visits: number }>())!.visits
+		const enter = async (path: string, player: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}${path}`, {
+				method: 'POST',
+				headers: {
+					...(await bearer(player)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ JoinMode: '2' }).toString(),
+			})
+			expect(res.status).toBe(200)
+		}
+
+		// Counted per matchmake, whichever route got the player there — the two-segment
+		// room form and the subroom form both land in room 77.
+		const before = await visits(77)
+		await enter('/matchmake/room/77', '94')
+		expect(await visits(77)).toBe(before + 1)
+		await enter('/matchmake/room/77/35', '95')
+		expect(await visits(77)).toBe(before + 2)
+
+		// Same player entering again is another visit (VisitCount is visits, not visitors),
+		// and it's the entered room that's counted — not every room.
+		const otherBefore = await visits(2)
+		await enter('/matchmake/room/77', '94')
+		expect(await visits(77)).toBe(before + 3)
+		expect(await visits(2)).toBe(otherBefore)
+
+		// A refused matchmake counts nothing: an unknown room has no row to bump.
+		const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/99999`, {
+			method: 'POST',
+			headers: await bearer('96'),
+		})
+		expect(((await res.json()) as { errorCode: number }).errorCode).toBe(20)
+	})
+
 	test('POST /matchmake/room/:roomId seeds presence with the account device class', async () => {
 		// A screen player (deviceClass 2, recorded by auth at login) matchmaking with no
 		// live presence: without the account fallback they'd enter the room as deviceClass

@@ -28,7 +28,13 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		name TEXT GENERATED ALWAYS AS (json_extract(data, '$.Name')) VIRTUAL,
 		name_lower TEXT GENERATED ALWAYS AS (lower(json_extract(data, '$.Name'))) VIRTUAL,
 		creator_account_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.CreatorAccountId')) VIRTUAL,
-		is_dorm INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsDorm')) VIRTUAL
+		is_dorm INTEGER GENERATED ALWAYS AS (json_extract(data, '$.IsDorm')) VIRTUAL,
+		-- Lifetime visit counter (migrations/0011_room_visits.sql, which appends it here):
+		-- bumped once per successful matchmake into the room by {@link recordRoomVisit},
+		-- and served as the room's \`Stats.VisitCount\`. A real column rather than a field
+		-- in the blob so a visit is one atomic UPDATE that can't lose a concurrent
+		-- read-modify-write of the whole room.
+		visits INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_room_id ON room (room_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_rooms_name_lower ON room (name_lower)`,
@@ -853,10 +859,28 @@ export async function deleteSubRoom(
 
 interface RoomRow {
 	data: string
+	visits: number
 }
 
-const parseOne = (row: RoomRow | null): Room | null => (row ? (JSON.parse(row.data) as Room) : null)
-const parseAll = (rows: RoomRow[]): Room[] => rows.map((r) => JSON.parse(r.data) as Room)
+/**
+ * The columns every room read selects. `visits` is authoritative for the room's
+ * `Stats.VisitCount` (the blob keeps it at 0 — see {@link storedStats}), so it has to
+ * come back with the blob on every read; a join aliases them (`r.data AS data`).
+ */
+const ROOM_COLUMNS = 'data, visits'
+
+/**
+ * Parse a room row: the stored blob with the counters the columns own folded back in.
+ * `visits` is a real column, so a room read straight from the DB carries the live count.
+ */
+const parseRow = (row: RoomRow): Room => {
+	const room = JSON.parse(row.data) as Room
+	room.Stats = { ...storedStats(room.Stats), VisitCount: row.visits ?? 0 }
+	return room
+}
+
+const parseOne = (row: RoomRow | null): Room | null => (row ? parseRow(row) : null)
+const parseAll = (rows: RoomRow[]): Room[] => rows.map(parseRow)
 
 // ---- Subrooms -------------------------------------------------------------
 // Subrooms are their own table (globally-unique autoincrement `sub_room_id`); a
@@ -986,8 +1010,14 @@ async function attachSubRooms(db: D1Database, rooms: Room[]): Promise<void> {
 // A room's cheer/favorite counters are DERIVED from the `interaction` table rather than
 // stored: they're recomputed on every read, so a cheer shows up immediately and the
 // counts can't drift from the per-player rows they're made of. The blob keeps them at 0
-// (see {@link serializeRoom}). `VisitorCount`/`VisitCount` are left as the blob has them
-// — nothing records a visit yet, and `interaction.last_visited_at` is only stamped by the
+// (see {@link serializeRoom}).
+//
+// `VisitCount` is neither stored in the blob nor derived: it's the `room.visits` column,
+// incremented by {@link recordRoomVisit} on each matchmake and read back with the blob
+// (see {@link parseRow}). It can't be derived the way cheers are — a visit leaves no
+// per-player row to count — and it can't live in the blob, where a read-modify-write of
+// the whole room would drop concurrent visits. `VisitorCount` (distinct visitors) is
+// still left as the blob has it: `interaction.last_visited_at` is only stamped by the
 // cheer/favorite toggles, so counting those rows would report cheerers as visitors.
 
 /** One room's derived engagement counters (the aggregate maps below key these by RoomId). */
@@ -1012,13 +1042,23 @@ const STATS_ID_LIMIT = 90
 const roomIdOf = (room: Room): number => (typeof room.RoomId === 'number' ? room.RoomId : 0)
 
 /**
- * The `Stats` object to persist: whatever the room carried, with the derived counters
- * back at 0 so the blob never holds a stale copy of them.
+ * The `Stats` object to persist: whatever the room carried, with the counters the
+ * columns/tables own back at 0 so the blob never holds a stale copy of them.
  */
 function storedStats(stats: unknown): Record<string, unknown> {
 	const stored =
 		typeof stats === 'object' && stats !== null ? (stats as Record<string, unknown>) : {}
-	return { ...ZERO_STATS, ...stored, CheerCount: 0, FavoriteCount: 0 }
+	return { ...ZERO_STATS, ...stored, CheerCount: 0, FavoriteCount: 0, VisitCount: 0 }
+}
+
+/**
+ * Count one visit to a room — the `match` worker calls this on every successful
+ * matchmake (see its `enterRoom`), which is the only way a player ever lands in a room.
+ * A blind `visits = visits + 1` UPDATE: it's the whole write, so simultaneous visitors
+ * can't clobber each other, and an unknown room id simply matches nothing.
+ */
+export async function recordRoomVisit(db: D1Database, roomId: number): Promise<void> {
+	await db.prepare('UPDATE room SET visits = visits + 1 WHERE room_id = ?1').bind(roomId).run()
 }
 
 /**
@@ -1063,8 +1103,12 @@ async function attachStats(
 	const byRoom = stats ?? (await getRoomStats(db, [...new Set(rooms.map(roomIdOf))]))
 	for (const room of rooms) {
 		const counts = byRoom.get(roomIdOf(room))
+		// `storedStats` zeroes VisitCount (the blob doesn't own it), so carry over the
+		// value `parseRow` folded in from the `visits` column rather than losing it here.
+		const stats = (room.Stats ?? {}) as Record<string, unknown>
 		room.Stats = {
-			...storedStats(room.Stats),
+			...storedStats(stats),
+			VisitCount: typeof stats.VisitCount === 'number' ? stats.VisitCount : 0,
 			CheerCount: counts?.CheerCount ?? 0,
 			FavoriteCount: counts?.FavoriteCount ?? 0,
 		}
@@ -1384,7 +1428,10 @@ export async function getRoomById(db: D1Database, roomId: number): Promise<Room 
 	return hydrateRoom(
 		db,
 		parseOne(
-			await db.prepare('SELECT data FROM room WHERE room_id = ?1').bind(roomId).first<RoomRow>()
+			await db
+				.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE room_id = ?1`)
+				.bind(roomId)
+				.first<RoomRow>()
 		)
 	)
 }
@@ -1422,7 +1469,7 @@ export async function getRoomByName(db: D1Database, name: string): Promise<Room 
 		db,
 		parseOne(
 			await db
-				.prepare('SELECT data FROM room WHERE name_lower = ?1')
+				.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE name_lower = ?1`)
 				.bind(name.toLowerCase())
 				.first<RoomRow>()
 		)
@@ -1434,7 +1481,7 @@ export async function getRoomsByIds(db: D1Database, ids: number[]): Promise<Room
 	if (ids.length === 0) return []
 	const placeholders = ids.map((_, i) => `?${i + 1}`).join(',')
 	const { results } = await db
-		.prepare(`SELECT data FROM room WHERE room_id IN (${placeholders})`)
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE room_id IN (${placeholders})`)
 		.bind(...ids)
 		.all<RoomRow>()
 	return hydrateRooms(db, parseAll(results))
@@ -1443,7 +1490,7 @@ export async function getRoomsByIds(db: D1Database, ids: number[]): Promise<Room
 /** All rooms created by an account (e.g. their dorm). */
 export async function getRoomsByCreator(db: D1Database, accountId: number): Promise<Room[]> {
 	const { results } = await db
-		.prepare('SELECT data FROM room WHERE creator_account_id = ?1')
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE creator_account_id = ?1`)
 		.bind(accountId)
 		.all<RoomRow>()
 	return hydrateRooms(db, parseAll(results))
@@ -1490,7 +1537,7 @@ export async function getFavoritedRooms(
 ): Promise<Room[]> {
 	const { results } = await db
 		.prepare(
-			`SELECT r.data AS data
+			`SELECT r.data AS data, r.visits AS visits
 			 FROM interaction i
 			 JOIN room r ON r.room_id = i.room_id
 			 WHERE i.player_id = ?1 AND i.favorited = 1
@@ -1515,7 +1562,7 @@ export async function getVisitedRooms(
 ): Promise<Room[]> {
 	const { results } = await db
 		.prepare(
-			`SELECT r.data AS data
+			`SELECT r.data AS data, r.visits AS visits
 			 FROM interaction i
 			 JOIN room r ON r.room_id = i.room_id
 			 WHERE i.player_id = ?1 AND i.last_visited_at IS NOT NULL
@@ -1674,7 +1721,7 @@ export async function searchRooms(
 	if (q === '') return { Results: [], TotalResults: 0 }
 	const terms = q.split(/[\s+]+/).filter(Boolean)
 
-	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
+	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
 	let rooms = parseAll(results).filter((r) => r.IsDorm !== true && r.Accessibility === 1)
 
 	for (const term of terms) {
@@ -1745,7 +1792,7 @@ export async function getHotRooms(
 	skip: number,
 	take: number
 ): Promise<{ Results: Room[]; TotalResults: number }> {
-	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
+	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
 	let rooms = parseAll(results).filter(
 		(r) => r.IsDorm !== true && r.Accessibility === 1 && r.ExcludeFromLists !== true
 	)
@@ -1796,7 +1843,7 @@ export async function getRecommendedRooms(
 	skip: number,
 	take: number
 ): Promise<Room[]> {
-	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
+	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
 	const stats = await getRoomStats(db)
 	return hydrateRooms(
 		db,
@@ -1834,7 +1881,7 @@ export interface FeaturedRoomGroup {
  * Small dataset, so done in memory.
  */
 export async function getFeaturedRooms(db: D1Database): Promise<FeaturedRoomGroup> {
-	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
+	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
 	const rooms = parseAll(results).filter(
 		(r) => r.IsDorm !== true && r.Accessibility === 1 && r.ExcludeFromLists !== true
 	)
@@ -1881,7 +1928,7 @@ export async function getSimilarRooms(
 	const targetTags = new Set(roomTags(target))
 	if (targetTags.size === 0) return empty
 
-	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
+	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
 	const sharedCount = (r: Room): number => roomTags(r).filter((t) => targetTags.has(t)).length
 	const stats = await getRoomStats(db)
 
@@ -1917,7 +1964,7 @@ export async function getSimilarRooms(
  * array. Small dataset, so done in memory.
  */
 export async function getBaseRooms(db: D1Database, skip: number, take: number): Promise<Room[]> {
-	const { results } = await db.prepare('SELECT data FROM room').all<RoomRow>()
+	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
 	const base = new Set(['base'])
 	return hydrateRooms(
 		db,
@@ -1948,7 +1995,9 @@ export async function getDormRoom(db: D1Database, accountId: number): Promise<Ro
 		db,
 		parseOne(
 			await db
-				.prepare('SELECT data FROM room WHERE creator_account_id = ?1 AND is_dorm = 1 LIMIT 1')
+				.prepare(
+					`SELECT ${ROOM_COLUMNS} FROM room WHERE creator_account_id = ?1 AND is_dorm = 1 LIMIT 1`
+				)
 				.bind(accountId)
 				.first<RoomRow>()
 		)
