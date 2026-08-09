@@ -1,4 +1,4 @@
-export { RoomInstanceType, Accessibility, Role, MessageType } from './enums'
+export { RoomInstanceType, Accessibility, Role, MessageType, MatchmakingErrorCode } from './enums'
 export * from './accounts-db'
 export * from './clubs-db'
 export * from './images-db'

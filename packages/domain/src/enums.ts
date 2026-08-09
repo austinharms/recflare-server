@@ -84,6 +84,65 @@ export enum Accessibility {
 }
 
 /**
+ * The `errorCode` a matchmaking response carries, matching the client's
+ * `MatchmakingErrorCode`. `Success` (0) comes with an instance; every other code comes
+ * with a null one. The numbering is sparse — these are the client's declared values,
+ * gaps included, so don't renumber or fill them in.
+ *
+ * We only ever answer a few of these. Most refusals are deliberately opaque
+ * ({@link MatchmakingErrorCode.NoSuchRoom}), since telling someone a room exists but is
+ * closed to them leaks more than it helps; {@link MatchmakingErrorCode.BannedFromRoom}
+ * is the exception, because a banned player already knows the room is there. The rest
+ * are here so a code seen in a client log has a name.
+ */
+export enum MatchmakingErrorCode {
+	UnknownError = -1,
+	Success = 0,
+	NoSuchGame = 1,
+	PlayerNotOnline = 2,
+	InsufficientSpace = 3,
+	EventNotStarted = 4,
+	EventAlreadyFinished = 5,
+	BlockedFromRoom = 7,
+	JuniorNotAllowed = 11,
+	Banned = 12,
+	AlreadyInBestInstance = 13,
+	InsufficientRelationship = 14,
+	UpdateRequired = 16,
+	AlreadyInTargetInstance = 17,
+	UGCNotAllowed = 19,
+	NoSuchRoom = 20,
+	RoomIsNotActive = 22,
+	RoomBlockedByCreator = 23,
+	RoomIsPrivate = 25,
+	RoomInstanceIsPrivate = 26,
+	DeviceClassNotSupported = 30,
+	DeviceClassNotSupportedByRoomOwner = 31,
+	MovementModeNotSupportedByRoomOwner = 32,
+	EventIsPrivate = 35,
+	EventIsFull = 36,
+	RoomInviteExpired = 40,
+	NoAvailableRegion = 45,
+	NotorietyTooPoor = 50,
+	BannedFromRoom = 55,
+	NoSuchClub = 70,
+	ClubHasNoClubhouse = 71,
+	ClubIsNotActive = 73,
+	NotAMemberOfClub = 74,
+	BannedFromClub = 75,
+	InstanceJoinNotPermitted = 76,
+	LevelTooLow = 77,
+	ChatPartyInviteNotFound = 78,
+	ChatPartyInviteModerated = 79,
+	ChatMessageNotAnInvite = 80,
+	DeveloperOnly = 81,
+	RRPlusRequired = 82,
+	MetaJuniorAccountRestriction = 83,
+	NotExclusivelyLoggedIn = 84,
+	AccountDoesNotExist = 85,
+}
+
+/**
  * A room-role tier (the `Role` byte on a room's `Roles` entries), matching the
  * client's values. Host and Moderator are limited-permission helper tiers; CoOwner
  * and Creator are the owner-level tiers that may manage the room (see

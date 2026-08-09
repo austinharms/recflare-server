@@ -25,6 +25,7 @@ import {
 	getRoomInstanceSummariesByRoom,
 	isClubMember,
 	isPlayerBannedFromRoom,
+	MatchmakingErrorCode,
 	MessageType,
 	recordRoomVisit,
 	refreshInstanceFullness,
@@ -293,16 +294,16 @@ async function enterRoom(c: Context<App>, id: number, roomInstance: RoomInstance
 	await notifyFriendsPresence(c, id)
 }
 
-/** MatchmakingErrorCode.NoSuchRoom — returned when a room isn't in the DB. */
-const NO_SUCH_ROOM = 20
+/** Returned when a room isn't in the DB — and for every other opaque refusal. */
+const NO_SUCH_ROOM = MatchmakingErrorCode.NoSuchRoom
 
 /**
- * MatchmakingErrorCode for "you are banned from this room". Unlike the opaque
- * NoSuchRoom every other refusal answers, a banned player is told why: they already
- * know the room exists, so there's nothing to hide, and the client can say so instead
- * of showing a room that mysteriously fails to load.
+ * "You are banned from this room". Unlike the opaque NoSuchRoom every other refusal
+ * answers, a banned player is told why: they already know the room exists, so there's
+ * nothing to hide, and the client can say so instead of showing a room that
+ * mysteriously fails to load.
  */
-const BANNED_FROM_ROOM = 55
+const BANNED_FROM_ROOM = MatchmakingErrorCode.BannedFromRoom
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
@@ -513,8 +514,8 @@ async function inviteParty(
  * there (NoSuchRoom) from one the caller is banned from — those answer different codes.
  */
 type ResolvedInstance =
-	| { instance: RoomInstance; errorCode: 0 }
-	| { instance: null; errorCode: number }
+	| { instance: RoomInstance; errorCode: MatchmakingErrorCode.Success }
+	| { instance: null; errorCode: MatchmakingErrorCode }
 
 /**
  * Resolve a room by `:room` path segment (numeric id or name) from D1, then find a
@@ -584,7 +585,7 @@ async function resolveRoomInstance(
 			instance.photonRoomId,
 			f.subRoomId
 		),
-		errorCode: 0,
+		errorCode: MatchmakingErrorCode.Success,
 	}
 }
 
