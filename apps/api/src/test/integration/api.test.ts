@@ -2423,9 +2423,18 @@ describe('mutual friends', () => {
 
 describe('player events', () => {
 	const HOUR = 60 * 60 * 1000
-	/** Seconds precision, no milliseconds — the form the client sends and reads back. */
+	/**
+	 * Seconds precision, no milliseconds — the form the client sends and reads back.
+	 *
+	 * Anchored to one instant fixed when this suite is defined, NOT to `Date.now()` per
+	 * call: the same offset is evaluated once to build a fixture and again to assert what
+	 * came back, and a re-read clock makes those two strings differ by a second whenever
+	 * the pair straddles a second boundary. Offsets are whole hours, so pinning the anchor
+	 * leaves the upcoming/live/finished distinction the browse queries make intact.
+	 */
+	const NOW = Date.now()
 	const at = (offsetMs: number): string =>
-		new Date(Date.now() + offsetMs).toISOString().replace(/\.\d{3}Z$/, 'Z')
+		new Date(NOW + offsetMs).toISOString().replace(/\.\d{3}Z$/, 'Z')
 
 	const post = async (path: string, body: unknown, sub = '42'): Promise<Response> =>
 		exports.default.fetch(`${ORIGIN}${path}`, {
