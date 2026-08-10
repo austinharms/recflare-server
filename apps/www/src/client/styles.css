@@ -622,10 +622,6 @@ h2 {
 }
 
 .room {
-	display: grid;
-	grid-template-columns: 112px minmax(0, 1fr);
-	gap: 14px;
-	align-items: start;
 	padding-top: 12px;
 	border-top: 1px solid var(--line);
 }
@@ -634,6 +630,29 @@ h2 {
 .room:first-child {
 	padding-top: 0;
 	border-top: none;
+}
+
+/* The whole row is the link to the room's page, so the target is the size of the thing
+   you're aiming at rather than the name alone. Padded out to the card edge and pulled
+   back by the same amount, so the hover fill covers the row instead of stopping short. */
+.room-link {
+	display: grid;
+	grid-template-columns: 112px minmax(0, 1fr);
+	gap: 14px;
+	align-items: start;
+	margin: 0 -10px;
+	padding: 10px;
+	border-radius: 8px;
+	color: inherit;
+	text-decoration: none;
+}
+
+.room-link:hover {
+	background: var(--surface-hi);
+}
+
+.room-link:hover .room-name {
+	color: var(--accent);
 }
 
 /* Fixed 3:2 frame — room thumbnails are screenshots and arrive at any ratio, and a
@@ -705,6 +724,115 @@ h2 {
 	font-size: 0.8rem;
 	color: var(--muted);
 	font-variant-numeric: tabular-nums;
+}
+
+/* ---- One room's page ---------------------------------------------------- */
+
+/* The way back out, above the page's own heading. */
+.backlink {
+	margin: 0 0 16px;
+	font-size: 0.9rem;
+}
+
+.backlink a {
+	color: var(--muted);
+	text-decoration: none;
+}
+
+.backlink a:hover {
+	color: var(--text);
+}
+
+/* Wider thumbnail than the list's, and the name beside it rather than under: this is
+   the page about this one room, so the photo can carry some of the weight. */
+.room-hero {
+	display: grid;
+	grid-template-columns: 260px minmax(0, 1fr);
+	gap: 20px;
+	align-items: start;
+}
+
+.room-hero-img {
+	width: 100%;
+	aspect-ratio: 3 / 2;
+	object-fit: cover;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--surface-hi);
+}
+
+.room-hero-name {
+	font-family: var(--display);
+	font-weight: 700;
+	font-size: 1.5rem;
+	letter-spacing: -0.02em;
+	margin: 0;
+	overflow-wrap: anywhere;
+}
+
+.room-hero-desc {
+	margin: 10px 0 0;
+	overflow-wrap: anywhere;
+}
+
+/* Label/value pairs. A two-column grid rather than a list of "Label: value" lines, so
+   the values line up and the page can be read down one column. */
+.facts {
+	display: grid;
+	grid-template-columns: 150px minmax(0, 1fr);
+	gap: 8px 16px;
+	margin: 0;
+	font-size: 0.9rem;
+}
+
+.facts dt {
+	color: var(--muted);
+}
+
+.facts dd {
+	margin: 0;
+	overflow-wrap: anywhere;
+}
+
+.subrooms {
+	list-style: none;
+	margin: 18px 0 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 14px;
+}
+
+.subroom {
+	padding-top: 14px;
+	border-top: 1px solid var(--line);
+}
+
+.subroom:first-child {
+	padding-top: 0;
+	border-top: none;
+}
+
+.subroom-name {
+	font-family: var(--display);
+	font-weight: 700;
+	font-size: 0.975rem;
+	letter-spacing: -0.01em;
+	overflow-wrap: anywhere;
+}
+
+.subroom-meta,
+.subroom-save {
+	margin: 6px 0 0;
+	font-size: 0.825rem;
+	color: var(--muted);
+	overflow-wrap: anywhere;
+}
+
+/* Something the owner probably wants to act on — an unpublished subroom, a staged save
+   nobody can see yet. Not an error: nothing is broken, it just isn't live. */
+.warn {
+	color: var(--accent);
 }
 
 /* ---- Forms -------------------------------------------------------------- */
@@ -881,6 +1009,21 @@ button[type='submit']:disabled {
 
 	.vtabs button {
 		border-color: var(--line);
+	}
+
+	/* The room page's hero and its fact table both stack: 260px of photo (or 150px of
+	   label) beside a value leaves the value in a column too narrow to read. */
+	.room-hero {
+		grid-template-columns: 1fr;
+	}
+
+	.facts {
+		grid-template-columns: 1fr;
+		gap: 2px 0;
+	}
+
+	.facts dd {
+		margin-bottom: 10px;
 	}
 }
 

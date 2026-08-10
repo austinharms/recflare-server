@@ -60,9 +60,36 @@ interface SelfAccount {
 }
 
 /**
- * One room from `rooms` (`GET /rooms/ownedby/me`), narrowed to what this page draws. The
- * worker serves the stored room blob verbatim — dozens of fields the game needs and this
- * list doesn't — so only the handful read here is declared.
+ * One subroom, as `rooms` re-attaches them to every room read. A room is a container;
+ * the subrooms are the actual places players load into, each with its own accessibility
+ * and its own save history.
+ */
+interface SubRoom {
+	SubRoomId: number
+	Name: string
+	/** The Unity scene the client loads under the saved objects. */
+	UnitySceneId: string
+	/** Set INDEPENDENTLY of the room's — a public room can hold a private subroom. */
+	Accessibility: number
+	IsSandbox: boolean
+	MaxPlayers: number
+	/**
+	 * A save posted without `AutoPublish` waits here. Cleared when that save is
+	 * published, so a non-null value means "edited since players last saw a change".
+	 */
+	StagedSubRoomDataSaveId: number | null
+	/**
+	 * What players actually load. Null until the first publish — and a subroom without
+	 * one silently loads nothing, which is worth surfacing to an owner who can't tell
+	 * that apart from a broken room.
+	 */
+	CurrentSave: { SubRoomDataSaveId: number; CreatedAt: string; Description: string } | null
+}
+
+/**
+ * One room from `rooms` (`GET /rooms/ownedby/me`), narrowed to what these pages draw.
+ * The worker serves the stored room blob verbatim — dozens of fields the game needs and
+ * the website doesn't — so only the ones read here are declared.
  */
 interface OwnedRoom {
 	RoomId: number
@@ -73,6 +100,18 @@ interface OwnedRoom {
 	/** The `Accessibility` ordinal, NOT the enum name — see ACCESSIBILITY_LABEL. */
 	Accessibility: number
 	CreatedAt: string
+	MaxPlayers: number
+	/** False blocks `POST /rooms/{id}/clone` — nobody can take a copy of the room. */
+	CloningAllowed: boolean
+	SupportsScreens: boolean
+	SupportsWalkVR: boolean
+	SupportsTeleportVR: boolean
+	SupportsQuest2: boolean
+	SupportsMobile: boolean
+	SupportsJuniors: boolean
+	/** `Type` 0 is a tag the owner set, 2 one the server derived. */
+	Tags: Array<{ Tag: string; Type: number }>
+	SubRooms: SubRoom[]
 	/** Always present: the worker folds the live counters in on every read. */
 	Stats: {
 		CheerCount: number
@@ -83,9 +122,9 @@ interface OwnedRoom {
 }
 
 /**
- * What a room's `Accessibility` ordinal is called on screen. The two dev values are
- * reachable — the game sets them — so they're named rather than left to fall through
- * to the unknown case in RoomCard.
+ * What an `Accessibility` ordinal is called on screen — rooms and subrooms both carry
+ * one. The two dev values are reachable (the game sets them), so they're named rather
+ * than left to fall through to the unknown case in `accessibilityLabel`.
  */
 const ACCESSIBILITY_LABEL: Record<number, string> = {
 	[Accessibility.Private]: 'Private',
@@ -414,6 +453,16 @@ function Link({
 	)
 }
 
+/**
+ * The room id in `/rooms/<id>`, or null for any other path. Numeric rather than the
+ * room's name: a name is renameable (`PUT /rooms/{id}/name`), so a link someone
+ * bookmarked would rot the moment they renamed the room.
+ */
+function roomIdFromPath(path: string): number | null {
+	const match = /^\/rooms\/(\d+)$/.exec(path)
+	return match ? Number.parseInt(match[1], 10) : null
+}
+
 export function App() {
 	// undefined = still checking the session; null = signed out.
 	const [account, setAccount] = useState<SelfAccount | null | undefined>(undefined)
@@ -421,6 +470,7 @@ export function App() {
 	// so a slow (or failed) config fetch can't flash a form the server would refuse.
 	const [config, setConfig] = useState<SiteConfig | undefined>(undefined)
 	const { path, navigate } = useRouter()
+	const roomId = roomIdFromPath(path)
 
 	useEffect(() => {
 		// Config first, and everything else after it: it carries the hostnames every other
@@ -469,6 +519,8 @@ export function App() {
 				/>
 			) : path === '/account' ? (
 				<AccountPage account={account} navigate={navigate} onChange={setAccount} />
+			) : roomId !== null ? (
+				<RoomPage account={account} roomId={roomId} navigate={navigate} />
 			) : (
 				<HomePage account={account} config={config} navigate={navigate} />
 			)}
@@ -891,8 +943,221 @@ function AccountPage({
 	return (
 		<main className="shell wide">
 			<h1>My account</h1>
-			<Dashboard account={account} onChange={onChange} />
+			<Dashboard account={account} navigate={navigate} onChange={onChange} />
 		</main>
+	)
+}
+
+/**
+ * One room's own page — what it is, how it's set up, and the subrooms inside it.
+ *
+ * The room is found in the caller's OWN list rather than read from the public
+ * `GET /rooms?id=`, which is unfiltered by design (the game looks any room up that way).
+ * Going through `ownedby/me` is what makes this the owner's page: a room that isn't
+ * yours simply isn't in the list, so there's no second ownership rule here to drift out
+ * of step with the one the mutating endpoints enforce.
+ */
+function RoomPage({
+	account,
+	roomId,
+	navigate,
+}: {
+	account: SelfAccount | null | undefined
+	roomId: number
+	navigate: Navigate
+}) {
+	const [rooms, setRooms] = useState<OwnedRoom[] | null>(null)
+	const [error, setError] = useState('')
+	const accountId = account?.accountId
+
+	useEffect(() => {
+		if (account === null) navigate('/login')
+	}, [account, navigate])
+
+	useEffect(() => {
+		// Waits for the session: the list is auth-gated, and `account === undefined` only
+		// means the stored token hasn't been checked yet.
+		if (accountId === undefined) return
+		void fetchMyRooms()
+			.then(setRooms)
+			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
+	}, [accountId])
+
+	if (!account) {
+		return (
+			<main className="shell">
+				<p className="muted">{account === undefined ? 'Loading…' : 'Redirecting…'}</p>
+			</main>
+		)
+	}
+
+	const room = rooms?.find((r) => r.RoomId === roomId)
+
+	return (
+		<main className="shell wide">
+			<p className="backlink">
+				<Link to="/account" navigate={navigate}>
+					← My rooms
+				</Link>
+			</p>
+			{error ? (
+				<p className="error">{error}</p>
+			) : rooms === null ? (
+				<p className="muted">Loading…</p>
+			) : room === undefined ? (
+				// Covers both "no such room" and "someone else's" — deliberately the same
+				// sentence, since telling a stranger which of the two it is answers a question
+				// they have no business asking.
+				<p className="muted">That isn&apos;t one of your rooms.</p>
+			) : (
+				<RoomDetail room={room} imgHost={where().img} />
+			)}
+		</main>
+	)
+}
+
+/** The platforms a room says it supports, named the way the game names them. */
+function platformList(room: OwnedRoom): string[] {
+	const on: string[] = []
+	if (room.SupportsScreens) on.push('Screens')
+	if (room.SupportsWalkVR) on.push('VR (walk)')
+	if (room.SupportsTeleportVR) on.push('VR (teleport)')
+	if (room.SupportsQuest2) on.push('Quest 2')
+	if (room.SupportsMobile) on.push('Mobile')
+	if (room.SupportsJuniors) on.push('Juniors')
+	return on
+}
+
+/** A room's settings and its subrooms. Read-only: rooms are edited in game. */
+function RoomDetail({ room, imgHost }: { room: OwnedRoom; imgHost: string }) {
+	const created = new Date(room.CreatedAt)
+	const platforms = platformList(room)
+	const subRooms = room.SubRooms ?? []
+
+	return (
+		<>
+			<section className="card room-hero">
+				{/* 512 rather than the list's 256: this one is displayed large. Both are sizes
+				    the img worker allows, so each is a cached variant. */}
+				<img className="room-hero-img" src={`${imgHost}/${room.ImageName}?width=512`} alt="" />
+				<div className="room-hero-body">
+					<div className="room-head">
+						<h1 className="room-hero-name">^{room.Name}</h1>
+						<VisibilityBadge accessibility={room.Accessibility} />
+					</div>
+					{room.Description ? (
+						<p className="muted room-hero-desc">{room.Description}</p>
+					) : (
+						<p className="muted room-hero-desc">No description set.</p>
+					)}
+					<p className="room-stats">
+						{room.Stats.VisitCount.toLocaleString()} visit
+						{room.Stats.VisitCount === 1 ? '' : 's'} · {room.Stats.FavoriteCount.toLocaleString()}{' '}
+						favourite
+						{room.Stats.FavoriteCount === 1 ? '' : 's'} · {room.Stats.CheerCount.toLocaleString()}{' '}
+						cheer{room.Stats.CheerCount === 1 ? '' : 's'}
+					</p>
+				</div>
+			</section>
+
+			<section className="card">
+				<h2>Settings</h2>
+				<dl className="facts">
+					<dt>Room id</dt>
+					<dd>{room.RoomId}</dd>
+					<dt>Visibility</dt>
+					<dd>{accessibilityLabel(room.Accessibility)}</dd>
+					<dt>Max players</dt>
+					<dd>{room.MaxPlayers}</dd>
+					<dt>Cloning</dt>
+					<dd>
+						{room.CloningAllowed ? 'Anyone may clone this room' : 'Nobody may clone this room'}
+					</dd>
+					<dt>Plays on</dt>
+					<dd>
+						{platforms.length > 0 ? platforms.join(', ') : 'Nothing — no platform is enabled'}
+					</dd>
+					<dt>Tags</dt>
+					<dd>{room.Tags?.length ? room.Tags.map((t) => t.Tag).join(', ') : 'None'}</dd>
+					<dt>Created</dt>
+					<dd>{Number.isNaN(created.getTime()) ? room.CreatedAt : created.toLocaleDateString()}</dd>
+				</dl>
+			</section>
+
+			<section className="card">
+				<h2>Subrooms</h2>
+				<p className="muted">
+					The places inside the room players actually load into. Each keeps its own accessibility
+					and its own saves, so a public room can still hold a subroom nobody else can reach.
+				</p>
+				{subRooms.length === 0 ? (
+					<p className="muted">This room has no subrooms.</p>
+				) : (
+					<ul className="subrooms">
+						{subRooms.map((sub) => (
+							<SubRoomRow key={sub.SubRoomId} sub={sub} />
+						))}
+					</ul>
+				)}
+			</section>
+		</>
+	)
+}
+
+/** One subroom: what it is, and — the part an owner can't see anywhere else — its save. */
+function SubRoomRow({ sub }: { sub: SubRoom }) {
+	const save = sub.CurrentSave ?? null
+	const saved = save ? new Date(save.CreatedAt) : null
+	// Cleared when that save is published (see publishSubRoomSave), so a value here always
+	// means work the owner saved but players still can't see.
+	const staged = sub.StagedSubRoomDataSaveId !== null && sub.StagedSubRoomDataSaveId !== undefined
+
+	return (
+		<li className="subroom">
+			<div className="room-head">
+				<span className="subroom-name">{sub.Name || `Subroom ${sub.SubRoomId}`}</span>
+				<VisibilityBadge accessibility={sub.Accessibility} />
+				{sub.IsSandbox && <span className="badge">Sandbox</span>}
+			</div>
+			<p className="subroom-meta">
+				#{sub.SubRoomId} · up to {sub.MaxPlayers} players
+				{sub.UnitySceneId && ` · scene ${sub.UnitySceneId}`}
+			</p>
+			<p className="subroom-save">
+				{save === null ? (
+					// A subroom with no published save loads an empty scene without erroring, which
+					// from the inside looks exactly like a broken room. Say so plainly.
+					<span className="warn">Never published — players load an empty scene.</span>
+				) : (
+					<>
+						Published save #{save.SubRoomDataSaveId}
+						{saved && !Number.isNaN(saved.getTime()) && `, saved ${saved.toLocaleString()}`}
+						{save.Description && ` — “${save.Description}”`}
+					</>
+				)}
+				{staged && (
+					<span className="warn"> · a newer save is staged, waiting to be published.</span>
+				)}
+			</p>
+		</li>
+	)
+}
+
+/** How a room or subroom's `Accessibility` reads on screen. */
+const accessibilityLabel = (accessibility: number): string =>
+	// Unknown ordinals shouldn't happen, but this label is the only thing telling an owner
+	// whether a room is visible — so show the raw value rather than nothing at all.
+	ACCESSIBILITY_LABEL[accessibility] ?? `Accessibility ${accessibility}`
+
+/**
+ * The visibility pill. Public gets the same green "healthy" reading as the server
+ * status; every other value stays neutral, since Private is a choice, not a fault.
+ */
+function VisibilityBadge({ accessibility }: { accessibility: number }) {
+	return (
+		<span className={`badge ${accessibility === Accessibility.Public ? 'live' : ''}`}>
+			{accessibilityLabel(accessibility)}
+		</span>
 	)
 }
 
@@ -1152,9 +1417,11 @@ function LoginForm({ onAuthed }: { onAuthed: (a: SelfAccount) => void }) {
 
 function Dashboard({
 	account,
+	navigate,
 	onChange,
 }: {
 	account: SelfAccount
+	navigate: Navigate
 	onChange: (a: SelfAccount) => void
 }) {
 	// The dashboard sections, shown one at a time via the left tab rail. Admin-only
@@ -1162,7 +1429,7 @@ function Dashboard({
 	const sections = [
 		// First, so a player who just signed in lands on what they made rather than on a
 		// settings form they opened the page to avoid.
-		{ id: 'rooms', label: 'My rooms', render: () => <MyRooms /> },
+		{ id: 'rooms', label: 'My rooms', render: () => <MyRooms navigate={navigate} /> },
 		{
 			id: 'username',
 			label: 'Username',
@@ -1219,7 +1486,7 @@ function Dashboard({
  * the overview — everything you've made in one place, including the rooms you never
  * published, which are invisible everywhere else.
  */
-function MyRooms() {
+function MyRooms({ navigate }: { navigate: Navigate }) {
 	const [rooms, setRooms] = useState<OwnedRoom[] | null>(null)
 	const [error, setError] = useState('')
 
@@ -1251,7 +1518,7 @@ function MyRooms() {
 				// the fetch above resolved, and that fetch went through `where()` itself.
 				<ul className="rooms">
 					{rooms.map((room) => (
-						<RoomCard key={room.RoomId} room={room} imgHost={where().img} />
+						<RoomCard key={room.RoomId} room={room} imgHost={where().img} navigate={navigate} />
 					))}
 				</ul>
 			)}
@@ -1261,47 +1528,53 @@ function MyRooms() {
 
 /**
  * One room in the list: its thumbnail, what it's called in game (`^Name`), and how it's
- * doing.
+ * doing. The whole row links to the room's own page.
  *
  * The thumbnail is asked for at 256px wide — one of the img worker's four allowed sizes,
  * so it's a cached variant rather than the full-size upload. A room with no image of its
  * own still answers 200 there (the worker serves its fallback), so there's no broken
  * frame to handle.
  */
-function RoomCard({ room, imgHost }: { room: OwnedRoom; imgHost: string }) {
-	// Unknown ordinals shouldn't happen, but the label is the only thing telling an owner
-	// whether a room is visible — so show the raw value rather than nothing at all.
-	const visibility =
-		ACCESSIBILITY_LABEL[room.Accessibility] ?? `Accessibility ${room.Accessibility}`
+function RoomCard({
+	room,
+	imgHost,
+	navigate,
+}: {
+	room: OwnedRoom
+	imgHost: string
+	navigate: Navigate
+}) {
 	const created = new Date(room.CreatedAt)
 
 	return (
 		<li className="room">
-			<img
-				className="room-thumb"
-				src={`${imgHost}/${room.ImageName}?width=256`}
-				alt=""
-				loading="lazy"
-			/>
-			<div className="room-body">
-				<div className="room-head">
-					{/* The caret is how the game writes a room name, so it reads as the thing you
-					    type to get there rather than as a title someone wrote. */}
-					<span className="room-name">^{room.Name}</span>
-					<span className={`badge ${room.Accessibility === Accessibility.Public ? 'live' : ''}`}>
-						{visibility}
-					</span>
+			{/* A real `<a href>` (see Link), not a click handler on the row: it has to be
+			    reachable by keyboard, and openable in a new tab like any other link. */}
+			<Link to={`/rooms/${room.RoomId}`} navigate={navigate} className="room-link">
+				<img
+					className="room-thumb"
+					src={`${imgHost}/${room.ImageName}?width=256`}
+					alt=""
+					loading="lazy"
+				/>
+				<div className="room-body">
+					<div className="room-head">
+						{/* The caret is how the game writes a room name, so it reads as the thing you
+						    type to get there rather than as a title someone wrote. */}
+						<span className="room-name">^{room.Name}</span>
+						<VisibilityBadge accessibility={room.Accessibility} />
+					</div>
+					{room.Description && <p className="room-desc">{room.Description}</p>}
+					<p className="room-stats">
+						{room.Stats.VisitCount.toLocaleString()} visit
+						{room.Stats.VisitCount === 1 ? '' : 's'} · {room.Stats.FavoriteCount.toLocaleString()}{' '}
+						favourite
+						{room.Stats.FavoriteCount === 1 ? '' : 's'} · {room.Stats.CheerCount.toLocaleString()}{' '}
+						cheer{room.Stats.CheerCount === 1 ? '' : 's'}
+						{!Number.isNaN(created.getTime()) && ` · made ${created.toLocaleDateString()}`}
+					</p>
 				</div>
-				{room.Description && <p className="room-desc">{room.Description}</p>}
-				<p className="room-stats">
-					{room.Stats.VisitCount.toLocaleString()} visit
-					{room.Stats.VisitCount === 1 ? '' : 's'} · {room.Stats.FavoriteCount.toLocaleString()}{' '}
-					favourite
-					{room.Stats.FavoriteCount === 1 ? '' : 's'} · {room.Stats.CheerCount.toLocaleString()}{' '}
-					cheer{room.Stats.CheerCount === 1 ? '' : 's'}
-					{!Number.isNaN(created.getTime()) && ` · made ${created.toLocaleDateString()}`}
-				</p>
-			</div>
+			</Link>
 		</li>
 	)
 }
