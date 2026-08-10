@@ -69,6 +69,8 @@ import {
 	SaveOutfitV4Response,
 	SubscriptionResponse,
 	UNAUTHORIZED_RESPONSE,
+	UpdateObjectiveRequest,
+	UpdateObjectiveResponse,
 } from './openapi'
 import { getOutfits, setOutfit } from './outfit-db'
 
@@ -498,6 +500,37 @@ const app = new Hono<App>({ strict: false })
 			responses: { 200: json(JsonArray, 'Always empty for now') },
 		}),
 		(c) => c.json([])
+	)
+
+	// Report one objective's progress. The client posts the whole objective as it now
+	// sees it (Index/Group identify it within `myprogress`) and reads back the state of
+	// the GROUP that objective belongs to — camelCase here, unlike the PascalCase body it
+	// posted. Stubbed: with no objectives store yet we persist nothing, echo the group
+	// back and never complete it, so the reward-claim flow isn't triggered. `clearedAt`
+	// is the clear time, which for a group we didn't clear is just now.
+	.post(
+		'/api/objectives/v1/updateobjective',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Report objective progress',
+			description: [
+				'Stubbed: with no objectives store we persist nothing and never complete a group.',
+				'Echoes `Group` back as camelCase `group` with `isCompleted: false` so the client',
+				'gets a well-formed body.',
+			].join(' '),
+			requestBody: jsonBody(UpdateObjectiveRequest, 'The objective as the client now sees it'),
+			responses: { 200: json(UpdateObjectiveResponse, 'The echoed group, never completed') },
+		}),
+		async (c) => {
+			const body = await c.req
+				.json<{ Group?: string | number }>()
+				.catch(() => ({}) as Record<string, never>)
+			return c.json({
+				group: Number(body.Group) || 0,
+				isCompleted: false,
+				clearedAt: new Date().toISOString(),
+			})
+		}
 	)
 
 	// The player's avatar, stored as a JSON blob on their account row. Falls back

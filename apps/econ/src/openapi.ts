@@ -113,6 +113,17 @@ export const ChallengeProgressResponse = z.object({
 })
 
 /**
+ * `POST /api/objectives/v1/updateobjective` — the group the objective belongs to, after
+ * the update. camelCase, unlike the PascalCase body the client posts and the PascalCase
+ * `ObjectiveGroups` entries `myprogress` serves — three spellings of the same group.
+ */
+export const UpdateObjectiveResponse = z.object({
+	group: z.int().describe('Echoed back from the request'),
+	isCompleted: z.boolean().describe('Always false — no objectives store yet'),
+	clearedAt: z.string().describe('When the group was cleared — now, since nothing persists'),
+})
+
+/**
  * `POST /api/storefronts/v2/buyItem` — the purchase result. `Balance` is the CHANGE
  * applied (the negated price), not the resulting total; the client reads its new total
  * from `GET /balance/:type`. `BalanceType` -2 is account-wide. Each `Data` entry is the
@@ -196,6 +207,20 @@ export const ChallengeProgressRequest = z.object({
 	ChallengeMapId: z.union([z.string(), z.int()]).optional(),
 	ChallengeId: z.union([z.string(), z.int()]).optional(),
 	Config: z.string().optional().describe('The client-evaluated rule tree'),
+})
+
+/**
+ * `POST /api/objectives/v1/updateobjective` JSON body — one objective's state as the
+ * client now sees it. `Index`/`Group` identify it within `myprogress`; the rest is the
+ * progress it wants persisted.
+ */
+export const UpdateObjectiveRequest = z.object({
+	Index: z.int().describe('Which objective within the group'),
+	Group: z.int().describe('Which objective group'),
+	Progress: z.int().optional(),
+	VisualProgress: z.int().optional().describe('What the client animates towards'),
+	IsCompleted: z.boolean().optional(),
+	HasClaimedReward: z.boolean().optional(),
 })
 
 /** `POST /api/avatar/v3/saved/set` JSON body — an outfit with a target `Slot`. */

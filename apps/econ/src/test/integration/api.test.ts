@@ -342,6 +342,37 @@ describe('econ endpoints', () => {
 		}
 	})
 
+	test('POST /api/objectives/v1/updateobjective echoes the group, never completed', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/objectives/v1/updateobjective`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({
+				Index: 2,
+				Group: 3,
+				Progress: 1,
+				VisualProgress: 0,
+				IsCompleted: true,
+				HasClaimedReward: false,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { group: number; isCompleted: boolean; clearedAt: string }
+		expect(body.group).toBe(3)
+		expect(body.isCompleted).toBe(false)
+		expect(Number.isNaN(Date.parse(body.clearedAt))).toBe(false)
+	})
+
+	test('POST /api/objectives/v1/updateobjective tolerates a non-JSON body', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/objectives/v1/updateobjective`, {
+			method: 'POST',
+			body: 'not json',
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { group: number; isCompleted: boolean }
+		expect(body.group).toBe(0)
+		expect(body.isCompleted).toBe(false)
+	})
+
 	test('GET /api/checklist/v1/current 401s without a token, returns [] with one', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/api/checklist/v1/current`)
 		expect(anon.status).toBe(401)
@@ -1425,6 +1456,7 @@ describe('econ endpoints', () => {
 			'POST /api/consumables/v1/consume',
 			'POST /api/gamerewards/v1/request',
 			'POST /api/objectives/v1/cleargroup',
+			'POST /api/objectives/v1/updateobjective',
 			'POST /api/storefronts/v2/buyItem',
 			'PUT /api/equipment/v1/update',
 		])
