@@ -13,6 +13,7 @@ import {
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
+import { TOKEN_TTL_SECONDS } from '@repo/jwt'
 
 import {
 	getLinksForAccount,
@@ -473,7 +474,7 @@ describe('auth worker routes', () => {
 			expires_in: number
 		}
 		expect(json.token_type).toBe('Bearer')
-		expect(json.expires_in).toBe(3600)
+		expect(json.expires_in).toBe(TOKEN_TTL_SECONDS)
 		// header.payload.signature
 		const parts = json.access_token.split('.')
 		expect(parts).toHaveLength(3)
@@ -1104,9 +1105,7 @@ describe('CORS', () => {
 		)
 		expect(res.status).toBe(204)
 		expect(res.headers.get('access-control-allow-origin')).toBe('*')
-		expect(res.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
-			'content-type'
-		)
+		expect(res.headers.get('access-control-allow-headers')?.toLowerCase()).toContain('content-type')
 	})
 
 	// The header has to be on the REAL response too, not just the preflight — and on a
