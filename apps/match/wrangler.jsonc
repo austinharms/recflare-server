@@ -52,6 +52,10 @@
 			"head_sampling_rate": 1 // 100%
 		}
 	},
+	// The room substitutions (ROOM_REDIRECTS) are deliberately NOT set here. They're
+	// injected at deploy time from the gitignored .env (RECFLARE_ROOM_REDIRECTS, see
+	// .env.example), so swapping a room out never means editing a versioned file. Unset —
+	// the default — means every matchmake enters the room it asked for.
 	"vars": {
 		"ENVIRONMENT": "development", // overridden during deployment
 		"SENTRY_RELEASE": "unknown" // overridden during deployment

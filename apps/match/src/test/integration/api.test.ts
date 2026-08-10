@@ -501,6 +501,79 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual({ errorCode: 20, roomInstance: null })
 	})
 
+	test('ROOM_REDIRECTS switches a matchmake out to another room', async () => {
+		// `env` is shared by every test in this file, so restore the knob in `finally`.
+		const original = env.ROOM_REDIRECTS
+		const matchmake = async (path: string, player: string) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}${path}`, {
+					method: 'POST',
+					headers: {
+						...(await bearer(player)),
+						'Content-Type': 'application/x-www-form-urlencoded',
+					},
+					// Private, so each call gets a fresh instance of whatever room it landed in.
+					body: new URLSearchParams({ JoinMode: '2' }).toString(),
+				})
+			).json()) as {
+				errorCode: number
+				roomInstance: { roomId: number; subRoomId: number; location: string; name: string } | null
+			}
+
+		try {
+			env.ROOM_REDIRECTS = '2=MultiRoom'
+			// The room asked for is never entered; the substitute is, scene and all.
+			expect((await matchmake('/matchmake/room/2', '8801')).roomInstance).toMatchObject({
+				roomId: 77,
+				name: '^MultiRoom',
+				location: RECCENTER_SCENE,
+			})
+			// Matched on the resolved room, not the path segment, so the name spelling of the
+			// same room is substituted too.
+			expect((await matchmake('/matchmake/room/RecCenter', '8802')).roomInstance).toMatchObject({
+				roomId: 77,
+			})
+			// The requested subroom is dropped — 35 is a subroom of the substitute, not of the
+			// room asked for — so entry falls back to the substitute's default subroom (34).
+			expect((await matchmake('/matchmake/room/2/35', '8803')).roomInstance).toMatchObject({
+				roomId: 77,
+				subRoomId: 34,
+				location: RECCENTER_SCENE,
+			})
+			// Club 4's clubhouse is room 2, and it resolves through the same path: a
+			// substituted room is substituted wherever a matchmake names it.
+			expect((await matchmake('/matchmake/club/4', '121')).roomInstance).toMatchObject({
+				roomId: 77,
+			})
+
+			// Targeting by id works the same, and substitution is a single hop: 2 and 77
+			// swap rather than bouncing between each other.
+			env.ROOM_REDIRECTS = '2=77,77=2'
+			expect((await matchmake('/matchmake/room/2', '8804')).roomInstance).toMatchObject({
+				roomId: 77,
+			})
+			expect((await matchmake('/matchmake/room/77', '8805')).roomInstance).toMatchObject({
+				roomId: 2,
+			})
+
+			// A target that doesn't resolve leaves the requested room in place — a typo'd
+			// knob must not make the room unreachable.
+			env.ROOM_REDIRECTS = '2=NoSuchRoomHere'
+			expect((await matchmake('/matchmake/room/2', '8806')).roomInstance).toMatchObject({
+				roomId: 2,
+			})
+
+			// Unset: everyone enters the room they asked for.
+			env.ROOM_REDIRECTS = undefined
+			expect((await matchmake('/matchmake/room/2', '8807')).roomInstance).toMatchObject({
+				roomId: 2,
+				name: '^RecCenter',
+			})
+		} finally {
+			env.ROOM_REDIRECTS = original
+		}
+	})
+
 	test('PUT /player/statusvisibility returns 200', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player/statusvisibility`, { method: 'PUT' })
 		expect(res.status).toBe(200)

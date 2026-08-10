@@ -518,23 +518,90 @@ type ResolvedInstance =
 	| { instance: null; errorCode: MatchmakingErrorCode }
 
 /**
+ * The operator's room substitutions, parsed from the `ROOM_REDIRECTS` var: a map of
+ * the room id the client asks for to the room it actually enters (id or room name).
+ * The var is comma-separated `<fromRoomId>=<to>` pairs, e.g. `2=MyHub,3=100`.
+ *
+ * Keyed on the source's numeric id rather than the path segment because the client can
+ * matchmake by either id or name (`/matchmake/room/2` and `/matchmake/room/RecCenter`
+ * are the same room), so the substitution is matched against the room D1 resolved —
+ * one entry then covers both spellings. Unparseable pairs are skipped rather than
+ * failing the matchmake: a typo in the knob must not take room entry down.
+ */
+function roomRedirects(env: Env): Map<number, string> {
+	const map = new Map<number, string>()
+	if (typeof env.ROOM_REDIRECTS !== 'string') return map
+	for (const pair of env.ROOM_REDIRECTS.split(',')) {
+		const eq = pair.indexOf('=')
+		if (eq === -1) continue
+		const from = Number(pair.slice(0, eq).trim())
+		const to = pair.slice(eq + 1).trim()
+		if (!Number.isInteger(from) || to === '') continue
+		map.set(from, to)
+	}
+	return map
+}
+
+/**
+ * Apply the operator's `ROOM_REDIRECTS` substitution to a room the client asked for.
+ * Answers the room to actually enter, plus the subroom to enter it by.
+ *
+ * A substituted room drops the requested subroom: the id the client sent addresses a
+ * subroom of the room it *asked* for, and the same number in the target room is a
+ * different place entirely (or nothing at all), so entry falls back to the target's
+ * default subroom. Substitution is a single hop — `2=3,3=2` swaps the two rooms rather
+ * than looping — and an unresolvable target leaves the original room in place, so a
+ * typo'd knob degrades to "no substitution" instead of a dead hub.
+ */
+async function substituteRoom(
+	c: Context<App>,
+	room: Room,
+	subRoomId?: number
+): Promise<{ room: Room; subRoomId?: number }> {
+	const fromId = typeof room.RoomId === 'number' ? room.RoomId : NaN
+	const to = roomRedirects(c.env).get(fromId)
+	if (to === undefined) return { room, subRoomId }
+
+	const toId = Number.parseInt(to, 10)
+	const target = Number.isNaN(toId)
+		? await getRoomByName(c.env.DB, to)
+		: await getRoomById(c.env.DB, toId)
+	if (!target) {
+		logger.warn('room redirect target not found; entering the requested room', {
+			roomId: fromId,
+			target: to,
+		})
+		return { room, subRoomId }
+	}
+
+	logger.info('room redirected', { roomId: fromId, target: to })
+	return { room: target, subRoomId: undefined }
+}
+
+/**
  * Resolve a room by `:room` path segment (numeric id or name) from D1, then find a
  * joinable instance of it (public matchmakes reuse one via the `room_instance`
  * table) or create a new one. A null instance carries the error code to answer:
  * NoSuchRoom when the room isn't in the DB, BannedFromRoom when the caller is banned.
+ *
+ * Every matchmake that names a room lands here, so this is also where the operator's
+ * room substitutions apply (`ROOM_REDIRECTS`) — everything downstream, from the ban
+ * check to presence and the visit count, sees only the room actually entered.
  */
 async function resolveRoomInstance(
 	c: Context<App>,
 	roomKey: string,
 	isPrivate: boolean,
 	ownerId: number,
-	subRoomId?: number
+	requestedSubRoomId?: number
 ): Promise<ResolvedInstance> {
 	const id = Number.parseInt(roomKey, 10)
-	const room = Number.isNaN(id)
+	const requested = Number.isNaN(id)
 		? await getRoomByName(c.env.DB, roomKey)
 		: await getRoomById(c.env.DB, id)
-	if (!room) return { instance: null, errorCode: NO_SUCH_ROOM }
+	if (!requested) return { instance: null, errorCode: NO_SUCH_ROOM }
+
+	const { room, subRoomId } = await substituteRoom(c, requested, requestedSubRoomId)
 
 	const f = instanceFieldsFromRoom(room, subRoomId)
 

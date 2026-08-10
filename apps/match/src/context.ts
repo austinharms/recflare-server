@@ -20,6 +20,17 @@ export type Env = SharedHonoEnv & {
 	 * player. Used by `POST /invite` to deliver the game-invite message to the invitee.
 	 */
 	RECFLARE_NOTIFICATIONS_HUB: DurableObjectNamespace<NotificationsHub>
+	/**
+	 * Room substitutions applied at matchmake time, as comma-separated `<fromRoomId>=<to>`
+	 * pairs — e.g. `2=100` or `2=MyHub,3=100` — where `from` is the room id the client
+	 * asks for and `to` is the room it actually enters (id or room name). Optional; unset
+	 * means every matchmake enters the room it asked for.
+	 *
+	 * The point of it is swapping out a stock RRO room for a custom one: `2=MyHub` sends
+	 * everyone who matchmakes into the Rec Center (room 2) to `MyHub` instead, without
+	 * touching the client. See `roomRedirects` in match.app.ts.
+	 */
+	ROOM_REDIRECTS?: string
 }
 
 /** Variables can be extended */
