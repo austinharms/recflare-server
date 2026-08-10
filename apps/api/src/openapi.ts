@@ -184,6 +184,21 @@ export const SendMessageRequest = z.object({
 	Data: z.string().optional().describe('The message payload; often empty'),
 })
 
+/**
+ * `POST /api/messages/v1/sendMultiple` JSON body — the same message fanned out to
+ * several recipients. Unlike the form-encoded single send, this one is real JSON, so
+ * `Type` arrives as a number and `ToPlayerIds` as an array of numbers. The sender is
+ * still taken from the bearer token, not the body.
+ */
+export const SendMultipleMessagesRequest = z.object({
+	ToPlayerIds: z.array(z.int()).describe('Account ids of the recipients'),
+	Type: z
+		.int()
+		.optional()
+		.describe('The Message-model type, e.g. `20`. Passed through unmapped; defaults to 0'),
+	Data: z.string().optional().describe('The message payload; often empty'),
+})
+
 /** The `{ Success, Message }` ack the flag toggles answer with. */
 export const AckResponse = z.object({ Success: z.boolean(), Message: z.string() })
 

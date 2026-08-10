@@ -2329,6 +2329,63 @@ describe('messages', () => {
 		expect(res.status).toBe(401)
 		expect(await pushed()).toEqual([])
 	})
+
+	// The bulk form takes a JSON body, not the form encoding the single send uses.
+	const sendMultiple = async (body: unknown, headers?: Record<string, string>) => {
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		return exports.default.fetch(`${ORIGIN}/api/messages/v1/sendMultiple`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...headers },
+			body: JSON.stringify(body),
+		})
+	}
+
+	test('POST /api/messages/v1/sendMultiple pushes one frame per recipient', async () => {
+		const res = await sendMultiple(
+			{ ToPlayerIds: [205, 206], Type: 20, Data: 'hi' },
+			await bearer('42')
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		// Each frame is addressed to its own recipient; the sender is the token's subject.
+		expect(await pushed()).toEqual([
+			{
+				playerId: 205,
+				notificationType: MESSAGE_RECEIVED,
+				data: { FromPlayerId: 42, ToPlayerId: 205, Type: 20, Data: 'hi' },
+			},
+			{
+				playerId: 206,
+				notificationType: MESSAGE_RECEIVED,
+				data: { FromPlayerId: 42, ToPlayerId: 206, Type: 20, Data: 'hi' },
+			},
+		])
+	})
+
+	test('POST /api/messages/v1/sendMultiple defaults Type and Data, and de-duplicates ids', async () => {
+		const res = await sendMultiple({ ToPlayerIds: [205, 205] }, await bearer('42'))
+		expect(res.status).toBe(200)
+
+		const sent = await pushed()
+		expect(sent).toHaveLength(1)
+		expect(sent[0]?.data).toEqual({ FromPlayerId: 42, ToPlayerId: 205, Type: 0, Data: '' })
+	})
+
+	test('POST /api/messages/v1/sendMultiple 400s with no usable recipient, pushing nothing', async () => {
+		for (const body of [{ Type: 20 }, { ToPlayerIds: [] }, { ToPlayerIds: ['nope', 0] }]) {
+			const res = await sendMultiple(body, await bearer('42'))
+			expect(res.status).toBe(400)
+			expect(await res.json()).toEqual({ success: false, error: 'ToPlayerIds is required' })
+			expect(await pushed()).toEqual([])
+		}
+	})
+
+	test('POST /api/messages/v1/sendMultiple is auth-gated', async () => {
+		const res = await sendMultiple({ ToPlayerIds: [205] })
+		expect(res.status).toBe(401)
+		expect(await pushed()).toEqual([])
+	})
 })
 
 describe('mutual friends', () => {
@@ -3020,6 +3077,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/updateprice',
 			'POST /api/inventions/v6/save',
+			'POST /api/messages/v1/sendMultiple',
 			'POST /api/messages/v2/send',
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
