@@ -50,6 +50,13 @@ export const UNAUTHORIZED_RESPONSE = { description: 'Missing or invalid bearer t
 /** Bearer-JWT security requirement, for the auth-gated routes. */
 export const AUTHED = [{ bearerAuth: [] }]
 
+/**
+ * Optional bearer JWT — the empty requirement object makes "no credentials" a valid
+ * alternative. For routes that serve public data but personalise it for a known caller
+ * (the weekly challenge's per-player `Complete`) instead of 401ing.
+ */
+export const OPTIONAL_AUTHED: OpenAPIV3_1.SecurityRequirementObject[] = [{}, { bearerAuth: [] }]
+
 // ---- Loose shapes ----------------------------------------------------------
 // Several routes serve opaque static catalogs (avatar items, the weekly challenge) or
 // empty-list stubs. Modelling every catalog field adds noise without value, so these
@@ -108,8 +115,10 @@ export const SubscriptionResponse = z.object({
 export const ChallengeProgressResponse = z.object({
 	ChallengeMapId: z.int(),
 	ChallengeId: z.int(),
-	Config: z.string(),
-	Complete: z.boolean().describe('Always false — no challenge-progress store yet'),
+	Config: z.string().describe('Echoed back verbatim; not stored'),
+	Complete: z
+		.boolean()
+		.describe('The STORED completion — latches true within a rotation, so it may differ'),
 })
 
 /**
@@ -206,7 +215,26 @@ export const ConsumeGiftRequest = z.object({
 export const ChallengeProgressRequest = z.object({
 	ChallengeMapId: z.union([z.string(), z.int()]).optional(),
 	ChallengeId: z.union([z.string(), z.int()]).optional(),
-	Config: z.string().optional().describe('The client-evaluated rule tree'),
+	Config: z
+		.string()
+		.optional()
+		.describe('The client-evaluated rule tree, with its running count in `cc`; not stored'),
+	Complete: z
+		.union([z.string(), z.boolean()])
+		.optional()
+		.describe('The client’s verdict — sent as .NET’s `"True"`/`"False"`'),
+})
+
+/** `POST /api/gamerewards/v1/request` form body. */
+export const GameRewardRequest = z.object({
+	rewardType: z
+		.string()
+		.describe('The reward being asked for, e.g. `FirstActivityOfDay`, `PostGameActivity`'),
+	Message: z.string().optional().describe('The message to show for the reward'),
+	giftContext: z
+		.string()
+		.optional()
+		.describe('The activity it came from, e.g. `Soccer` — accepted and ignored'),
 })
 
 /**

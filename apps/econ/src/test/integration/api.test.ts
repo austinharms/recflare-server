@@ -13,6 +13,9 @@ import {
 // The `invention` table belongs to the `api` worker; buyInvention reads it, so its DDL
 // is built here too (see the same cross-worker import in econ.app.ts).
 import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
+// The live weekly rotation, so the challenge tests exercise whatever it currently holds
+// instead of hard-coded ids from a rotation that has since been replaced.
+import weeklyChallenge from '../../../static/weekly-challenge.json'
 import { SCHEMA_DDL } from '../../avatar-db'
 import {
 	BALANCE_SCHEMA_DDL,
@@ -21,10 +24,12 @@ import {
 	getBalance,
 	spendCurrency,
 } from '../../balance-db'
+import { CHALLENGE_STATUS_SCHEMA_DDL } from '../../challenge-db'
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
 import { OUTFIT_SCHEMA_DDL } from '../../outfit-db'
+import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
 
 import type { Env } from '../../context'
 
@@ -34,6 +39,9 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+/** The first challenge of the live rotation — the progress tests report against it. */
+const CURRENT_CHALLENGE = weeklyChallenge.Challenges[0]
+
 // Build the accounts table and seed the test player (the default token's sub, 42)
 // so avatar reads/writes have a row to attach to.
 beforeAll(async () => {
@@ -42,6 +50,8 @@ beforeAll(async () => {
 	for (const stmt of SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of BALANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of OUTFIT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of CHALLENGE_STATUS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of REWARD_STATUS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTORY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of EQUIPMENT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -1342,36 +1352,179 @@ describe('econ endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	test('POST /api/challenge/v2/updateProgress echoes the challenge, never complete (stub)', async () => {
-		const config =
-			'{"ct":1,"ipc":false,"ctc":[{"ct":0,"ipc":false,"wc":[{"ct":6,"vs":[2]},{"ct":7,"vs":[{"l":"a673712c-877f-4749-b69a-4a4c6310d545"}]}]}],"t":5,"cc":1}'
+	test('POST /api/challenge/v2/updateProgress echoes the challenge and its stored completion', async () => {
+		// Post the live rotation's own challenge and rule tree — what the client actually
+		// sends — so editing static/weekly-challenge.json can't quietly stale this test.
+		const challenge = CURRENT_CHALLENGE
 		const res = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/updateProgress`, {
 			method: 'POST',
-			headers: { 'Content-Type': 'application/json' },
+			headers: { ...(await bearer('70')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				ChallengeMapId: '17',
-				ChallengeId: '49',
-				Config: config,
+				ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+				ChallengeId: String(challenge.ChallengeId),
+				Config: challenge.Config,
+				// .NET's bool.ToString() — the capitalized string, which `Boolean("False")`
+				// would read as complete.
 				Complete: 'False',
 			}),
 		})
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({
-			ChallengeMapId: 17,
-			ChallengeId: 49,
-			Config: config,
+			ChallengeMapId: weeklyChallenge.ChallengeMapId,
+			ChallengeId: challenge.ChallengeId,
+			Config: challenge.Config,
 			Complete: false,
 		})
 	})
 
-	test('POST /api/gamerewards/v1/request returns [] (stub)', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
+	test('POST /api/challenge/v2/updateProgress is 401 without a token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/updateProgress`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ ChallengeMapId: '17', ChallengeId: '49', Complete: 'True' }),
+		})
+		expect(res.status).toBe(401)
+	})
+
+	test('a completed challenge persists and getCurrent stamps it for that player only', async () => {
+		const completedId = CURRENT_CHALLENGE.ChallengeId
+		const bearerHeaders = await bearer('71')
+		const posted = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/updateProgress`, {
+			method: 'POST',
+			headers: { ...bearerHeaders, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+				ChallengeId: completedId,
+				Complete: 'True',
+			}),
+		})
+		expect(posted.status).toBe(200)
+
+		const mine = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`, {
+			headers: bearerHeaders,
+		})
+		const body = (await mine.json()) as {
+			Challenges: Array<{ ChallengeId: number; Complete: boolean }>
+		}
+		// Only the reported one is stamped; the rest of the rotation is untouched.
+		expect(body.Challenges.filter((ch) => ch.Complete).map((ch) => ch.ChallengeId)).toEqual([
+			completedId,
+		])
+
+		// A different player, and an anonymous caller, still see the static catalog.
+		const other = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`, {
+			headers: await bearer('72'),
+		})
+		const otherBody = (await other.json()) as { Challenges: Array<{ Complete: boolean }> }
+		expect(otherBody.Challenges.some((ch) => ch.Complete)).toBe(false)
+		const anon = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`)
+		const anonBody = (await anon.json()) as { Challenges: Array<{ Complete: boolean }> }
+		expect(anonBody.Challenges.some((ch) => ch.Complete)).toBe(false)
+	})
+
+	test('completion latches within a rotation but resets on a new one', async () => {
+		const headers = { ...(await bearer('73')), 'Content-Type': 'application/json' }
+		// A challenge id of its own, so this says nothing about the live rotation.
+		const post = (ChallengeMapId: string, Complete: string) =>
+			exports.default.fetch(`${ORIGIN}/api/challenge/v2/updateProgress`, {
+				method: 'POST',
+				headers,
+				body: JSON.stringify({ ChallengeMapId, ChallengeId: '9001', Complete }),
+			})
+		const completeOf = async (res: Response) =>
+			((await res.json()) as { Complete: boolean }).Complete
+
+		expect(await completeOf(await post('17', 'True'))).toBe(true)
+		// A later report that says "not complete" must not un-finish it.
+		expect(await completeOf(await post('17', 'False'))).toBe(true)
+		// …but the same challenge id in the NEXT rotation starts over.
+		expect(await completeOf(await post('18', 'False'))).toBe(false)
+		expect(await completeOf(await post('18', 'True'))).toBe(true)
+	})
+
+	test('POST /api/gamerewards/v1/request claims once an hour per reward type', async () => {
+		const headers = {
+			...(await bearer('80')),
+			'Content-Type': 'application/x-www-form-urlencoded',
+		}
+		const request = (body: string) =>
+			exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
+				method: 'POST',
+				headers,
+				body,
+			})
+		const statusOf = (rewardType: string) =>
+			env.DB.prepare(
+				'SELECT granted_at, grant_count FROM reward_status WHERE account_id = 80 AND reward_type = ?1'
+			)
+				.bind(rewardType)
+				.first<{ granted_at: string; grant_count: number }>()
+
+		// The payload is stubbed, so a claim still answers the empty list the client accepts.
+		const first = await request(
+			'rewardType=FirstActivityOfDay&Message=First%20Game%20of%20the%20Day'
+		)
+		expect(first.status).toBe(200)
+		expect(await first.json()).toEqual([])
+		const claimed = await statusOf('FirstActivityOfDay')
+		expect(claimed?.grant_count).toBe(1)
+
+		// Asking again inside the hour claims nothing — and must not push the cooldown out,
+		// or a client that retries in a loop would never become eligible.
+		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
+		expect(await statusOf('FirstActivityOfDay')).toEqual(claimed)
+
+		// A different type has its own cooldown; `giftContext` doesn't split it.
+		expect(
+			(
+				await request(
+					'rewardType=PostGameActivity&Message=Activity%20completed%21&giftContext=Soccer'
+				)
+			).status
+		).toBe(200)
+		expect((await statusOf('PostGameActivity'))?.grant_count).toBe(1)
+		expect(
+			(
+				await request(
+					'rewardType=PostGameActivity&Message=Activity%20completed%21&giftContext=Paintball'
+				)
+			).status
+		).toBe(200)
+		expect((await statusOf('PostGameActivity'))?.grant_count).toBe(1)
+
+		// Once the hour has passed, the same type claims again.
+		await env.DB.prepare(
+			"UPDATE reward_status SET granted_at = ?1 WHERE account_id = 80 AND reward_type = 'FirstActivityOfDay'"
+		)
+			.bind(new Date(Date.now() - 61 * 60 * 1000).toISOString())
+			.run()
+		expect((await request('rewardType=FirstActivityOfDay&Message=tomorrow')).status).toBe(200)
+		expect((await statusOf('FirstActivityOfDay'))?.grant_count).toBe(2)
+	})
+
+	test('POST /api/gamerewards/v1/request is 401 without a token, and ignores a typeless ask', async () => {
+		const anon = await exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
 			body: 'rewardType=FirstActivityOfDay&Message=First%20Game%20of%20the%20Day',
 		})
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+		expect(anon.status).toBe(401)
+
+		// No reward type: nothing to gate, so no row keyed on an empty string.
+		const typeless = await exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('81')),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: 'Message=First%20Game%20of%20the%20Day',
+		})
+		expect(typeless.status).toBe(200)
+		expect(await typeless.json()).toEqual([])
+		const rows = await env.DB.prepare(
+			'SELECT COUNT(*) AS count FROM reward_status WHERE account_id = 81'
+		).first<{ count: number }>()
+		expect(rows?.count).toBe(0)
 	})
 
 	test('GET /api/roomkeys/v1/mine returns []', async () => {

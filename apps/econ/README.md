@@ -4,14 +4,15 @@ Economy Worker served on the `econ` subdomain (`econ.recflare.net`). Hosts the
 avatar/economy endpoints the game client calls on the `econ` service (distinct from the
 main `api` worker, which also serves many of them — the client may call either host).
 
-Balances, inventory, consumables, saved outfits, avatars and gift boxes are D1-backed;
-storefront catalogs are static assets (`static/storefronts/sf{N}.json`) served via the
-ASSETS binding. Several routes are still empty-list stubs.
+Balances, inventory, consumables, saved outfits, avatars, gift boxes, weekly-challenge
+progress and game-reward eligibility are D1-backed; storefront catalogs and the weekly-challenge rotation are static
+assets (`static/`), the storefronts served via the ASSETS binding. Several routes are still
+empty-list stubs.
 
 ## Routes
 
 `✓` = auth-gated (validates the Bearer JWT from the `auth` worker; empty-body 401 when
-missing/invalid).
+missing/invalid). `~` = optional auth: served to anyone, personalised for a valid bearer.
 
 | Method   | Path                                                 | Auth | Description                             |
 | -------- | ---------------------------------------------------- | ---- | --------------------------------------- |
@@ -42,10 +43,10 @@ missing/invalid).
 | GET      | `/api/storefronts/v3/giftdropstore/:id`              |      | Gift-drop storefront catalog            |
 | POST     | `/api/storefronts/v2/buyItem`                        | ✓    | Buy a storefront item                   |
 | GET      | `/api/storefronts/v1/adcarouselitems`                |      | Ad-carousel items (static)              |
-| GET      | `/api/challenge/v2/getCurrent`                       |      | Current weekly challenge (static)       |
-| POST     | `/api/challenge/v2/updateProgress`                   |      | Report challenge progress (stub)        |
+| GET      | `/api/challenge/v2/getCurrent`                       | ~    | Weekly rotation + the caller's progress |
+| POST     | `/api/challenge/v2/updateProgress`                   | ✓    | Report challenge progress               |
 | GET      | `/api/gamerewards/v1/pending`                        |      | Pending game rewards (stub `[]`)        |
-| POST     | `/api/gamerewards/v1/request`                        |      | Request a game reward (stub `[]`)       |
+| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward (hourly, per type)  |
 | GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
 | GET      | `/api/roomkeys/v1/room`                              |      | Room keys for a room (stub `[]`)        |
 | POST     | `/api/CampusCard/v1/UpdateAndGetSubscription`        |      | Subscription lookup (both null)         |
@@ -97,15 +98,18 @@ mismatched call is a harmless no-op (opening _another_ player's box is a 403).
 
 ## Weekly challenge (`static/weekly-challenge.json`)
 
-Served verbatim by `GET /api/challenge/v2/getCurrent`. The server never evaluates it: the
-client reads the rule tree in each challenge's `Config`, watches its own gameplay, and
-posts the tree back to `/api/challenge/v2/updateProgress` with its verdict. So this file
-is the entire definition of a week's challenges — ids, display strings, matching rules and
-the reward preview.
+Served by `GET /api/challenge/v2/getCurrent` (with each challenge's per-player `Complete`
+stamped in — see Progress below). The server never evaluates the rules: the client reads
+the rule tree in each challenge's `Config`, watches its own gameplay, and posts the tree
+back to `/api/challenge/v2/updateProgress` with its verdict. So this file is the entire
+definition of a week's challenges — ids, display strings, matching rules and the reward
+preview.
 
 Everything below was read off reference data (one captured live rotation), not a spec.
 Field meanings marked _(inferred)_ are read from how the values line up with the strings
-the client renders; the rest are pinned by the data itself.
+the client renders; the rest are pinned by the data itself. The file itself is edited
+freely as rotations change — the examples here are the captured week, so expect the shipped
+rotation to differ.
 
 ### Top level
 
@@ -134,7 +138,7 @@ rotation with a ~1-day countdown rather than an expired one. If you edit the win
 | `Config`      | The rule tree, as an **escaped JSON string** (not a nested object). See below.                                                                                                  |
 | `Description` | The one-line goal, e.g. `"Complete 10 games in ^Paintball"`.                                                                                                                    |
 | `Tooltip`     | The longer hint under it.                                                                                                                                                       |
-| `Complete`    | Per-player state, so meaningless in a static catalog: always `false` here, and `updateProgress` is stubbed and never flips it.                                                  |
+| `Complete`    | Per-player state, so always `false` in the file — `getCurrent` overwrites it per caller from `challenge_status`.                                                                |
 
 `^Token` in `Description`/`Tooltip` is a client-side room link: the client resolves the
 token to a room and renders a tappable name. Subrooms use a dotted path
@@ -184,24 +188,20 @@ The two idioms in the file, unescaped:
 Note the quest challenges have **no `t`** (one qualifying session is the whole goal) and
 the counted ones have **no `won` predicate** (finishing counts, winning is irrelevant).
 
-On `updateProgress` the client posts the same tree back with **`cc`** added to the counter
-node — its current count (`…,"t":5,"cc":1`). `cc` never appears in this file; it is
-progress, not definition. Since the server persists nothing, that count lives only in the
-client.
+On `updateProgress` the client posts the same tree back with its own progress written into
+it: **`cc`** on the counter node is the current count (`…,"t":5,"cc":1`), and **`c`** (`"c":true`)
+marks a node it now considers satisfied. Neither appears in this file — they are progress,
+not definition, which is why the tree isn't stored (only the top-level `Complete` is). The
+count itself lives only in the client.
 
 **Scene ids, not room ids.** Because `ct: 7` matches `UnitySceneId`, a screens room and its
-VR twin share ids and both count — the six Paintball scenes listed for challenge `44` are
-the subrooms of _both_ `Paintball` and `PaintballVR`, and each also exists as a standalone
-base room (`River`, `Clearcut`, …). One list covers every way in. How the rotation's five
-challenges resolve:
-
-| Challenge | Scenes                                                            |
-| --------- | ----------------------------------------------------------------- |
-| `37`      | TheRiseofJumbotron / Home                                         |
-| `38`      | Crescendo / Home                                                  |
-| `44`      | Paintball: River, Homestead, Quarry, Clearcut, Spillway, Drive-in |
-| `49`      | 3DCharades / InkSpaceHome + Legacy3DCharades / Home               |
-| `63`      | Clearcut only                                                     |
+VR twin share ids and both count: the captured "Complete 10 games in Paintball" listed six
+scenes, which are the subrooms of _both_ `Paintball` and `PaintballVR` — and each is also a
+standalone base room (`River`, `Clearcut`, …). One list covers every way in. Resolve a guid
+against the `SubRooms[].UnitySceneId` values in `apps/rooms/migrations/0002_import_rooms.sql`;
+a "one map only" challenge is the same shape with a single-entry list. Watch for one trap
+this creates: `Soccer / Home` and `Stadium / Home` are the same scene, so a soccer challenge
+also completes in the Stadium.
 
 ### The `Gift` block
 
@@ -217,6 +217,67 @@ guid bytes in .NET little-endian order, padding stripped (`g5u0weNLmkCLeUXFUVn74
 _not_ by `GiftDropId`: this block's `GiftDropId` is `3994`, while the same skin sells in
 `sf3.json` as `2121` ("Camera Skin (Comic)"). Nothing grants it — the reward is preview
 only (see Known gaps).
+
+### Progress (`challenge_status`)
+
+`POST /api/challenge/v2/updateProgress` (auth-gated) upserts one row per (account,
+challenge) into `challenge_status`, and `getCurrent` reads them back to stamp `Complete`.
+The body is `{ ChallengeMapId, ChallengeId, Config, Complete }` with the ids as **strings**
+and `Complete` as .NET's `"True"`/`"False"` — capitalized, so `Boolean(body.Complete)` reads
+"not complete" as complete (`parseBool` handles both spellings and a real JSON `true`).
+
+Only the completion is stored. `Config` is the catalog's own rule tree plus the client's
+running count, so a per-player copy would just be a staler duplicate of static data — it is
+echoed back untouched but never persisted. The response is the four posted fields, except
+`Complete` is the **stored** value rather than the posted one, because:
+
+- **Completion latches within a rotation.** The client reports repeatedly, and a later
+  report saying "not complete" (a fresh session, a retry arriving out of order) must not
+  un-finish something already finished.
+- **A new rotation resets the row.** Challenge ids are only unique within a rotation, so
+  the same id in a later week would otherwise start out already complete. A report whose
+  `ChallengeMapId` differs from the stored one replaces the row instead of latching; reads
+  are scoped to the rotation for the same reason.
+
+`getCurrent`'s auth is **optional** — an unauthenticated caller gets the static rotation
+with every `Complete` false rather than a 401, since the rotation is public and a failure
+on this route can stall the client's load. The overlay rebuilds the response object rather
+than stamping the imported JSON in place: that import is module state shared across every
+request an isolate serves, so mutating it would leak one player's completions to the next
+caller.
+
+## Game rewards (`reward_status`)
+
+The client asks for a reward whenever it thinks one is due, posting a form body of the type
+and the message to show for it:
+
+```
+rewardType=FirstActivityOfDay&Message=First%20Game%20of%20the%20Day
+rewardType=PostGameActivity&Message=Activity%20completed%21&giftContext=Soccer
+```
+
+Since the client asks rather than the server offering, whether a reward is actually **owed**
+is decided here, from `reward_status` — one row per (account, reward type) holding the last
+claim and a count. One claim per type per hour (`REWARD_COOLDOWN_MS`), flat for every type
+despite what a name like `FirstActivityOfDay` suggests; per-type windows would be a map
+keyed by type.
+
+- **The claim is one SQL statement** (`ON CONFLICT … DO UPDATE … WHERE`). The client fires
+  these off right after a match, so two can land together; a read-then-write would let both
+  see the same stale `granted_at` and pay out twice.
+- **A rejected claim leaves `granted_at` alone.** If an on-cooldown ask pushed the timestamp
+  forward, a client that retries in a loop would never become eligible.
+- **`giftContext` (the activity, e.g. `Soccer`) is accepted and ignored** — the cooldown is
+  per type, shared across activities, so it is not part of the key.
+
+**The reward payload itself is a stub:** a successful claim records the cooldown, logs a
+`game reward claimed` line, and grants nothing, so a claim and an on-cooldown ask both
+answer the same empty list the client already accepts. Paying one out is the
+`claimed !== null` branch in the handler. Getting eligibility right first is the point —
+it's what stops a repeat ask paying twice once there's something to pay.
+
+`GET /api/gamerewards/v1/pending` stays `[]`: with rewards claimed on request, nothing sits
+waiting to be collected.
 
 ## Bindings
 
@@ -235,7 +296,8 @@ Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no cod
 - Gifting to another player grants the item and box but does not notify the recipient.
 - `buyItem` grants avatar-item and consumable drops; currency/xp drops aren't granted.
 - Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
-- Several routes (room keys, wishlist, equipment, room consumables/currencies, game
-  rewards) are empty-list stubs pending their own stores.
-- Weekly-challenge progress is never persisted and the rotation's `Gift` is never granted:
-  `updateProgress` echoes `Complete: false`, so nothing ever completes.
+- Several routes (room keys, wishlist, equipment, room consumables/currencies) are
+  empty-list stubs pending their own stores.
+- Game rewards gate correctly but pay nothing out — see the `reward_status` section.
+- Weekly-challenge completion is persisted, but the rotation's `Gift` is never granted —
+  nothing watches for the last challenge finishing, and there is no claim endpoint.

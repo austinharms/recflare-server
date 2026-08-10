@@ -36,6 +36,7 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
+import { getCompletedChallengeIds, recordChallengeProgress } from './challenge-db'
 import {
 	consumeConsumable,
 	countConsumable,
@@ -60,11 +61,13 @@ import {
 	EquipmentUpdateRequest,
 	ErrorResponse,
 	form,
+	GameRewardRequest,
 	json,
 	JsonArray,
 	jsonBody,
 	JsonObject,
 	OpaqueJsonBody,
+	OPTIONAL_AUTHED,
 	SaveOutfitRequest,
 	SaveOutfitV4Response,
 	SubscriptionResponse,
@@ -73,6 +76,7 @@ import {
 	UpdateObjectiveResponse,
 } from './openapi'
 import { getOutfits, setOutfit } from './outfit-db'
+import { claimReward } from './reward-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, StoredGift } from '@repo/domain'
@@ -87,7 +91,7 @@ import type { Outfit } from './outfit-db'
  * Economy Worker. Hosts the avatar/economy endpoints the game client calls on
  * the `econ` service (these are separate from the main `api` worker). Balances,
  * inventory (avatar items, equipment, bought inventions), consumables, saved outfits,
- * avatars and gift boxes are D1-backed;
+ * avatars, gift boxes, weekly-challenge progress and game-reward eligibility are D1-backed;
  * storefront catalogs are static assets (`sf{N}.json`) served via the ASSETS
  * binding. Some routes are still empty-list stubs (room keys, wishlist, …).
  *
@@ -105,6 +109,16 @@ async function authedId(c: Context<App>): Promise<number | null> {
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
 	return c.body(null, 401)
+}
+
+/**
+ * A boolean the client may send either as a JSON `true` or as .NET's `bool.ToString()`
+ * output — `"True"`/`"False"`, capitalized. `Boolean(value)` is a trap here: the string
+ * `"False"` is truthy, so a client reporting "not complete" would read as complete.
+ * Anything unrecognised (missing, `null`, `""`) is false.
+ */
+function parseBool(value: string | boolean | undefined): boolean {
+	return typeof value === 'boolean' ? value : String(value).toLowerCase() === 'true'
 }
 
 /**
@@ -1381,51 +1395,95 @@ const app = new Hono<App>({ strict: false })
 		(c) => c.json(adCarouselItems)
 	)
 
-	// Current weekly challenge. Served from the bundled static JSON until
-	// per-rotation challenge data is wired up.
+	// Current weekly challenge. The rotation itself is the bundled static JSON (its format
+	// is documented in the README) but each challenge's `Complete` is per-player, so the
+	// caller's rows from `challenge_status` are stamped over the static `false`s.
+	// Auth is OPTIONAL: without a valid bearer the static catalog is served unchanged
+	// rather than 401, since the rotation is public information and a 404/401 on this
+	// route can stall the client's load orchestration.
 	.get(
 		'/api/challenge/v2/getCurrent',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Current weekly challenge',
-			description: 'Served from the bundled static challenge until per-rotation data is wired up.',
+			description: [
+				'The bundled static rotation, with each challenge’s `Complete` stamped from the',
+				'caller’s progress rows. Auth is optional — unauthenticated callers get the static',
+				'catalog with every `Complete` false.',
+			].join(' '),
+			security: OPTIONAL_AUTHED,
 			responses: { 200: json(JsonObject, 'The current weekly challenge') },
 		}),
-		(c) => c.json(weeklyChallenge)
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return c.json(weeklyChallenge)
+			const complete = await getCompletedChallengeIds(c.env.DB, id, weeklyChallenge.ChallengeMapId)
+			if (complete.size === 0) return c.json(weeklyChallenge)
+			// Rebuild rather than mutate: the static import is module state shared by every
+			// request this isolate serves, so stamping it in place would leak one player's
+			// completions to the next caller.
+			return c.json({
+				...weeklyChallenge,
+				Challenges: weeklyChallenge.Challenges.map((challenge) => ({
+					...challenge,
+					Complete: complete.has(challenge.ChallengeId),
+				})),
+			})
+		}
 	)
 
-	// Report progress on a weekly challenge. The client evaluates the challenge's rule
-	// tree locally and posts ChallengeMapId/ChallengeId, that tree in `Config`, and
-	// whether it now considers the challenge `Complete`. Stubbed: with no challenge-
-	// progress DB yet we persist nothing and never mark a challenge complete (so the
-	// gift flow isn't triggered). Echo the identifying fields back with Complete=false
-	// so the client gets a well-formed, non-null body to deserialize.
+	// Report progress on a weekly challenge. [Authorize]. The client evaluates the
+	// challenge's rule tree locally and posts ChallengeMapId/ChallengeId, that tree in
+	// `Config`, and whether it now considers the challenge `Complete`. Only the
+	// completion is persisted (keyed by account + challenge); `Config` is the catalog's
+	// own definition plus the client's running count, so storing it would duplicate
+	// static data. Echoes the identifying fields back with the completion the row now
+	// holds — which is not always what was posted, since completion latches within a
+	// rotation.
 	.post(
 		'/api/challenge/v2/updateProgress',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Report weekly-challenge progress',
 			description: [
-				'Stubbed: with no challenge-progress store we persist nothing and never mark a',
-				'challenge complete. Echoes the identifying fields back with `Complete: false` so the',
-				'client gets a well-formed body.',
+				'Persists the reported completion into `challenge_status`, keyed by account +',
+				'challenge. `Config` is accepted and echoed but not stored. Completion latches within',
+				'a rotation, so the echoed `Complete` is the stored value, not the posted one.',
 			].join(' '),
+			security: AUTHED,
 			requestBody: jsonBody(ChallengeProgressRequest, 'Challenge ids + the evaluated rule tree'),
-			responses: { 200: json(ChallengeProgressResponse, 'Echoed fields, Complete false') },
+			responses: {
+				200: json(ChallengeProgressResponse, 'Echoed fields with the stored completion'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
 		}),
 		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
 			const body = await c.req
 				.json<{
 					ChallengeMapId?: string | number
 					ChallengeId?: string | number
 					Config?: string
+					Complete?: string | boolean
 				}>()
 				.catch(() => ({}) as Record<string, never>)
+			const challengeMapId = Number(body.ChallengeMapId) || 0
+			const challengeId = Number(body.ChallengeId) || 0
+			// Nothing to key a row on — echo the body back rather than writing a (0, 0) row.
+			const complete =
+				challengeId === 0
+					? parseBool(body.Complete)
+					: await recordChallengeProgress(c.env.DB, id, {
+							challengeMapId,
+							challengeId,
+							complete: parseBool(body.Complete),
+						})
 			return c.json({
-				ChallengeMapId: Number(body.ChallengeMapId) || 0,
-				ChallengeId: Number(body.ChallengeId) || 0,
+				ChallengeMapId: challengeMapId,
+				ChallengeId: challengeId,
 				Config: typeof body.Config === 'string' ? body.Config : '',
-				Complete: false,
+				Complete: complete,
 			})
 		}
 	)
@@ -1435,13 +1493,56 @@ const app = new Hono<App>({ strict: false })
 		c.json([])
 	)
 
-	// Request a game reward (client posts `rewardType`/`Message`, e.g.
-	// FirstActivityOfDay). Stubbed: with no reward DB yet we grant nothing and return an
-	// empty list of rewards — matching the `pending` shape so the client deserializes it.
+	// Request a game reward. [Authorize]. The client asks whenever it thinks one is due,
+	// posting the type and the message to show for it (`rewardType=FirstActivityOfDay&
+	// Message=First Game of the Day`, or `rewardType=PostGameActivity&Message=Activity
+	// completed!&giftContext=Soccer`) — so whether a reward is actually OWED is decided
+	// here, from `reward_status`: one claim per type per hour, atomically.
+	//
+	// The reward itself is still a stub: a claim records the cooldown and grants nothing,
+	// so both outcomes answer the same empty list the client already accepts. Paying one
+	// out later is the `claimed !== null` branch below — the eligibility half is what has
+	// to be right first, since that's what stops a repeat ask paying twice.
+	//
+	// `giftContext` (the activity, e.g. `Soccer`) is accepted and ignored: the cooldown is
+	// per reward type, shared across activities.
 	.post(
 		'/api/gamerewards/v1/request',
-		listRoute('Request a game reward', 'Stubbed — grants nothing, returns []'),
-		(c) => c.json([])
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Request a game reward',
+			description: [
+				'Claims one reward of `rewardType` per hour per player, recorded in `reward_status`.',
+				'The reward payload is still a stub — a claim grants nothing and both a claim and a',
+				'rejected (on-cooldown) ask answer `[]`. `giftContext` is accepted and ignored.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(GameRewardRequest, 'The reward type and its display message'),
+			responses: {
+				200: json(JsonArray, 'The rewards granted — always [] while the payload is stubbed'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const rewardType = typeof body.rewardType === 'string' ? body.rewardType : ''
+			// No type, nothing to gate: don't write a row keyed on an empty string.
+			if (rewardType === '') return c.json([])
+			const claimed = await claimReward(c.env.DB, id, rewardType)
+			if (claimed !== null) {
+				// The reward would be granted here. Logged for now so the faucet is visible in
+				// production before it pays anything out.
+				logger.info('game reward claimed', {
+					accountId: id,
+					rewardType,
+					grantCount: claimed,
+					message: typeof body.Message === 'string' ? body.Message : '',
+				})
+			}
+			return c.json([])
+		}
 	)
 
 	// The player's room keys. Returns "[]".
