@@ -835,6 +835,44 @@ h2 {
 	color: var(--accent);
 }
 
+/*
+ * A scene-data blob and the link that downloads it. The KEY is the link, rather than a
+ * "Download" button beside it: the key is the thing an owner came to find (it's what
+ * `CurrentSave.DataBlob` holds, and what a bug report quotes), so making it the target
+ * keeps it readable and clickable without a second control competing for the row.
+ */
+.blob {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 4px 10px;
+	margin-top: 8px;
+	font-size: 0.8rem;
+}
+
+.blob-label {
+	flex: none;
+	color: var(--muted);
+}
+
+/* Blob keys are `<date>/<uuid>` — long, and with only two places a line could break.
+   `anywhere` lets one wrap mid-key instead of pushing the card sideways. */
+.blob-key {
+	color: var(--accent);
+	text-decoration: none;
+	overflow-wrap: anywhere;
+	min-width: 0;
+}
+
+.blob-key:hover {
+	text-decoration: underline;
+}
+
+.blob-note {
+	color: var(--muted);
+	overflow-wrap: anywhere;
+}
+
 /* ---- Forms -------------------------------------------------------------- */
 
 label {

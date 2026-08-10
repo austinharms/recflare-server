@@ -49,6 +49,7 @@ it('advertises signup and where the other workers live', async () => {
 			img: 'https://img.rec.example.com',
 			notify: 'https://notify.rec.example.com',
 			rooms: 'https://rooms.rec.example.com',
+			cdn: 'https://cdn.rec.example.com',
 		},
 	})
 })

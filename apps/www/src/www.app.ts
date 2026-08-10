@@ -12,6 +12,7 @@ import {
 	accountsBase,
 	apiBase,
 	authBase,
+	cdnBase,
 	imgBase,
 	notifyBase,
 	postAuthForm,
@@ -69,6 +70,7 @@ const app = new Hono<App>()
 				img: imgBase(c.env),
 				notify: notifyBase(c.env),
 				rooms: roomsBase(c.env),
+				cdn: cdnBase(c.env),
 			},
 		})
 	})

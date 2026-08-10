@@ -33,6 +33,7 @@ interface Hosts {
 	img: string
 	notify: string
 	rooms: string
+	cdn: string
 }
 
 /**
@@ -67,12 +68,12 @@ interface SelfAccount {
 interface SubRoom {
 	SubRoomId: number
 	Name: string
-	/** The Unity scene the client loads under the saved objects. */
-	UnitySceneId: string
 	/** Set INDEPENDENTLY of the room's — a public room can hold a private subroom. */
 	Accessibility: number
 	IsSandbox: boolean
 	MaxPlayers: number
+	/** The subroom's scene-data key, served back by `cdn` under `room/`. */
+	DataBlob?: string
 	/**
 	 * A save posted without `AutoPublish` waits here. Cleared when that save is
 	 * published, so a non-null value means "edited since players last saw a change".
@@ -83,7 +84,17 @@ interface SubRoom {
 	 * one silently loads nothing, which is worth surfacing to an owner who can't tell
 	 * that apart from a broken room.
 	 */
-	CurrentSave: { SubRoomDataSaveId: number; CreatedAt: string; Description: string } | null
+	CurrentSave: {
+		SubRoomDataSaveId: number
+		CreatedAt: string
+		Description: string
+		/**
+		 * The scene-data key for the published save — what the client downloads to load
+		 * the place, and the file worth keeping a copy of. `subRoomDataBlob()` resolves
+		 * this one first, ahead of the subroom's own.
+		 */
+		DataBlob: string
+	} | null
 }
 
 /**
@@ -1010,7 +1021,7 @@ function RoomPage({
 				// they have no business asking.
 				<p className="muted">That isn&apos;t one of your rooms.</p>
 			) : (
-				<RoomDetail room={room} imgHost={where().img} />
+				<RoomDetail room={room} imgHost={where().img} cdnHost={where().cdn} />
 			)}
 		</main>
 	)
@@ -1029,7 +1040,15 @@ function platformList(room: OwnedRoom): string[] {
 }
 
 /** A room's settings and its subrooms. Read-only: rooms are edited in game. */
-function RoomDetail({ room, imgHost }: { room: OwnedRoom; imgHost: string }) {
+function RoomDetail({
+	room,
+	imgHost,
+	cdnHost,
+}: {
+	room: OwnedRoom
+	imgHost: string
+	cdnHost: string
+}) {
 	const created = new Date(room.CreatedAt)
 	const platforms = platformList(room)
 	const subRooms = room.SubRooms ?? []
@@ -1095,7 +1114,7 @@ function RoomDetail({ room, imgHost }: { room: OwnedRoom; imgHost: string }) {
 				) : (
 					<ul className="subrooms">
 						{subRooms.map((sub) => (
-							<SubRoomRow key={sub.SubRoomId} sub={sub} />
+							<SubRoomRow key={sub.SubRoomId} sub={sub} roomName={room.Name} cdnHost={cdnHost} />
 						))}
 					</ul>
 				)}
@@ -1105,23 +1124,31 @@ function RoomDetail({ room, imgHost }: { room: OwnedRoom; imgHost: string }) {
 }
 
 /** One subroom: what it is, and — the part an owner can't see anywhere else — its save. */
-function SubRoomRow({ sub }: { sub: SubRoom }) {
+function SubRoomRow({
+	sub,
+	roomName,
+	cdnHost,
+}: {
+	sub: SubRoom
+	roomName: string
+	cdnHost: string
+}) {
 	const save = sub.CurrentSave ?? null
 	const saved = save ? new Date(save.CreatedAt) : null
 	// Cleared when that save is published (see publishSubRoomSave), so a value here always
 	// means work the owner saved but players still can't see.
 	const staged = sub.StagedSubRoomDataSaveId !== null && sub.StagedSubRoomDataSaveId !== undefined
+	const name = sub.Name || `Subroom ${sub.SubRoomId}`
 
 	return (
 		<li className="subroom">
 			<div className="room-head">
-				<span className="subroom-name">{sub.Name || `Subroom ${sub.SubRoomId}`}</span>
+				<span className="subroom-name">{name}</span>
 				<VisibilityBadge accessibility={sub.Accessibility} />
 				{sub.IsSandbox && <span className="badge">Sandbox</span>}
 			</div>
 			<p className="subroom-meta">
 				#{sub.SubRoomId} · up to {sub.MaxPlayers} players
-				{sub.UnitySceneId && ` · scene ${sub.UnitySceneId}`}
 			</p>
 			<p className="subroom-save">
 				{save === null ? (
@@ -1139,7 +1166,108 @@ function SubRoomRow({ sub }: { sub: SubRoom }) {
 					<span className="warn"> · a newer save is staged, waiting to be published.</span>
 				)}
 			</p>
+			{/* The published save's blob first: that's the copy of the room worth keeping,
+			    and the one the client resolves ahead of the subroom's own key. */}
+			{save?.DataBlob && (
+				<BlobDownload
+					label="Save DataBlob"
+					blobKey={save.DataBlob}
+					filename={safeFilename(roomName, name, `save-${save.SubRoomDataSaveId}`)}
+					cdnHost={cdnHost}
+				/>
+			)}
+			{sub.DataBlob && (
+				<BlobDownload
+					label="Subroom DataBlob"
+					blobKey={sub.DataBlob}
+					filename={safeFilename(roomName, name, 'datablob')}
+					cdnHost={cdnHost}
+				/>
+			)}
 		</li>
+	)
+}
+
+/**
+ * A download filename built from player-supplied names, with everything that isn't a
+ * word character, dot or dash flattened to a dash — a subroom can be called anything,
+ * and that string is about to become a path on someone's disk.
+ */
+const safeFilename = (...parts: string[]): string =>
+	`${parts.join('-').replace(/[^\w.-]+/g, '-')}.bin`
+
+/**
+ * One scene-data blob: the key, and a link that downloads it from `cdn`.
+ *
+ * `href` is the real CDN URL, so open-in-new-tab and right-click → Save As work like any
+ * other link. The click is intercepted only to give the file a NAME: blobs are stored
+ * under a date-foldered UUID, so three downloads otherwise land as three
+ * indistinguishable extensionless files. The `download` attribute can't do that on its
+ * own — browsers ignore it cross-origin, and `cdn` is always a different origin from the
+ * website — hence fetching the bytes and saving them through an object URL.
+ */
+function BlobDownload({
+	label,
+	blobKey,
+	filename,
+	cdnHost,
+}: {
+	label: string
+	blobKey: string
+	filename: string
+	cdnHost: string
+}) {
+	// Room build data is served under `room/` — the same prefix the storage worker
+	// uploads it to, and the one the game downloads it from.
+	const url = `${cdnHost}/room/${blobKey}`
+	const [pending, setPending] = useState(false)
+	const [error, setError] = useState('')
+
+	const download = async () => {
+		setPending(true)
+		setError('')
+		try {
+			const res = await fetch(url)
+			// The blob key is stored on the subroom, so a miss here means the object is gone
+			// from the bucket — worth saying, rather than saving a file of the 404 body.
+			if (!res.ok) throw new Error(`the CDN answered ${res.status}`)
+			const href = URL.createObjectURL(await res.blob())
+			const link = document.createElement('a')
+			link.href = href
+			link.download = filename
+			link.click()
+			// The click is dispatched synchronously but the save reads the URL after this
+			// frame, so the revoke waits a tick rather than pulling it out from under.
+			setTimeout(() => URL.revokeObjectURL(href), 0)
+		} catch (e) {
+			setError(e instanceof Error ? e.message : String(e))
+		} finally {
+			setPending(false)
+		}
+	}
+
+	return (
+		<div className="blob">
+			<span className="blob-label">{label}</span>
+			<a
+				className="blob-key"
+				href={url}
+				download={filename}
+				onClick={(e) => {
+					e.preventDefault()
+					void download()
+				}}
+			>
+				{blobKey}
+			</a>
+			{/* Only rendered when it has something to say — an empty span would still take a
+			    gap from the flex row, leaving the key trailed by a stray space. */}
+			{pending ? (
+				<span className="blob-note">Downloading…</span>
+			) : error ? (
+				<span className="blob-note error">Couldn’t download — {error}.</span>
+			) : null}
+		</div>
 	)
 }
 
