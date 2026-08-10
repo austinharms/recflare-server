@@ -140,6 +140,62 @@ describe('img endpoints', () => {
 		expect(res.status).toBe(304)
 	})
 
+	it('honors a Range request on the stored image with a 206', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/${R2_KEY}`, { headers: { Range: 'bytes=2-4' } })
+		expect(res.status).toBe(206)
+		expect(res.headers.get('content-range')).toBe('bytes 2-4/8')
+		expect(res.headers.get('accept-ranges')).toBe('bytes')
+		expect(new Uint8Array(await res.arrayBuffer())).toEqual(IMAGE_BYTES.slice(2, 5))
+	})
+
+	// R2 resolves a range it cannot parse or satisfy to the WHOLE object rather than
+	// failing. Handing that back as a bare 200 is the shape that corrupts a chunked
+	// download — the client wrote a whole file where it expected a slice — so every one
+	// of these still states what the body holds.
+	it('never answers a bytes range with a whole-object 200', async () => {
+		for (const range of ['bytes=100-200', 'bytes=abc', 'bytes=0-1,3-4', 'bytes=0-7']) {
+			const res = await SELF.fetch(`${ORIGIN}/${R2_KEY}`, { headers: { Range: range } })
+			expect(res.status, range).toBe(206)
+			expect(res.headers.get('content-range'), range).toBe('bytes 0-7/8')
+		}
+
+		// A unit other than bytes must be ignored outright (RFC 9110), not answered with
+		// a byte-denominated Content-Range.
+		const other = await SELF.fetch(`${ORIGIN}/${R2_KEY}`, { headers: { Range: 'items=0-1' } })
+		expect(other.status).toBe(200)
+		expect(other.headers.get('content-range')).toBeNull()
+	})
+
+	// A resize decodes the whole image, so there is no meaningful slice of the source to
+	// read — the range is ignored and the whole transformed result served, which is the
+	// legal answer. What it must NOT do is claim a 206 over bytes it rebuilt. Runs against
+	// the R2 path (a decodable JPEG borrowed from `static/`), since that is the one that
+	// has a range to suppress; the static-asset path is never handed one at all.
+	it('ignores a Range when a transform rebuilds the body', async () => {
+		const real = await (await SELF.fetch(`${ORIGIN}/3DCharades.jpg`)).arrayBuffer()
+		await env.IMAGES.put('ranged-transform.jpg', real, {
+			httpMetadata: { contentType: 'image/jpeg' },
+		})
+
+		const res = await SELF.fetch(`${ORIGIN}/ranged-transform.jpg?width=128`, {
+			headers: { Range: 'bytes=0-9' },
+		})
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-range')).toBeNull()
+		expect(res.headers.get('accept-ranges')).toBeNull()
+		expect(jpegSize(new Uint8Array(await res.arrayBuffer())).width).toBe(128)
+
+		// Same for a real RSA signature, which covers the whole body (the test env binds
+		// IMG_SIGNING_ENABLED on, so `?sig=p1` takes the signing path rather than the stub).
+		const signed = await SELF.fetch(`${ORIGIN}/ranged-transform.jpg?sig=p1`, {
+			headers: { Range: 'bytes=0-9' },
+		})
+		expect(signed.status).toBe(200)
+		expect(signed.headers.get('content-range')).toBeNull()
+		expect(signed.headers.get('content-signature')).toContain('key-id=KEY:RSA:p1.rec.net')
+		expect(new Uint8Array(await signed.arrayBuffer()).byteLength).toBe(real.byteLength)
+	})
+
 	it('serves the DefaultProfileImage.jpg fallback for a missing image', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/missing.png`)
 		expect(res.status).toBe(200)

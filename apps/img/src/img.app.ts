@@ -3,7 +3,7 @@ import { Hono } from 'hono'
 import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
+import { withCleanSpec, withNotFound, withOnError, writeContentRange } from '@repo/hono-helpers'
 
 import { imageBytes, json, ServiceStatus } from './openapi'
 
@@ -373,6 +373,12 @@ app.get(
 			'return JPEG with no `ETag` (the source etag no longer describes the body), and the',
 			'`If-None-Match` precondition is skipped. An out-of-range or non-integer dimension is',
 			'ignored and the original is served — never an error.',
+			'',
+			'A `Range` is honoured (206) only on the untouched stream, which is the only response',
+			'that advertises `Accept-Ranges`. A transform decodes the whole image and a real',
+			'signature covers the whole body, so those serve the entire result and ignore the',
+			'header. Where a range does apply, a `bytes=` request is never answered with a bare',
+			'200: the `Content-Range` always states which bytes the body holds.',
 		].join('\n'),
 		parameters: [
 			{
@@ -433,9 +439,22 @@ app.get(
 					'Conditional request against the R2 object etag. Ignored when a transform is requested.',
 				schema: { type: 'string' },
 			},
+			{
+				name: 'Range',
+				in: 'header',
+				required: false,
+				description: [
+					'A single byte range, parsed by R2 itself. Honoured with a 206 on the untouched',
+					'stream only — ignored when a transform or a real signature applies, since both',
+					'need the whole image. A `bytes=` value never yields a bare 200: the',
+					'`Content-Range` names the bytes enclosed even where that is all of them.',
+				].join(' '),
+				schema: { type: 'string', example: 'bytes=0-1023' },
+			},
 		],
 		responses: {
 			200: imageBytes('The image bytes (or the DefaultProfileImage.jpg fallback)'),
+			206: imageBytes('A byte range of the stored image, when the request carried a `Range`'),
 			304: { description: 'If-None-Match matched the stored object etag; no body' },
 			400: { description: 'The key contained `..`; no body' },
 		},
@@ -468,10 +487,16 @@ app.get(
 		// one. Skip the precondition when a transform is requested.
 		const ifNoneMatch = transform ? undefined : c.req.header('if-none-match')?.replace(/"/g, '')
 		const { bucket, objectKey } = resolveObject(c.env, key)
-		const object = await bucket.get(
-			objectKey,
-			ifNoneMatch ? { onlyIf: { etagDoesNotMatch: ifNoneMatch } } : undefined
-		)
+		// A `Range` applies only to the untouched stream. Resizing decodes the whole image
+		// and an RSA signature covers the whole body, so a ranged read there would produce
+		// bytes that are not the range asked for — ask R2 for the range only when we are
+		// going to hand its bytes straight back. R2 parses the header itself; see
+		// writeContentRange() below for why it is never answered with a bare 200.
+		const range = needsBody(transform, signing) ? undefined : c.req.raw.headers
+		const object = await bucket.get(objectKey, {
+			...(ifNoneMatch ? { onlyIf: { etagDoesNotMatch: ifNoneMatch } } : {}),
+			...(range ? { range } : {}),
+		})
 		if (!object) {
 			// Missing from both static and R2 → serve the bundled DefaultProfileImage.jpg
 			// static asset so clients still get a valid image instead of a 404. Honour
@@ -495,6 +520,15 @@ app.get(
 		if (needsBody(transform, signing)) {
 			const bytes = await object.arrayBuffer()
 			return finalizeImage(c.env, bytes, headers, transform, signing)
+		}
+
+		// Only the untouched stream can honour a range, so only it advertises the fact.
+		// The transformed and static-asset paths above serve the whole thing regardless,
+		// which is the legal answer to a range you cannot honour — but claiming
+		// `accept-ranges` there would invite a client to expect otherwise.
+		headers.set('accept-ranges', 'bytes')
+		if (writeContentRange(headers, c.req.raw.headers, object)) {
+			return new Response(object.body, { status: 206, headers })
 		}
 
 		return new Response(object.body, { headers })
