@@ -1,5 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 
+import { Accessibility } from '@repo/domain/src/enums'
+
 import { NotificationType } from '../../../notify/src/notification-types'
 import { authFailure, authUnreachable } from '../auth-messages'
 import {
@@ -30,6 +32,7 @@ interface Hosts {
 	api: string
 	img: string
 	notify: string
+	rooms: string
 }
 
 /**
@@ -54,6 +57,42 @@ interface SelfAccount {
 	 * stays usable and lets the server be the one to refuse.
 	 */
 	availableUsernameChanges?: number
+}
+
+/**
+ * One room from `rooms` (`GET /rooms/ownedby/me`), narrowed to what this page draws. The
+ * worker serves the stored room blob verbatim — dozens of fields the game needs and this
+ * list doesn't — so only the handful read here is declared.
+ */
+interface OwnedRoom {
+	RoomId: number
+	Name: string
+	Description: string
+	/** A key on the `img` worker; a room with no image of its own gets the fallback. */
+	ImageName: string
+	/** The `Accessibility` ordinal, NOT the enum name — see ACCESSIBILITY_LABEL. */
+	Accessibility: number
+	CreatedAt: string
+	/** Always present: the worker folds the live counters in on every read. */
+	Stats: {
+		CheerCount: number
+		FavoriteCount: number
+		VisitorCount: number
+		VisitCount: number
+	}
+}
+
+/**
+ * What a room's `Accessibility` ordinal is called on screen. The two dev values are
+ * reachable — the game sets them — so they're named rather than left to fall through
+ * to the unknown case in RoomCard.
+ */
+const ACCESSIBILITY_LABEL: Record<number, string> = {
+	[Accessibility.Private]: 'Private',
+	[Accessibility.Public]: 'Public',
+	[Accessibility.Unlisted]: 'Unlisted',
+	[Accessibility.Dev_only]: 'Dev only',
+	[Accessibility.Dev_Unlisted]: 'Dev unlisted',
 }
 
 /**
@@ -196,6 +235,28 @@ async function call<T = Record<string, unknown>>(url: string, opts: CallOptions 
 /** The signed-in account, straight from `accounts`. */
 const fetchMe = (): Promise<SelfAccount> =>
 	call<SelfAccount>(`${where().accounts}/account/me`, { authed: true })
+
+/**
+ * The caller's own rooms, from the `rooms` worker — the same list the game's "My Rooms"
+ * loads. `ownedby/me` rather than `createdby/me`: the dorm is auto-provisioned, not a
+ * room the player made, and it's the one room they can't do anything with from here.
+ *
+ * The worker deliberately does NOT filter on accessibility for this list, so a room that
+ * has never been published shows up — which is the point, since that's the one its owner
+ * is most likely to be looking for.
+ *
+ * Sorted newest-first here rather than upstream: the query has no ORDER BY (D1 hands
+ * back insertion order, which is not a promise), and the room someone just made is the
+ * one they came to see.
+ */
+async function fetchMyRooms(): Promise<OwnedRoom[]> {
+	const rooms = await call<OwnedRoom[]>(`${where().rooms}/rooms/ownedby/me`, { authed: true })
+	// A bare array is the contract; anything else is treated as "no rooms" rather than
+	// thrown, since `.sort` on a non-array would surface as an unreadable TypeError.
+	if (!Array.isArray(rooms)) return []
+	// ISO-8601 timestamps, so lexical order IS chronological order.
+	return [...rooms].sort((a, b) => (a.CreatedAt < b.CreatedAt ? 1 : -1))
+}
 
 /**
  * Sign in with auth's password grant, posted directly the way the game posts it. The
@@ -1099,6 +1160,9 @@ function Dashboard({
 	// The dashboard sections, shown one at a time via the left tab rail. Admin-only
 	// sections are appended when the session carries an admin role.
 	const sections = [
+		// First, so a player who just signed in lands on what they made rather than on a
+		// settings form they opened the page to avoid.
+		{ id: 'rooms', label: 'My rooms', render: () => <MyRooms /> },
 		{
 			id: 'username',
 			label: 'Username',
@@ -1144,6 +1208,101 @@ function Dashboard({
 				<div className="panel">{current.render()}</div>
 			</div>
 		</>
+	)
+}
+
+/**
+ * The rooms the signed-in player owns.
+ *
+ * Read-only on purpose: rooms are made and edited in game, and there is nothing here a
+ * player could change that the game doesn't already own. What the web is better at is
+ * the overview — everything you've made in one place, including the rooms you never
+ * published, which are invisible everywhere else.
+ */
+function MyRooms() {
+	const [rooms, setRooms] = useState<OwnedRoom[] | null>(null)
+	const [error, setError] = useState('')
+
+	useEffect(() => {
+		void fetchMyRooms()
+			.then(setRooms)
+			.catch((e) => setError(e instanceof Error ? e.message : String(e)))
+	}, [])
+
+	return (
+		<section className="card">
+			<h2>My rooms</h2>
+			<p className="muted">
+				Every room you&apos;ve made, newest first — unpublished ones included. Your dorm isn&apos;t
+				here: it was made for you rather than by you.
+			</p>
+			{error ? (
+				<p className="error">{error}</p>
+			) : rooms === null ? (
+				<p className="muted">Loading…</p>
+			) : rooms.length === 0 ? (
+				<p className="muted">
+					You haven&apos;t made a room yet. Rooms are created in game — clone one you like, or start
+					from a blank one in the Rec Center.
+				</p>
+			) : (
+				// `where()` THROWS when the config never landed, and a throw in render takes the
+				// page down (see useSlideshow). It can't here: this branch is only reached once
+				// the fetch above resolved, and that fetch went through `where()` itself.
+				<ul className="rooms">
+					{rooms.map((room) => (
+						<RoomCard key={room.RoomId} room={room} imgHost={where().img} />
+					))}
+				</ul>
+			)}
+		</section>
+	)
+}
+
+/**
+ * One room in the list: its thumbnail, what it's called in game (`^Name`), and how it's
+ * doing.
+ *
+ * The thumbnail is asked for at 256px wide — one of the img worker's four allowed sizes,
+ * so it's a cached variant rather than the full-size upload. A room with no image of its
+ * own still answers 200 there (the worker serves its fallback), so there's no broken
+ * frame to handle.
+ */
+function RoomCard({ room, imgHost }: { room: OwnedRoom; imgHost: string }) {
+	// Unknown ordinals shouldn't happen, but the label is the only thing telling an owner
+	// whether a room is visible — so show the raw value rather than nothing at all.
+	const visibility =
+		ACCESSIBILITY_LABEL[room.Accessibility] ?? `Accessibility ${room.Accessibility}`
+	const created = new Date(room.CreatedAt)
+
+	return (
+		<li className="room">
+			<img
+				className="room-thumb"
+				src={`${imgHost}/${room.ImageName}?width=256`}
+				alt=""
+				loading="lazy"
+			/>
+			<div className="room-body">
+				<div className="room-head">
+					{/* The caret is how the game writes a room name, so it reads as the thing you
+					    type to get there rather than as a title someone wrote. */}
+					<span className="room-name">^{room.Name}</span>
+					<span className={`badge ${room.Accessibility === Accessibility.Public ? 'live' : ''}`}>
+						{visibility}
+					</span>
+				</div>
+				{room.Description && <p className="room-desc">{room.Description}</p>}
+				<p className="room-stats">
+					{room.Stats.VisitCount.toLocaleString()} visit
+					{room.Stats.VisitCount === 1 ? '' : 's'} · {room.Stats.FavoriteCount.toLocaleString()}{' '}
+					favourite
+					{room.Stats.FavoriteCount === 1 ? '' : 's'} · {room.Stats.CheerCount.toLocaleString()}{' '}
+					cheer{room.Stats.CheerCount === 1 ? '' : 's'}
+					{!Number.isNaN(created.getTime()) && ` · made ${created.toLocaleDateString()}`}
+				</p>
+			</div>
+		</li>
 	)
 }
 

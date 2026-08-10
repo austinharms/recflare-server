@@ -181,6 +181,32 @@ describe('rooms endpoints', () => {
 		expect(other).toEqual([])
 	})
 
+	// The website's "My rooms" list is a browser calling this worker from another origin,
+	// so a response without CORS headers is one the browser throws away — and the page
+	// can't tell that apart from the server being down. Pinned on the preflight too: the
+	// SPA sends `Authorization`, which makes even the GET a preflighted request.
+	it('answers CORS so the website can read a room list from the browser', async () => {
+		const preflight = await SELF.fetch(`${ORIGIN}/rooms/ownedby/me`, {
+			method: 'OPTIONS',
+			headers: {
+				origin: 'https://www.example.com',
+				'access-control-request-method': 'GET',
+				'access-control-request-headers': 'authorization',
+			},
+		})
+		expect(preflight.status).toBe(204)
+		expect(preflight.headers.get('access-control-allow-origin')).toBe('*')
+		expect(preflight.headers.get('access-control-allow-headers')?.toLowerCase()).toContain(
+			'authorization'
+		)
+
+		const res = await SELF.fetch(`${ORIGIN}/rooms/ownedby/me`, {
+			headers: { ...(await bearer('1')), origin: 'https://www.example.com' },
+		})
+		expect(res.status).toBe(200)
+		expect(res.headers.get('access-control-allow-origin')).toBe('*')
+	})
+
 	it('GET /rooms/ownedby|createdby/me lists the caller’s UNPUBLISHED rooms too', async () => {
 		// "My Rooms" is the owner's own list, not a catalog: it must show a room that
 		// isn't public yet, or a freshly created room (which starts Private — see
@@ -214,9 +240,9 @@ describe('rooms endpoints', () => {
 		}
 
 		// The same room is absent from the account's PUBLIC profile list.
-		const publicList = (await (
-			await SELF.fetch(`${ORIGIN}/rooms/ownedby/804`)
-		).json()) as Array<{ Name: string }>
+		const publicList = (await (await SELF.fetch(`${ORIGIN}/rooms/ownedby/804`)).json()) as Array<{
+			Name: string
+		}>
 		expect(publicList.some((r) => r.Name === 'MyUnpublishedRoom')).toBe(false)
 	})
 
@@ -725,8 +751,7 @@ describe('rooms endpoints', () => {
 
 		const namesIn = async (path: string) => {
 			const body = (await (await SELF.fetch(`${ORIGIN}${path}`)).json()) as
-				| { Results: Array<{ Name: string }> }
-				| Array<{ Name: string }>
+				{ Results: Array<{ Name: string }> } | Array<{ Name: string }>
 			return (Array.isArray(body) ? body : body.Results).map((r) => r.Name)
 		}
 		expect(await namesIn('/rooms/hot?take=200')).not.toContain('ParkCloneUnpublished')

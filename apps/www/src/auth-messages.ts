@@ -32,6 +32,10 @@ const AUTH_MESSAGES: Record<string, string> = {
 	'no linked account for this platform identity':
 		'No account is linked to this platform sign-in yet. Sign in with your password once to link it.',
 	'refresh_token is invalid or expired': 'Your session has expired. Please sign in again.',
+	// Deliberately says nothing about when it lifts: auth sends one fixed description for
+	// every ban (see its BANNED_DESCRIPTION), permanent or timed, so there is no expiry
+	// here to quote.
+	'this account is banned': 'This account is banned and cannot be signed in to.',
 }
 
 /** Fallbacks when nothing above matched, so a player never reads an OAuth code. */

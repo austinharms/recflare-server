@@ -605,6 +605,108 @@ h2 {
 	font-weight: 600;
 }
 
+/* ---- My rooms ----------------------------------------------------------- */
+
+/*
+ * The owner's own room list. Rows rather than a grid of tiles: a room is identified by
+ * its name, and the counts underneath are the reason to look — both read left-to-right,
+ * which a tile would stack into a column of tiny type.
+ */
+.rooms {
+	list-style: none;
+	margin: 18px 0 0;
+	padding: 0;
+	display: flex;
+	flex-direction: column;
+	gap: 12px;
+}
+
+.room {
+	display: grid;
+	grid-template-columns: 112px minmax(0, 1fr);
+	gap: 14px;
+	align-items: start;
+	padding-top: 12px;
+	border-top: 1px solid var(--line);
+}
+
+/* The first row sits directly under the intro copy, which already separates it. */
+.room:first-child {
+	padding-top: 0;
+	border-top: none;
+}
+
+/* Fixed 3:2 frame — room thumbnails are screenshots and arrive at any ratio, and a
+   per-room height would leave the names in a ragged column. */
+.room-thumb {
+	width: 100%;
+	aspect-ratio: 3 / 2;
+	object-fit: cover;
+	border: 1px solid var(--line);
+	border-radius: 8px;
+	background: var(--surface-hi);
+}
+
+.room-body {
+	min-width: 0;
+}
+
+.room-head {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: center;
+	gap: 8px;
+}
+
+/* Room names have no spaces to break at, so let a long one wrap anywhere rather than
+   widen the row past the panel. */
+.room-name {
+	font-family: var(--display);
+	font-weight: 700;
+	font-size: 1rem;
+	letter-spacing: -0.01em;
+	overflow-wrap: anywhere;
+}
+
+/* Whether the room is visible to anyone else — the one piece of state an owner can't
+   see anywhere but here. Public gets the same green "healthy" reading as the server
+   status; every other value stays neutral, since Private isn't a fault. */
+.badge {
+	flex: none;
+	font-size: 0.7rem;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.06em;
+	padding: 2px 8px;
+	border-radius: 999px;
+	border: 1px solid var(--line);
+	color: var(--muted);
+}
+
+.badge.live {
+	color: var(--live);
+	border-color: color-mix(in srgb, var(--live) 45%, transparent);
+}
+
+.room-desc {
+	margin: 6px 0 0;
+	font-size: 0.875rem;
+	color: var(--muted);
+	/* Two lines: enough to tell rooms apart, not enough for one to own the list. */
+	display: -webkit-box;
+	-webkit-box-orient: vertical;
+	-webkit-line-clamp: 2;
+	overflow: hidden;
+	overflow-wrap: anywhere;
+}
+
+.room-stats {
+	margin: 8px 0 0;
+	font-size: 0.8rem;
+	color: var(--muted);
+	font-variant-numeric: tabular-nums;
+}
+
 /* ---- Forms -------------------------------------------------------------- */
 
 label {

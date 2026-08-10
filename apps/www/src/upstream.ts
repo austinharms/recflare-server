@@ -15,6 +15,7 @@ export const accountsBase = (env: Env): string => `https://accounts.${env.DOMAIN
 export const notifyBase = (env: Env): string => `https://notify.${env.DOMAIN}`
 export const apiBase = (env: Env): string => `https://api.${env.DOMAIN}`
 export const imgBase = (env: Env): string => `https://img.${env.DOMAIN}`
+export const roomsBase = (env: Env): string => `https://rooms.${env.DOMAIN}`
 
 /**
  * POST a form body to the `auth` worker, carrying the browser's real IP across.
