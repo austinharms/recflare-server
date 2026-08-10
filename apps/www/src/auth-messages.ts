@@ -36,6 +36,11 @@ const AUTH_MESSAGES: Record<string, string> = {
 	// every ban (see its BANNED_DESCRIPTION), permanent or timed, so there is no expiry
 	// here to quote.
 	'this account is banned': 'This account is banned and cannot be signed in to.',
+	// Not this account, but one it shares a device or network with. Phrased for BOTH the
+	// person evading a ban and the housemate of one — the IP arm cannot tell them apart —
+	// and for both forms, since signup and sign-in send the same description.
+	'this device or network is blocked':
+		'This device or network is blocked. If you think that is a mistake, contact the server operator.',
 }
 
 /** Fallbacks when nothing above matched, so a player never reads an OAuth code. */

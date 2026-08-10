@@ -31,6 +31,18 @@ export type Env = SharedHonoEnv & {
 	 * touching the client. See `roomRedirects` in match.app.ts.
 	 */
 	ROOM_REDIRECTS?: string
+	/**
+	 * Which linked arms a ban is enforced through, as a comma-separated list out of `ip`
+	 * and `platform` — or `off` for neither. Unset means BOTH: a ban reaches the accounts
+	 * that share a proven platform identity or an IP with the banned one, which is what
+	 * stops an evader simply making a new account.
+	 *
+	 * The `ip` arm is coarse (households, NAT, campus and carrier networks share one
+	 * address), so `platform` alone is the setting for a server whose players share
+	 * networks. Whatever this says, a ban always applies to the account it was handed to.
+	 * Read through `banEvasionMatch`; the `auth` worker reads the same knob.
+	 */
+	BAN_EVASION_MATCH?: string
 }
 
 /** Variables can be extended */

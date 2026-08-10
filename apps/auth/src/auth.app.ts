@@ -26,7 +26,7 @@ import { generateToken, TOKEN_TTL_SECONDS, validateAndGetAccountId } from '@repo
 
 // The account-wide ban lives on a `report` row, whose table the api worker owns; its db
 // module is plain D1 queries with no runtime deps, so it imports cleanly here.
-import { getActiveBan } from '../../api/src/reports-db'
+import { banEvasionMatch, resolveBan } from '../../api/src/bans-db'
 import { verifyMetaNonce } from './meta-nonce'
 import {
 	CachedLogin,
@@ -68,6 +68,15 @@ const TOKEN_SCOPE =
  * fall through to the generic "you could not be signed in". Keep the two in sync.
  */
 const BANNED_DESCRIPTION = 'this account is banned'
+
+/**
+ * The refusal when it is not THIS account that is banned but one it shares an identity
+ * with (see bans-db's linked arms). Deliberately a different, vaguer sentence: the
+ * account being refused may be an innocent housemate of a banned player, so telling them
+ * "this account is banned" would be a lie, and naming the account we matched them to
+ * would hand out somebody else's moderation record.
+ */
+const BLOCKED_DESCRIPTION = 'this device or network is blocked'
 
 /**
  * The platform id a SIDELOADED Oculus APK reports. It is not an identity: a sideloaded
@@ -561,8 +570,16 @@ const app = new Hono<App>()
 				'**Bans.** Once the grant has resolved an account, a BANNED account is refused a',
 				'token at all (`invalid_grant`) — every grant, including a refresh. A ban is a',
 				'`report` row with `banned` set (the `api` worker owns that table); it lifts on its',
-				'own when `ban_expires` passes, and never if that is null. The ban belongs to the',
-				'account, so it does not stop the player creating a new one — only the signup caps do.',
+				'own when `ban_expires` passes, and never if that is null.',
+				'',
+				'The refusal follows the player, not just the account: it also catches an account',
+				'that shares a PROVEN platform identity (a `platform_account` link) or an IP',
+				'(`signupIp`/`lastLoginIp`, or the address this request came from) with a banned',
+				'one, and a `create_account` carrying either is refused BEFORE it mints anything.',
+				'Those two arms are the operator’s `BAN_EVASION_MATCH` knob (`ip`, `platform`, or',
+				'`off`); the ban on the account itself is always enforced. A linked match answers a',
+				'deliberately vaguer description than a direct one — the account refused may belong',
+				'to a housemate of the banned player rather than to them.',
 			].join('\n'),
 			requestBody: form(
 				TokenRequest,
@@ -718,6 +735,35 @@ const app = new Hono<App>()
 			//    via create_account or /account/me/changepassword.
 			let accountId: string
 			if (grantType === 'create_account') {
+				// A banned player's next move is a new account, so the ban is checked BEFORE
+				// one is minted — against the only identity a signup has, the IP it came from
+				// and the platform identity it just proved. Refusing after the fact (as the
+				// shared check below would) still refuses the token, but leaves the account
+				// row behind and burns a slot off both signup caps, so the evader gets to keep
+				// making them.
+				//
+				// Nothing here can match the account arm (there is no account yet), so this is
+				// purely the linked matching, and BAN_EVASION_MATCH=off leaves signup open —
+				// which is the honest default position: a server that won't accept the IP arm's
+				// false positives is choosing to let evaders re-register.
+				const blocked = await resolveBan(c.env.DB, null, {
+					identity: {
+						ip: clientIp,
+						platform: verifiedPlatform,
+						platformId: verifiedPlatformId,
+					},
+					arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
+				})
+				if (blocked) {
+					logger.info('signup refused: player banned', {
+						via: blocked.via,
+						bannedAccountId: blocked.bannedAccountId,
+						ip: clientIp,
+						platformId: verifiedPlatformId,
+					})
+					return c.json({ error: 'invalid_grant', error_description: BLOCKED_DESCRIPTION }, 400)
+				}
+
 				// Signup caps. Checked before minting anything, so a rejected signup leaves no
 				// account behind. Each arm is skipped when it's disabled (var <= 0) or when its
 				// identity is unknown (no verified platform id / no client IP) — an unattributable
@@ -887,8 +933,8 @@ const app = new Hono<App>()
 				await setLoginContext(c.env.DB, resolvedId, { deviceId, deviceClass, ip: clientIp })
 			}
 
-			// A banned account gets no token — and with no token every other worker is shut
-			// to it, so this is the outer wall of a ban; matchmaking's refusal is the inner
+			// A banned player gets no token — and with no token every other worker is shut to
+			// them, so this is the outer wall of a ban; matchmaking's refusal is the inner
 			// one, which still has to exist because a token issued before the ban stays valid
 			// until it expires.
 			//
@@ -898,18 +944,31 @@ const app = new Hono<App>()
 			// a wrong password is still "invalid account_id or password", so this can't be
 			// used to probe whether an account exists or is banned without knowing it.
 			//
-			// It is per-account, and the ban is the account's, not the person's: nothing here
-			// stops a banned player creating a new account and playing on. Refusing that is a
-			// signup-cap/platform-identity problem, not this check's.
-			const ban = await getActiveBan(c.env.DB, Number(accountId))
+			// The request's own IP and proven identity are passed alongside the account, so a
+			// ban also reaches an old, clean account logged into from the banned player's
+			// device or network — the stored ips alone would only catch that on the SECOND
+			// login. create_account was already refused before it minted anything (above);
+			// this still runs for it, so a signup that raced one is refused too.
+			const ban = await resolveBan(c.env.DB, Number(accountId), {
+				identity: { ip: clientIp, platform: verifiedPlatform, platformId: verifiedPlatformId },
+				arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
+			})
 			if (ban) {
-				logger.info('token refused: account banned', {
+				logger.info('token refused: player banned', {
 					accountId,
 					grantType,
-					reportId: ban.id,
-					banExpires: ban.ban_expires,
+					via: ban.via,
+					bannedAccountId: ban.bannedAccountId,
+					reportId: ban.ban.id,
+					banExpires: ban.ban.ban_expires,
 				})
-				return c.json({ error: 'invalid_grant', error_description: BANNED_DESCRIPTION }, 400)
+				return c.json(
+					{
+						error: 'invalid_grant',
+						error_description: ban.via === 'account' ? BANNED_DESCRIPTION : BLOCKED_DESCRIPTION,
+					},
+					400
+				)
 			}
 
 			// Never sign with an empty key. An empty JWT_SECRET (misconfigured/missing

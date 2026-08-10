@@ -13,6 +13,8 @@ import {
 
 import '../../api.app'
 
+import { PLATFORM_SCHEMA_DDL } from '../../../../auth/src/platform-db'
+import { banEvasionMatch, resolveBan } from '../../bans-db'
 import {
 	countGoing,
 	SCHEMA_DDL as EVENTS_SCHEMA_DDL,
@@ -24,6 +26,7 @@ import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
 import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
 import {
 	banFromReport,
+	createReport,
 	getActiveBan,
 	getReportsAgainst,
 	isPlayerBanned,
@@ -104,6 +107,9 @@ beforeAll(async () => {
 
 	// Reports table (owned by the api worker) — player reports are recorded here.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Platform identity links (owned by the auth worker) — the sharp arm of the
+	// ban-evasion resolution matches on them.
+	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Warnings table (owned by the api worker) — moderator-issued warnings land here.
 	for (const stmt of WARNINGS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -3214,5 +3220,197 @@ describe('openapi', () => {
 		const integers = raw.match(/"type":"integer"/g) ?? []
 		expect(integers.length).toBeGreaterThan(0)
 		expect(raw.match(/"example":12345/g)?.length).toBe(integers.length)
+	})
+})
+
+// A ban follows the player, not just the account row it was written on: an evader makes
+// a new account in seconds, so the block also reaches accounts sharing a PROVEN platform
+// identity or an IP with a banned one. See bans-db.ts — and note the IP arm is the coarse
+// one, which is why `BAN_EVASION_MATCH` can narrow or disable both linked arms.
+describe('ban evasion', () => {
+	/** Seed an account with the IPs it signed up / last logged in from. */
+	const account = async (id: number, ips: { signupIp?: string; lastLoginIp?: string } = {}) => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: id, username: `Evader${id}`, ...ips }))
+			.run()
+	}
+
+	/** Link a proven platform identity to an account, as a verified login does. */
+	const link = async (id: number, platform: number, platformId: string) => {
+		await env.DB.prepare(
+			`INSERT OR IGNORE INTO platform_account (account_id, platform, platform_id, linked_at)
+			 VALUES (?1, ?2, ?3, ?4)`
+		)
+			.bind(id, platform, platformId, new Date().toISOString())
+			.run()
+	}
+
+	/** File a report against `playerId` and convert it into a ban. */
+	const ban = async (playerId: number, banExpires: string | null = null) => {
+		const row = await createReport(env.DB, { reporterPlayerId: 1, reportedPlayerId: playerId })
+		await banFromReport(env.DB, row.id, { banExpires })
+	}
+
+	test('a banned account is matched directly', async () => {
+		await account(7001)
+		await ban(7001)
+		expect(await resolveBan(env.DB, 7001)).toMatchObject({ via: 'account', bannedAccountId: 7001 })
+	})
+
+	test('an unrelated account is not matched', async () => {
+		await account(7002, { signupIp: '198.51.100.9' })
+		await link(7002, 0, 'steam-clean')
+		expect(await resolveBan(env.DB, 7002)).toBeNull()
+	})
+
+	test('an account sharing a signup IP with a banned account is matched', async () => {
+		await account(7010, { signupIp: '203.0.113.7' })
+		await ban(7010)
+		await account(7011, { signupIp: '203.0.113.7' })
+
+		const match = await resolveBan(env.DB, 7011)
+		expect(match).toMatchObject({ via: 'ip', bannedAccountId: 7010 })
+	})
+
+	// The IPs are compared as SETS: the new account's last-login IP against the banned
+	// account's signup IP counts, which is the shape evasion actually takes (sign up
+	// somewhere else, come back to the same connection).
+	test('a last-login IP matching a banned signup IP is matched', async () => {
+		await account(7012, { signupIp: '203.0.113.20' })
+		await ban(7012)
+		await account(7013, { signupIp: '198.51.100.1', lastLoginIp: '203.0.113.20' })
+
+		expect(await resolveBan(env.DB, 7013)).toMatchObject({ via: 'ip', bannedAccountId: 7012 })
+	})
+
+	test('an account sharing a platform identity with a banned account is matched', async () => {
+		await account(7020)
+		await link(7020, 0, 'steam-76561')
+		await ban(7020)
+		await account(7021)
+		await link(7021, 0, 'steam-76561')
+
+		expect(await resolveBan(env.DB, 7021)).toMatchObject({ via: 'platform', bannedAccountId: 7020 })
+	})
+
+	// The same id on a DIFFERENT platform is a different person — ids are namespaced per
+	// platform, so the arm matches the pair, not the bare id.
+	test('the same platform id on another platform is not matched', async () => {
+		await account(7022)
+		await link(7022, 0, 'id-collision')
+		await ban(7022)
+		await account(7023)
+		await link(7023, 1, 'id-collision')
+
+		expect(await resolveBan(env.DB, 7023)).toBeNull()
+	})
+
+	// Two accounts that merely both lack an IP have nothing in common — "unknown" must
+	// never match "unknown", or every IP-less account would be banned by the first one.
+	test('accounts with no IP at all are not matched to each other', async () => {
+		await account(7030)
+		await ban(7030)
+		await account(7031)
+		expect(await resolveBan(env.DB, 7031)).toBeNull()
+		// Nor does an empty-string IP, which is what a login outside the CF edge stores.
+		await account(7032, { signupIp: '', lastLoginIp: '' })
+		expect(await resolveBan(env.DB, 7032)).toBeNull()
+	})
+
+	test('an expired ban reaches nobody, linked or not', async () => {
+		await account(7040, { signupIp: '203.0.113.40' })
+		await link(7040, 0, 'steam-expired')
+		await ban(7040, '2020-01-01T00:00:00.000Z')
+		await account(7041, { signupIp: '203.0.113.40' })
+		await link(7041, 0, 'steam-expired')
+
+		expect(await resolveBan(env.DB, 7040)).toBeNull()
+		expect(await resolveBan(env.DB, 7041)).toBeNull()
+	})
+
+	// The strongest evidence is reported: a player whose own account is banned is told
+	// that, not that their network was.
+	test('a direct ban outranks a linked one', async () => {
+		await account(7050, { signupIp: '203.0.113.50' })
+		await ban(7050)
+		await account(7051, { signupIp: '203.0.113.50' })
+		await ban(7051)
+
+		expect(await resolveBan(env.DB, 7051)).toMatchObject({ via: 'account', bannedAccountId: 7051 })
+	})
+
+	test('a platform match outranks an IP one', async () => {
+		await account(7060, { signupIp: '203.0.113.60' })
+		await ban(7060)
+		await account(7061)
+		await link(7061, 0, 'steam-both')
+		await ban(7061)
+		// 7062 shares an IP with 7060 and a platform identity with 7061.
+		await account(7062, { signupIp: '203.0.113.60' })
+		await link(7062, 0, 'steam-both')
+
+		expect(await resolveBan(env.DB, 7062)).toMatchObject({ via: 'platform', bannedAccountId: 7061 })
+	})
+
+	// A signup has no account yet — the identity the request carries is all there is to
+	// go on, and refusing it there is what stops the next account being created at all.
+	test('an identity with no account is matched on its IP and platform id', async () => {
+		await account(7070, { signupIp: '203.0.113.70' })
+		await link(7070, 0, 'steam-signup')
+		await ban(7070)
+
+		expect(await resolveBan(env.DB, null, { identity: { ip: '203.0.113.70' } })).toMatchObject({
+			via: 'ip',
+			bannedAccountId: 7070,
+		})
+		expect(
+			await resolveBan(env.DB, null, { identity: { platform: 0, platformId: 'steam-signup' } })
+		).toMatchObject({ via: 'platform', bannedAccountId: 7070 })
+		// An identity that matches nothing is not blocked.
+		expect(
+			await resolveBan(env.DB, null, {
+				identity: { ip: '198.51.100.200', platform: 0, platformId: 'steam-unknown' },
+			})
+		).toBeNull()
+		// And an identity carrying nothing at all can't be matched to anyone.
+		expect(await resolveBan(env.DB, null, { identity: {} })).toBeNull()
+	})
+
+	// The arms an operator can turn off — and the one they cannot.
+	test('BAN_EVASION_MATCH arms narrow the linked matching only', async () => {
+		await account(7080, { signupIp: '203.0.113.80' })
+		await link(7080, 0, 'steam-arms')
+		await ban(7080)
+		await account(7081, { signupIp: '203.0.113.80' }) // shares the IP only
+		await account(7082)
+		await link(7082, 0, 'steam-arms') // shares the identity only
+
+		const arms = (value: string | undefined) => ({ arms: banEvasionMatch(value) })
+		// Default: both arms reach.
+		expect(await resolveBan(env.DB, 7081, arms(undefined))).toMatchObject({ via: 'ip' })
+		expect(await resolveBan(env.DB, 7082, arms(undefined))).toMatchObject({ via: 'platform' })
+		// Platform only: the household bystander is let through, the evader isn't.
+		expect(await resolveBan(env.DB, 7081, arms('platform'))).toBeNull()
+		expect(await resolveBan(env.DB, 7082, arms('platform'))).toMatchObject({ via: 'platform' })
+		// Off: neither linked arm reaches...
+		expect(await resolveBan(env.DB, 7081, arms('off'))).toBeNull()
+		expect(await resolveBan(env.DB, 7082, arms('off'))).toBeNull()
+		// ...but the ban itself still applies to the account it was handed to.
+		expect(await resolveBan(env.DB, 7080, arms('off'))).toMatchObject({ via: 'account' })
+	})
+
+	test('banEvasionMatch reads the knob', () => {
+		expect(banEvasionMatch(undefined)).toEqual({ ip: true, platform: true })
+		expect(banEvasionMatch('ip,platform')).toEqual({ ip: true, platform: true })
+		expect(banEvasionMatch(' PLATFORM ')).toEqual({ ip: false, platform: true })
+		expect(banEvasionMatch('ip')).toEqual({ ip: true, platform: false })
+		expect(banEvasionMatch('off')).toEqual({ ip: false, platform: false })
+		expect(banEvasionMatch('none')).toEqual({ ip: false, platform: false })
+		expect(banEvasionMatch('')).toEqual({ ip: false, platform: false })
+		// `off` wins over anything else in the list, and a typo is ignored rather than
+		// fatal — this is read on the matchmake path.
+		expect(banEvasionMatch('off,ip')).toEqual({ ip: false, platform: false })
+		expect(banEvasionMatch('ipv6')).toEqual({ ip: false, platform: false })
+		expect(banEvasionMatch('ip,typo')).toEqual({ ip: true, platform: false })
 	})
 })

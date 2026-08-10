@@ -26,6 +26,7 @@ import {
 	createReport,
 	SCHEMA_DDL as REPORTS_SCHEMA_DDL,
 } from '../../../../api/src/reports-db'
+import { PLATFORM_SCHEMA_DDL } from '../../../../auth/src/platform-db'
 import { scheduled } from '../../match.app'
 
 import type { Env } from '../../context'
@@ -171,6 +172,9 @@ beforeAll(async () => {
 	// Report table (owned by the api worker) — an account-wide ban is a report row with
 	// `banned` set, and every matchmake is refused for a player who has one.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Platform identity links (owned by the auth worker) — a ban also reaches the
+	// accounts sharing a proven identity with the banned one.
+	for (const stmt of PLATFORM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 /**
@@ -1877,5 +1881,101 @@ describe('account bans', () => {
 			headers: await bearer('6007'),
 		})
 		expect(res.status).toBe(200)
+	})
+})
+
+// The ban follows the player past the account it was written on: a new account sharing a
+// proven platform identity or an IP with a banned one is refused the same way. See
+// bans-db.ts in the api worker for the arms and the BAN_EVASION_MATCH knob.
+describe('ban evasion at matchmake', () => {
+	const matchmake = async (player: string, ip?: string) =>
+		(await (
+			await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
+				method: 'POST',
+				headers: { ...(await bearer(player)), ...(ip ? { 'CF-Connecting-IP': ip } : {}) },
+			})
+		).json()) as { errorCode: number; roomInstance: unknown }
+
+	/** Seed an account row carrying the IPs it signed up / last logged in from. */
+	const account = async (id: number, ips: Record<string, string> = {}) => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId: id, username: `Player${id}`, ...ips }))
+			.run()
+	}
+
+	const link = async (id: number, platform: number, platformId: string) => {
+		await env.DB.prepare(
+			`INSERT OR IGNORE INTO platform_account (account_id, platform, platform_id, linked_at)
+			 VALUES (?1, ?2, ?3, ?4)`
+		)
+			.bind(id, platform, platformId, new Date().toISOString())
+			.run()
+	}
+
+	test('a new account sharing a banned account’s platform identity is refused', async () => {
+		await account(6201)
+		await link(6201, 0, 'steam-evader')
+		await banAccount(6201)
+		// The replacement account: different id, same headset.
+		await account(6202)
+		await link(6202, 0, 'steam-evader')
+
+		expect(await matchmake('6202')).toEqual({ errorCode: 55, roomInstance: null })
+	})
+
+	test('a new account sharing a banned account’s signup IP is refused', async () => {
+		await account(6203, { signupIp: '203.0.113.203' })
+		await banAccount(6203)
+		await account(6204, { signupIp: '203.0.113.203' })
+
+		expect(await matchmake('6204')).toEqual({ errorCode: 55, roomInstance: null })
+	})
+
+	// The address the request arrives from counts too, so an account that has never
+	// logged in from the banned network before is caught on the first matchmake.
+	test('the request’s own IP is matched even when the account has none stored', async () => {
+		await account(6205, { signupIp: '203.0.113.205' })
+		await banAccount(6205)
+		await account(6206)
+
+		expect(await matchmake('6206', '203.0.113.205')).toEqual({ errorCode: 55, roomInstance: null })
+		// From anywhere else, that same account plays.
+		expect((await matchmake('6206', '198.51.100.50')).errorCode).toBe(0)
+	})
+
+	test('an unrelated account is unaffected', async () => {
+		await account(6207, { signupIp: '203.0.113.207' })
+		await banAccount(6207)
+		await account(6208, { signupIp: '198.51.100.208' })
+		await link(6208, 0, 'steam-innocent')
+
+		expect((await matchmake('6208')).errorCode).toBe(0)
+	})
+
+	// BAN_EVASION_MATCH is the operator's answer to the IP arm's false positives: the
+	// housemate of a banned player gets back in, the evader on the same headset does not.
+	test('BAN_EVASION_MATCH=platform drops the IP arm but keeps the direct ban', async () => {
+		const original = env.BAN_EVASION_MATCH
+		await account(6210, { signupIp: '203.0.113.210' })
+		await link(6210, 0, 'steam-knob')
+		await banAccount(6210)
+		await account(6211, { signupIp: '203.0.113.210' }) // housemate
+		await account(6212)
+		await link(6212, 0, 'steam-knob') // same headset
+
+		try {
+			env.BAN_EVASION_MATCH = 'platform'
+			expect((await matchmake('6211')).errorCode).toBe(0)
+			expect(await matchmake('6212')).toEqual({ errorCode: 55, roomInstance: null })
+			// The banned account itself is still refused, whatever the knob says.
+			expect(await matchmake('6210')).toEqual({ errorCode: 55, roomInstance: null })
+
+			env.BAN_EVASION_MATCH = 'off'
+			expect((await matchmake('6211')).errorCode).toBe(0)
+			expect((await matchmake('6212')).errorCode).toBe(0)
+			expect(await matchmake('6210')).toEqual({ errorCode: 55, roomInstance: null })
+		} finally {
+			env.BAN_EVASION_MATCH = original
+		}
 	})
 })

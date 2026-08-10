@@ -41,7 +41,7 @@ import { validateAndGetAccountId } from '@repo/jwt'
 // The account-wide ban lives on a `report` row, whose table the api worker owns; its
 // db module is plain D1 queries with no runtime deps, so it imports cleanly here (the
 // same way econ reads api's inventions-db).
-import { isPlayerBanned } from '../../api/src/reports-db'
+import { banEvasionMatch, resolveBan } from '../../api/src/bans-db'
 // Value import of the notify worker's NotificationType enum (its bundle has no runtime
 // deps), so /invite sends a typed MessageReceived frame instead of a magic number.
 import { NotificationType } from '../../notify/src/notification-types'
@@ -700,12 +700,18 @@ const app = new Hono<App>()
 			})(c, next)
 	)
 
-	// A banned account goes nowhere. Room bans are per-room and checked per route (they
-	// depend on which room you're entering); an ACCOUNT ban isn't about a room at all, so
-	// it's enforced once here, across every matchmake — by room, by subroom, by instance,
-	// into a club's clubhouse, following a friend, and into their own dorm. A gate rather
-	// than six copies of the same check: a route added later inherits it, and there is no
+	// A banned player goes nowhere. Room bans are per-room and checked per route (they
+	// depend on which room you're entering); a BAN isn't about a room at all, so it's
+	// enforced once here, across every matchmake — by room, by subroom, by instance, into
+	// a club's clubhouse, following a friend, and into their own dorm. A gate rather than
+	// six copies of the same check: a route added later inherits it, and there is no
 	// matchmake left that hands a banned player Photon coordinates.
+	//
+	// `resolveBan` matches the caller's own account AND the accounts they share a proven
+	// platform identity or an IP with, so a ban survives the evader making a new account
+	// (see bans-db.ts; the operator narrows the linked arms with BAN_EVASION_MATCH). The
+	// arm that matched is logged, because "banned" and "shares a network with somebody
+	// banned" are very different things to be looking at in a log.
 	//
 	// It answers the same BannedFromRoom the room bans do. The code is per-room in name
 	// only — it's the one refusal the client renders as "you are banned" instead of a room
@@ -715,9 +721,20 @@ const app = new Hono<App>()
 	// 401, which mustn't turn into "banned" just because the token was missing.
 	.use('/matchmake/*', async (c, next) => {
 		const id = await authedId(c)
-		if (id !== null && (await isPlayerBanned(c.env.DB, id))) {
-			logger.info('matchmake refused: account banned', { accountId: id, path: c.req.path })
-			return c.json({ errorCode: BANNED_FROM_ROOM, roomInstance: null })
+		if (id !== null) {
+			const match = await resolveBan(c.env.DB, id, {
+				identity: { ip: c.req.header('cf-connecting-ip') },
+				arms: banEvasionMatch(c.env.BAN_EVASION_MATCH),
+			})
+			if (match) {
+				logger.info('matchmake refused: player banned', {
+					accountId: id,
+					via: match.via,
+					bannedAccountId: match.bannedAccountId,
+					path: c.req.path,
+				})
+				return c.json({ errorCode: BANNED_FROM_ROOM, roomInstance: null })
+			}
 		}
 		await next()
 	})
