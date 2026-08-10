@@ -22,7 +22,13 @@ import {
 import { createImage, getImageByName, SCHEMA_DDL as IMAGES_SCHEMA_DDL } from '../../images-db'
 import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
 import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
-import { getReportsAgainst, SCHEMA_DDL as REPORTS_SCHEMA_DDL } from '../../reports-db'
+import {
+	banFromReport,
+	getActiveBan,
+	getReportsAgainst,
+	isPlayerBanned,
+	SCHEMA_DDL as REPORTS_SCHEMA_DDL,
+} from '../../reports-db'
 import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
 import type { Env } from '../../context'
@@ -1330,6 +1336,84 @@ describe('player reports', () => {
 		expect(res.status).toBe(400)
 		// Same envelope as the success branch — the client parses only one shape.
 		expect(await res.json()).toEqual({ success: false, error: 'PlayerIdReported is required' })
+	})
+
+	// A report is filed unbanned; a moderator converting it into a ban is what the
+	// `banned` / `ban_expires` columns are for. `match` and `auth` read exactly this.
+	test('a report is filed unbanned', async () => {
+		await submit({ PlayerIdReported: '210' }, await bearer())
+		const [row] = await getReportsAgainst(env.DB, 210)
+		expect(row).toMatchObject({ banned: 0, ban_expires: null })
+		expect(await isPlayerBanned(env.DB, 210)).toBe(false)
+	})
+
+	test('banFromReport bans the reported player, permanently by default', async () => {
+		await submit({ PlayerIdReported: '211', Details: 'the evidence' }, await bearer())
+		const [row] = await getReportsAgainst(env.DB, 211)
+
+		const banned = await banFromReport(env.DB, row!.id)
+		expect(banned).toMatchObject({ banned: 1, ban_expires: null })
+		// The report the ban was made from is still attached to it — the point of
+		// banning on the row rather than in a table of its own.
+		expect(banned?.details).toBe('the evidence')
+		expect(await isPlayerBanned(env.DB, 211)).toBe(true)
+		// It bans the REPORTED player, not the reporter who filed it.
+		expect(await isPlayerBanned(env.DB, 42)).toBe(false)
+	})
+
+	// A timed ban lifts itself: nothing clears the flag, the expiry just passes.
+	test('a ban with a past expiry is no longer in force', async () => {
+		await submit({ PlayerIdReported: '212' }, await bearer())
+		const [row] = await getReportsAgainst(env.DB, 212)
+		await banFromReport(env.DB, row!.id, { banExpires: '2020-01-01T00:00:00.000Z' })
+
+		expect(await isPlayerBanned(env.DB, 212)).toBe(false)
+		// Still on the row, as the record that it happened.
+		expect((await getReportsAgainst(env.DB, 212))[0]).toMatchObject({ banned: 1 })
+		// And in force while it lasted.
+		expect(await isPlayerBanned(env.DB, 212, new Date('2019-06-01T00:00:00.000Z'))).toBe(true)
+	})
+
+	test('a ban with a future expiry is in force', async () => {
+		await submit({ PlayerIdReported: '213' }, await bearer())
+		const [row] = await getReportsAgainst(env.DB, 213)
+		const expires = new Date(Date.now() + 86_400_000).toISOString()
+		await banFromReport(env.DB, row!.id, { banExpires: expires })
+
+		expect(await isPlayerBanned(env.DB, 213)).toBe(true)
+		expect((await getActiveBan(env.DB, 213))?.ban_expires).toBe(expires)
+	})
+
+	// Two bans in force: the longest-lasting one is the one reported, so a fresh short
+	// ban can't shorten a standing permanent one.
+	test('getActiveBan prefers the permanent ban', async () => {
+		await submit({ PlayerIdReported: '214', Details: 'timed' }, await bearer())
+		await submit({ PlayerIdReported: '214', Details: 'permanent' }, await bearer())
+		const rows = await getReportsAgainst(env.DB, 214)
+		const timed = rows.find((r) => r.details === 'timed')!
+		const permanent = rows.find((r) => r.details === 'permanent')!
+		await banFromReport(env.DB, timed.id, {
+			banExpires: new Date(Date.now() + 3_600_000).toISOString(),
+		})
+		await banFromReport(env.DB, permanent.id)
+
+		expect(await getActiveBan(env.DB, 214)).toMatchObject({ details: 'permanent' })
+	})
+
+	test('banFromReport with banned:false lifts the ban and clears the expiry', async () => {
+		await submit({ PlayerIdReported: '215' }, await bearer())
+		const [row] = await getReportsAgainst(env.DB, 215)
+		await banFromReport(env.DB, row!.id, { banExpires: '2999-01-01T00:00:00.000Z' })
+		expect(await isPlayerBanned(env.DB, 215)).toBe(true)
+
+		const lifted = await banFromReport(env.DB, row!.id, { banned: false })
+		expect(lifted).toMatchObject({ banned: 0, ban_expires: null })
+		expect(await isPlayerBanned(env.DB, 215)).toBe(false)
+	})
+
+	// No such report — the caller can tell that from having banned nobody.
+	test('banFromReport returns null for an unknown report', async () => {
+		expect(await banFromReport(env.DB, 999_999)).toBeNull()
 	})
 })
 

@@ -24,6 +24,9 @@ import {
 import { intVar, logger, withCleanSpec, withDefaultCors, withNotFound, withOnError } from '@repo/hono-helpers'
 import { generateToken, TOKEN_TTL_SECONDS, validateAndGetAccountId } from '@repo/jwt'
 
+// The account-wide ban lives on a `report` row, whose table the api worker owns; its db
+// module is plain D1 queries with no runtime deps, so it imports cleanly here.
+import { getActiveBan } from '../../api/src/reports-db'
 import { verifyMetaNonce } from './meta-nonce'
 import {
 	CachedLogin,
@@ -57,6 +60,14 @@ import type { PlatformLink } from './platform-db'
 /** OAuth scopes granted by `/connect/token`. */
 const TOKEN_SCOPE =
 	'offline_access profile rn rn.accounts rn.accounts.gc rn.api rn.chat rn.clubs rn.commerce rn.match.read rn.match.write rn.notify rn.rooms rn.storage'
+
+/**
+ * The `error_description` a banned account's grant is refused with. A fixed sentence,
+ * never interpolated with the expiry, because `www`'s shared auth-messages table keys on
+ * this exact string to put a real sentence in front of a player — anything varying would
+ * fall through to the generic "you could not be signed in". Keep the two in sync.
+ */
+const BANNED_DESCRIPTION = 'this account is banned'
 
 /**
  * The platform id a SIDELOADED Oculus APK reports. It is not an identity: a sideloaded
@@ -546,6 +557,12 @@ const app = new Hono<App>()
 				'',
 				'**Roles.** The token embeds a `role` claim from the account, so developer/moderator',
 				'powers refresh on every login and every refresh grant.',
+				'',
+				'**Bans.** Once the grant has resolved an account, a BANNED account is refused a',
+				'token at all (`invalid_grant`) — every grant, including a refresh. A ban is a',
+				'`report` row with `banned` set (the `api` worker owns that table); it lifts on its',
+				'own when `ban_expires` passes, and never if that is null. The ban belongs to the',
+				'account, so it does not stop the player creating a new one — only the signup caps do.',
 			].join('\n'),
 			requestBody: form(
 				TokenRequest,
@@ -557,7 +574,8 @@ const app = new Hono<App>()
 					OAuthError,
 					[
 						'Unusable grant: bad credentials, an unverifiable platform or platform_auth, an',
-						'invalid/expired refresh token, a missing account identifier, or a signup cap reached',
+						'invalid/expired refresh token, a missing account identifier, a signup cap reached,',
+						'or a banned account',
 					].join(' ')
 				),
 				500: json(
@@ -867,6 +885,31 @@ const app = new Hono<App>()
 				}
 				await setLastLoginTime(c.env.DB, resolvedId, new Date().toISOString())
 				await setLoginContext(c.env.DB, resolvedId, { deviceId, deviceClass, ip: clientIp })
+			}
+
+			// A banned account gets no token — and with no token every other worker is shut
+			// to it, so this is the outer wall of a ban; matchmaking's refusal is the inner
+			// one, which still has to exist because a token issued before the ban stays valid
+			// until it expires.
+			//
+			// Checked once here, after the grant has resolved an account, so it covers every
+			// grant: password, cached_login and a refresh_token redeemed by a client that has
+			// been running since before the ban. Deliberately AFTER the credential checks —
+			// a wrong password is still "invalid account_id or password", so this can't be
+			// used to probe whether an account exists or is banned without knowing it.
+			//
+			// It is per-account, and the ban is the account's, not the person's: nothing here
+			// stops a banned player creating a new account and playing on. Refusing that is a
+			// signup-cap/platform-identity problem, not this check's.
+			const ban = await getActiveBan(c.env.DB, Number(accountId))
+			if (ban) {
+				logger.info('token refused: account banned', {
+					accountId,
+					grantType,
+					reportId: ban.id,
+					banExpires: ban.ban_expires,
+				})
+				return c.json({ error: 'invalid_grant', error_description: BANNED_DESCRIPTION }, 400)
 			}
 
 			// Never sign with an empty key. An empty JWT_SECRET (misconfigured/missing

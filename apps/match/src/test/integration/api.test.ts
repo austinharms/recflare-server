@@ -21,6 +21,11 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import {
+	banFromReport,
+	createReport,
+	SCHEMA_DDL as REPORTS_SCHEMA_DDL,
+} from '../../../../api/src/reports-db'
 import { scheduled } from '../../match.app'
 
 import type { Env } from '../../context'
@@ -162,7 +167,20 @@ beforeAll(async () => {
 		insertRel.bind(9702, 9700, 3), // friends (9702 requested) — friend is the requester
 		insertRel.bind(9700, 9703, 1), // pending request out — 9703 is NOT a friend
 	])
+
+	// Report table (owned by the api worker) — an account-wide ban is a report row with
+	// `banned` set, and every matchmake is refused for a player who has one.
+	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
+
+/**
+ * Ban a player account-wide the way a moderator would: file a report against them and
+ * convert it. `banExpires` null is a permanent ban.
+ */
+async function banAccount(playerId: number, banExpires: string | null = null): Promise<void> {
+	const row = await createReport(env.DB, { reporterPlayerId: 1, reportedPlayerId: playerId })
+	await banFromReport(env.DB, row.id, { banExpires })
+}
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
 // match worker's validation accepts it. Kept inline to avoid a cross-package
@@ -1218,8 +1236,11 @@ describe('auth-gated endpoints', () => {
 
 		// No token → 401.
 		expect(
-			(await exports.default.fetch(`${ORIGIN}/matchmake/instance/${instanceId}`, { method: 'POST' }))
-				.status
+			(
+				await exports.default.fetch(`${ORIGIN}/matchmake/instance/${instanceId}`, {
+					method: 'POST',
+				})
+			).status
 		).toBe(401)
 
 		// Authed but not the room's owner or co-owner → the opaque NoSuchRoom refusal,
@@ -1598,8 +1619,9 @@ describe('auth-gated endpoints', () => {
 				roomInstance: null,
 			})
 		} finally {
-			await env.DB.prepare('DELETE FROM room_ban WHERE room_id = 2 AND banned_player_id = 9800')
-				.run()
+			await env.DB.prepare(
+				'DELETE FROM room_ban WHERE room_id = 2 AND banned_player_id = 9800'
+			).run()
 		}
 	})
 
@@ -1763,5 +1785,97 @@ describe('auth-gated endpoints', () => {
 		for (const ops of Object.values(spec.paths)) {
 			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
 		}
+	})
+})
+
+// An ACCOUNT ban (a `report` row with `banned` set, owned by the api worker) is not
+// about any one room, so it is enforced across every matchmake rather than per route —
+// see the /matchmake/* gate in match.app.ts. It answers the same BannedFromRoom (55) the
+// per-room bans do, which is the code the client renders as "you are banned".
+describe('account bans', () => {
+	const matchmake = async (path: string, player: string) =>
+		exports.default.fetch(`${ORIGIN}${path}`, {
+			method: 'POST',
+			headers: await bearer(player),
+		})
+
+	test('every matchmake route is refused for a banned account', async () => {
+		await banAccount(6001)
+		// One live instance of room 2 and one club membership, so each route would
+		// otherwise have somewhere to put them.
+		for (const path of [
+			'/matchmake/room/2',
+			'/matchmake/room/77/34',
+			'/matchmake/dorm',
+			'/matchmake/club/4',
+			'/matchmake/player/9701',
+			'/matchmake/instance/1',
+		]) {
+			const res = await matchmake(path, '6001')
+			expect(res.status, path).toBe(200)
+			expect(await res.json(), path).toEqual({ errorCode: 55, roomInstance: null })
+		}
+	})
+
+	// The refusal is the ban's, not the room's: nothing is entered, so no presence is
+	// written and the player stays where they were (nowhere).
+	test('a refused matchmake leaves no presence behind', async () => {
+		await banAccount(6002)
+		expect((await matchmake('/matchmake/room/2', '6002')).status).toBe(200)
+
+		const player = (await (
+			await exports.default.fetch(`${ORIGIN}/player?id=6002`, { headers: await bearer('6002') })
+		).json()) as Array<{ isOnline: boolean; roomInstance: unknown }>
+		expect(player[0]?.roomInstance ?? null).toBeNull()
+	})
+
+	// A timed ban lifts itself once its expiry passes — nothing clears the flag.
+	test('an expired ban no longer blocks a matchmake', async () => {
+		await banAccount(6003, '2020-01-01T00:00:00.000Z')
+		const res = await matchmake('/matchmake/room/2', '6003')
+		const body = (await res.json()) as { errorCode: number; roomInstance: unknown }
+		expect(body.errorCode).toBe(0)
+		expect(body.roomInstance).not.toBeNull()
+	})
+
+	test('a ban that has not expired yet blocks a matchmake', async () => {
+		await banAccount(6004, new Date(Date.now() + 3_600_000).toISOString())
+		expect(await (await matchmake('/matchmake/room/2', '6004')).json()).toEqual({
+			errorCode: 55,
+			roomInstance: null,
+		})
+	})
+
+	// A report on its own is not a ban — only a moderator converting it is.
+	test('an unbanned report does not block a matchmake', async () => {
+		await createReport(env.DB, { reporterPlayerId: 1, reportedPlayerId: 6005 })
+		const body = (await (await matchmake('/matchmake/room/2', '6005')).json()) as {
+			errorCode: number
+		}
+		expect(body.errorCode).toBe(0)
+	})
+
+	// Filing the report doesn't touch the reporter, so they still play.
+	test('the reporter is not banned by the report they filed', async () => {
+		await banAccount(6006)
+		const body = (await (await matchmake('/matchmake/room/2', '1')).json()) as { errorCode: number }
+		expect(body.errorCode).toBe(0)
+	})
+
+	// The gate must not turn a missing token into "banned" — that's still a 401.
+	test('an unauthenticated matchmake is still a 401', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, { method: 'POST' })
+		expect(res.status).toBe(401)
+	})
+
+	// Only the matchmakes are gated: presence and the rest of the surface keep working,
+	// so a banned player's client isn't left hammering a dead heartbeat.
+	test('the gate does not touch non-matchmake routes', async () => {
+		await banAccount(6007)
+		const res = await exports.default.fetch(`${ORIGIN}/player/heartbeat`, {
+			method: 'POST',
+			headers: await bearer('6007'),
+		})
+		expect(res.status).toBe(200)
 	})
 })

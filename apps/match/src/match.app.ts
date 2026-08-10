@@ -38,6 +38,10 @@ import {
 import { logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
+// The account-wide ban lives on a `report` row, whose table the api worker owns; its
+// db module is plain D1 queries with no runtime deps, so it imports cleanly here (the
+// same way econ reads api's inventions-db).
+import { isPlayerBanned } from '../../api/src/reports-db'
 // Value import of the notify worker's NotificationType enum (its bundle has no runtime
 // deps), so /invite sends a typed MessageReceived frame instead of a magic number.
 import { NotificationType } from '../../notify/src/notification-types'
@@ -696,6 +700,28 @@ const app = new Hono<App>()
 			})(c, next)
 	)
 
+	// A banned account goes nowhere. Room bans are per-room and checked per route (they
+	// depend on which room you're entering); an ACCOUNT ban isn't about a room at all, so
+	// it's enforced once here, across every matchmake — by room, by subroom, by instance,
+	// into a club's clubhouse, following a friend, and into their own dorm. A gate rather
+	// than six copies of the same check: a route added later inherits it, and there is no
+	// matchmake left that hands a banned player Photon coordinates.
+	//
+	// It answers the same BannedFromRoom the room bans do. The code is per-room in name
+	// only — it's the one refusal the client renders as "you are banned" instead of a room
+	// that mysteriously fails to load, and it's what the enum offers.
+	//
+	// Unauthenticated requests fall through untouched: the route's own `authedId` answers
+	// 401, which mustn't turn into "banned" just because the token was missing.
+	.use('/matchmake/*', async (c, next) => {
+		const id = await authedId(c)
+		if (id !== null && (await isPlayerBanned(c.env.DB, id))) {
+			logger.info('matchmake refused: account banned', { accountId: id, path: c.req.path })
+			return c.json({ errorCode: BANNED_FROM_ROOM, roomInstance: null })
+		}
+		await next()
+	})
+
 	.onError(withOnError())
 	.notFound(withNotFound())
 
@@ -1288,11 +1314,12 @@ const app = new Hono<App>()
 			description: [
 				'Single-segment matchmake into the caller’s personal dorm, stored as presence. The',
 				'client only ever calls this with the `dorm` keyword — real rooms go through',
-				'`/matchmake/room/:roomId`.',
+				'`/matchmake/room/:roomId`. Returns errorCode 55 with a null instance when the',
+				'account is banned: a ban keeps a player out of their own dorm too.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(MatchmakeResponse, 'The player’s personal dorm instance'),
+				200: json(MatchmakeResponse, 'The dorm instance (or a null instance with errorCode 55)'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
