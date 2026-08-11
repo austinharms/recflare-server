@@ -192,60 +192,17 @@ same rotation writes both `"Complete 10 games in ^Paintball"` and, plainly,
 
 ### The `Config` rule tree
 
-A tree of nodes, each with a numeric type in `ct`. Two node kinds appear:
+An escaped JSON string holding a tree of nodes, each with a numeric type in `ct`: a
+**Match** (`ct: 0`, `wc` is a list of predicates that must all hold for one game result) or
+a **Counter** (`ct: 1`, `ctc` is the child node to count and `t` the target). Leaves match a
+scene allow-list (`ct: 7`, subroom `UnitySceneId`s) or a session variable (`ct: 9`, e.g.
+`won`). The server never evaluates any of it — the client does, and posts the tree back with
+its own count written in.
 
-- **Match** (`ct: 0`) — `wc` is a list of predicates that must _all_ hold for one game
-  result (AND).
-- **Counter** (`ct: 1`) — `ctc` holds the child node to count and `t` is the target count.
-
-Which slot a node uses (`wc` vs `ctc`) tells you what its children are; a node never has
-both. `ipc` is `false` on every composite node in the reference data — purpose unknown, but
-the client echoes it back, so keep emitting it.
-
-Predicate leaves carry `vs`, a list of accepted values matched as OR:
-
-| `ct` | Shape                            | Meaning                                                                                                                                                                                     |
-| ---- | -------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `6`  | `{"ct":6,"vs":[2]}`              | _(inferred)_ The kind of event being matched — a finished game/session. Present in **every** leaf group and always `[2]`; nothing observed varying it, so treat it as required boilerplate. |
-| `7`  | `{"ct":7,"vs":[{"l":"<guid>"}]}` | Scene allow-list: each `l` is a subroom's `UnitySceneId` (see `apps/rooms`). Matches if the game happened in any of them.                                                                   |
-| `9`  | `{"ct":9,"vs":[true],"v":"won"}` | A named session variable (`v`) equals one of `vs` — here, the player won.                                                                                                                   |
-
-The two idioms in the file, unescaped:
-
-```jsonc
-// "Complete ^TheRiseOfJumbotron quest" — one winning session in one scene
-{ "ct": 0, "ipc": false, "wc": [
-  { "ct": 6, "vs": [2] },
-  { "ct": 9, "vs": [true], "v": "won" },
-  { "ct": 7, "vs": [{ "l": "acc06e66-…" }] }   // TheRiseofJumbotron / Home
-]}
-
-// "Complete 5 Charades games" — count matching sessions to a target
-{ "ct": 1, "ipc": false, "t": 5, "ctc": [
-  { "ct": 0, "ipc": false, "wc": [
-    { "ct": 6, "vs": [2] },
-    { "ct": 7, "vs": [{ "l": "a673712c-…" }, { "l": "4078dfed-…" }] }   // 3DCharades + Legacy3DCharades
-  ]}
-]}
-```
-
-Note the quest challenges have **no `t`** (one qualifying session is the whole goal) and
-the counted ones have **no `won` predicate** (finishing counts, winning is irrelevant).
-
-On `updateProgress` the client posts the same tree back with its own progress written into
-it: **`cc`** on the counter node is the current count (`…,"t":5,"cc":1`), and **`c`** (`"c":true`)
-marks a node it now considers satisfied. Neither appears in this file — they are progress,
-not definition, which is why the tree isn't stored (only the top-level `Complete` is). The
-count itself lives only in the client.
-
-**Scene ids, not room ids.** Because `ct: 7` matches `UnitySceneId`, a screens room and its
-VR twin share ids and both count: the captured "Complete 10 games in Paintball" listed six
-scenes, which are the subrooms of _both_ `Paintball` and `PaintballVR` — and each is also a
-standalone base room (`River`, `Clearcut`, …). One list covers every way in. Resolve a guid
-against the `SubRooms[].UnitySceneId` values in `apps/rooms/migrations/0002_import_rooms.sql`;
-a "one map only" challenge is the same shape with a single-entry list. Watch for one trap
-this creates: `Soccer / Home` and `Stadium / Home` are the same scene, so a soccer challenge
-also completes in the Stadium.
+**Reading or writing one? See `.agents/weekly-challenge-config/SKILL.md`** — the full
+grammar, the two idioms the file uses, how to resolve a scene guid to a room, the shared
+scenes that make a challenge complete in more rooms than you meant (`Soccer` and `Stadium`
+are one scene), and an authoring checklist.
 
 ### The `Gift` block
 

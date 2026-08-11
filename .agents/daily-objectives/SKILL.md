@@ -25,7 +25,7 @@ Top-level keys, in declaration order (all accept three casings):
 | `levelProgressionMaps` | array of objects |
 | **`dailyObjectives`** | **jagged array** — `FCAOHDFPEAP[][]` |
 | `serverMaintenance` | object |
-| `autoMicMutingConfig` | object |
+| `autoMicMutingConfig` | object |econ
 | `storefrontConfig` | object |
 | `roomKeyConfig` | object |
 | `roomCurrencyConfig` | object |

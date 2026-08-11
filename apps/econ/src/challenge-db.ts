@@ -7,7 +7,7 @@
  * That tree is the challenge's DEFINITION (it comes from static/weekly-challenge.json and
  * is identical for everyone), decorated with the client's running count in `cc`; the
  * server evaluates none of it, so persisting a per-player copy would only be a second,
- * staler copy of the catalog. See the README's weekly-challenge section for the grammar.
+ * staler copy of the catalog. See .agents/weekly-challenge-config/SKILL.md for the grammar.
  *
  * Completion LATCHES within a rotation: the client reports progress repeatedly, and a
  * report that arrives with the challenge no longer complete (a fresh session, a reordered
