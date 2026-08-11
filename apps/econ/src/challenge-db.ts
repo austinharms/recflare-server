@@ -16,8 +16,12 @@
  * unique within a rotation, so a challenge that returns in a later week would otherwise
  * start out already complete on the old week's row.
  *
- * The `econ` worker owns this table and its migration
- * (apps/econ/migrations/0009_challenge_status.sql).
+ * Finishing every challenge in a rotation earns the rotation's `Gift`, which is handed out
+ * from the same `updateProgress` call that completes the set. That payout is gated by a
+ * second table here, `challenge_gift` — one row per (account, rotation), claimed once.
+ *
+ * The `econ` worker owns both tables and their migrations
+ * (apps/econ/migrations/0009_challenge_status.sql, 0011_challenge_gift.sql).
  */
 
 /** Schema DDL (mirror of migrations 0009_challenge_status.sql) — also builds the table in tests. */
@@ -83,6 +87,9 @@ export async function recordChallengeProgress(
  * The ids of the challenges a player has finished in one rotation. Scoped to the rotation
  * so a stale row from an earlier week — same challenge id, different `challenge_map_id` —
  * doesn't show up pre-completed before the client has reported anything against it.
+ *
+ * Also what "the whole set is finished" is decided from: the rotation's `Gift` is due once
+ * every challenge in static/weekly-challenge.json appears here.
  */
 export async function getCompletedChallengeIds(
 	db: D1Database,
@@ -97,4 +104,46 @@ export async function getCompletedChallengeIds(
 		.bind(accountId, challengeMapId)
 		.all<{ challenge_id: number }>()
 	return new Set(results.map((r) => r.challenge_id))
+}
+
+/** Schema DDL (mirror of migrations 0011_challenge_gift.sql) — also builds the table in tests. */
+export const CHALLENGE_GIFT_SCHEMA_DDL: string[] = [
+	`CREATE TABLE IF NOT EXISTS challenge_gift (
+		account_id INTEGER NOT NULL,
+		challenge_map_id INTEGER NOT NULL,
+		granted_at TEXT NOT NULL,
+		PRIMARY KEY (account_id, challenge_map_id)
+	)`,
+]
+
+/**
+ * Take the one gift a rotation owes a player, returning whether this call is the one that
+ * got it — `false` means it was already handed out and the caller must grant nothing.
+ *
+ * The client keeps reporting progress after the set is finished, so "has this been paid?"
+ * has to be asked and answered in ONE statement: a read-then-insert would let two reports
+ * that land together both see no row and both pay out. `ON CONFLICT … DO NOTHING` with
+ * `RETURNING` gives us that — the second insert matches the existing row, writes nothing
+ * and returns nothing.
+ *
+ * The gate is deliberately at-most-once: the row is claimed BEFORE the items are granted,
+ * so a failure mid-grant loses the reward rather than risking a second one. It is a faucet,
+ * and a stuck one is easier to notice and re-grant by hand than a leaking one.
+ */
+export async function claimChallengeGift(
+	db: D1Database,
+	accountId: number,
+	challengeMapId: number,
+	now: Date = new Date()
+): Promise<boolean> {
+	const row = await db
+		.prepare(
+			`INSERT INTO challenge_gift (account_id, challenge_map_id, granted_at)
+			 VALUES (?1, ?2, ?3)
+			 ON CONFLICT (account_id, challenge_map_id) DO NOTHING
+			 RETURNING granted_at`
+		)
+		.bind(accountId, challengeMapId, now.toISOString())
+		.first<{ granted_at: string }>()
+	return row !== null
 }

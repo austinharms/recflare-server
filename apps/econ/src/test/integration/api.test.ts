@@ -13,6 +13,9 @@ import {
 // The `invention` table belongs to the `api` worker; buyInvention reads it, so its DDL
 // is built here too (see the same cross-worker import in econ.app.ts).
 import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
+// The notification-type ids the hub carries, from the worker that owns them — asserting
+// against the enum rather than a copied number is what keeps these frames honest.
+import { NotificationType } from '../../../../notify/src/notification-types'
 // The live weekly rotation, so the challenge tests exercise whatever it currently holds
 // instead of hard-coded ids from a rotation that has since been replaced.
 import weeklyChallenge from '../../../static/weekly-challenge.json'
@@ -24,9 +27,9 @@ import {
 	getBalance,
 	spendCurrency,
 } from '../../balance-db'
-import { CHALLENGE_STATUS_SCHEMA_DDL } from '../../challenge-db'
+import { CHALLENGE_GIFT_SCHEMA_DDL, CHALLENGE_STATUS_SCHEMA_DDL } from '../../challenge-db'
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
-import { EQUIPMENT_SCHEMA_DDL } from '../../equipment-db'
+import { EQUIPMENT_SCHEMA_DDL, grantEquipment } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
 import { OUTFIT_SCHEMA_DDL } from '../../outfit-db'
 import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
@@ -51,6 +54,7 @@ beforeAll(async () => {
 	for (const stmt of BALANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of OUTFIT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CHALLENGE_STATUS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of CHALLENGE_GIFT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of REWARD_STATUS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTORY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -775,7 +779,7 @@ describe('econ endpoints', () => {
 		expect(await drainFrames()).toEqual([
 			{
 				accountId: 20,
-				notificationType: STOREFRONT_BALANCE_UPDATE,
+				notificationType: NotificationType.StorefrontBalanceUpdate,
 				payload: { Balance: -450, CurrencyType: 2, BalanceType: -2 },
 			},
 		])
@@ -1051,18 +1055,15 @@ describe('econ endpoints', () => {
 	 * test sees what was actually pushed.
 	 */
 	const drainFrames = async (): Promise<
-		Array<{ accountId: number; notificationType: number; payload: Record<string, number> }>
+		Array<{ accountId: number; notificationType: number; payload: Record<string, unknown> }>
 	> =>
 		(
 			env.RECFLARE_NOTIFICATIONS_HUB.getByName('global') as unknown as {
 				drainFrames(): Promise<
-					Array<{ accountId: number; notificationType: number; payload: Record<string, number> }>
+					Array<{ accountId: number; notificationType: number; payload: Record<string, unknown> }>
 				>
 			}
 		).drainFrames()
-
-	/** `NotificationType.StorefrontBalanceUpdate` in the notify worker's enum. */
-	const STOREFRONT_BALANCE_UPDATE = 61
 
 	// buyInvention is a GET with query params — that is how the client sends it.
 	const buyInvention = async (sub: string, inventionId: number, requestedPrice = 0) =>
@@ -1136,12 +1137,12 @@ describe('econ endpoints', () => {
 		expect(await drainFrames()).toEqual([
 			{
 				accountId: 999,
-				notificationType: STOREFRONT_BALANCE_UPDATE,
+				notificationType: NotificationType.StorefrontBalanceUpdate,
 				payload: { Balance: 250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
 			},
 			{
 				accountId: 51,
-				notificationType: STOREFRONT_BALANCE_UPDATE,
+				notificationType: NotificationType.StorefrontBalanceUpdate,
 				payload: { Balance: -250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
 			},
 		])
@@ -1440,6 +1441,190 @@ describe('econ endpoints', () => {
 		// …but the same challenge id in the NEXT rotation starts over.
 		expect(await completeOf(await post('18', 'False'))).toBe(false)
 		expect(await completeOf(await post('18', 'True'))).toBe(true)
+	})
+
+	/** Report every challenge of the live rotation complete, for one player. */
+	async function finishTheRotation(sub: string) {
+		const headers = { ...(await bearer(sub)), 'Content-Type': 'application/json' }
+		const ids = weeklyChallenge.Challenges.map((challenge) => challenge.ChallengeId)
+		const report = (challengeId: number) =>
+			exports.default.fetch(`${ORIGIN}/api/challenge/v2/updateProgress`, {
+				method: 'POST',
+				headers,
+				body: JSON.stringify({
+					ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+					ChallengeId: String(challengeId),
+					Complete: 'True',
+				}),
+			})
+		return { ids, report }
+	}
+
+	/** A player's unopened gift boxes, as the client reads them back. */
+	async function giftBoxes(sub: string) {
+		const res = await exports.default.fetch(`${ORIGIN}/api/avatar/v2/gifts`, {
+			headers: await bearer(sub),
+		})
+		return (await res.json()) as Array<{
+			Id: number
+			Message: string
+			EquipmentModificationGuid: string
+			AvatarItemDesc: string
+			GiftRarity: number
+		}>
+	}
+
+	test('finishing every challenge in the rotation grants its gift, once', async () => {
+		// The whole live rotation, so this follows whatever static/weekly-challenge.json holds.
+		const { ids, report } = await finishTheRotation('74')
+		for (const id of ids.slice(0, -1)) expect((await report(id)).status).toBe(200)
+		// One challenge short of the set — the gift isn't due yet.
+		expect(await giftBoxes('74')).toEqual([])
+		await drainFrames()
+
+		expect((await report(ids[ids.length - 1] ?? 0)).status).toBe(200)
+		const won = await giftBoxes('74')
+		expect(won).toHaveLength(1)
+		expect(won[0]?.Message).toBe('Weekly challenge complete!')
+		expect(won[0]?.EquipmentModificationGuid).toBe(weeklyChallenge.Gift.EquipmentModificationGuid)
+
+		// The client is told the moment the set is finished, rather than finding the box the
+		// next time it reads the gifts list. `Immediate` (31), from Coach (1).
+		const frames = await drainFrames()
+		expect(frames).toHaveLength(1)
+		expect(frames[0]?.accountId).toBe(74)
+		expect(frames[0]?.notificationType).toBe(NotificationType.GiftPackageReceivedImmediate)
+		expect(frames[0]?.payload).toEqual({
+			Id: won[0]?.Id,
+			FromGiftDropId: 0,
+			FromPlayerId: 1,
+			ConsumableItemDesc: '',
+			AvatarItemDesc: weeklyChallenge.Gift.AvatarItemDesc,
+			AvatarItemType: weeklyChallenge.Gift.AvatarItemType,
+			EquipmentPrefabName: weeklyChallenge.Gift.EquipmentPrefabName,
+			EquipmentModificationGuid: weeklyChallenge.Gift.EquipmentModificationGuid,
+			CurrencyType: 0,
+			Currency: 0,
+			Xp: 0,
+			Level: 0,
+			Platform: -1,
+			PlatformsToSpawnOn: -1,
+			BalanceType: -2,
+			GiftContext: weeklyChallenge.Gift.GiftContext,
+			// The catalog's rarity for the item, not the block's `GiftRarity` of 0.
+			GiftRarity: 5,
+			Message: 'Weekly challenge complete!',
+		})
+
+		// The reward is the item, not the box: it lands in the inventory unopened.
+		const unlocked = await exports.default.fetch(`${ORIGIN}/api/equipment/v2/getUnlocked`, {
+			headers: await bearer('74'),
+		})
+		const owned = (await unlocked.json()) as Array<{ ModificationGuid: string }>
+		expect(owned.map((e) => e.ModificationGuid)).toContain(
+			weeklyChallenge.Gift.EquipmentModificationGuid
+		)
+
+		// The client keeps reporting progress after the set is finished; a second pass over
+		// the same completions must not mint a second reward.
+		for (const id of ids) expect((await report(id)).status).toBe(200)
+		expect(await giftBoxes('74')).toHaveLength(1)
+	})
+
+	test('a player who already owns the rotation’s gift rolls the fallback box instead', async () => {
+		// Own the reward up front — the case the rotation's `FallbackGiftName` exists for.
+		await grantEquipment(env.DB, 75, {
+			ModificationGuid: weeklyChallenge.Gift.EquipmentModificationGuid,
+			PrefabName: weeklyChallenge.Gift.EquipmentPrefabName,
+			FriendlyName: 'Camera Skin (Comic)',
+			Tooltip: '',
+			Rarity: 5,
+			PlatformMask: -1,
+			Favorited: false,
+		})
+
+		const { ids, report } = await finishTheRotation('75')
+		for (const id of ids.slice(0, -1)) expect((await report(id)).status).toBe(200)
+		await drainFrames()
+		expect((await report(ids[ids.length - 1] ?? 0)).status).toBe(200)
+
+		const won = await giftBoxes('75')
+		expect(won).toHaveLength(1)
+		// Something they don't have, at the tier `FallbackGiftName` names ("4-Star Box" → 30),
+		// rather than a second copy of the gift.
+		const rolled = won[0]
+		expect(rolled?.EquipmentModificationGuid).not.toBe(
+			weeklyChallenge.Gift.EquipmentModificationGuid
+		)
+		expect(rolled?.GiftRarity).toBe(30)
+		expect(
+			(rolled?.AvatarItemDesc ?? '') !== '' || (rolled?.EquipmentModificationGuid ?? '') !== ''
+		).toBe(true)
+
+		// The frame announces what was ROLLED, not the box that promised it — so the client
+		// pops the item they actually won.
+		const frames = await drainFrames()
+		expect(frames).toHaveLength(1)
+		expect(frames[0]?.notificationType).toBe(NotificationType.GiftPackageReceivedImmediate)
+		expect(frames[0]?.payload).toMatchObject({
+			Id: rolled?.Id,
+			FromPlayerId: 1,
+			GiftRarity: 30,
+			AvatarItemDesc: rolled?.AvatarItemDesc,
+			EquipmentModificationGuid: rolled?.EquipmentModificationGuid,
+			Message: 'Weekly challenge complete!',
+		})
+	})
+
+	test('buying a query drop rolls a real item into the buyer’s inventory', async () => {
+		// sf2's "4-Star Unique Box" (539) — an `IsQuery` drop with no item fields of its own,
+		// which before the roll existed debited the buyer and granted nothing.
+		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await bearer('76')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 2,
+				PurchasableItemId: 539,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				RequestedPrice: 800,
+			}),
+		})
+		expect(res.status).toBe(200)
+
+		const boxes = await giftBoxes('76')
+		expect(boxes).toHaveLength(1)
+		// The box shows what was rolled — a real 4-star item, not the empty box drop.
+		expect(boxes[0]?.GiftRarity).toBe(30)
+		const key = (box?: { AvatarItemDesc: string; EquipmentModificationGuid: string }) =>
+			`${box?.AvatarItemDesc ?? ''}|${box?.EquipmentModificationGuid ?? ''}`
+		expect(key(boxes[0])).not.toBe('|')
+
+		// …and it is already in their inventory, unopened box or not.
+		const items = await exports.default.fetch(`${ORIGIN}/api/avatar/v4/items`, {
+			headers: await bearer('76'),
+		})
+		const owned = (await items.json()) as Array<{ AvatarItemDesc: string }>
+		if ((boxes[0]?.AvatarItemDesc ?? '') !== '') {
+			expect(owned.map((i) => i.AvatarItemDesc)).toContain(boxes[0]?.AvatarItemDesc)
+		}
+
+		// A second box can't roll the same prize: "an item that you don't have" excludes what
+		// the first roll just granted. Two draws from a 244-item pool could collide by chance,
+		// so this only holds because the pool is filtered by ownership.
+		const second = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await bearer('76')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 2,
+				PurchasableItemId: 539,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				RequestedPrice: 800,
+			}),
+		})
+		expect(second.status).toBe(200)
+		const after = await giftBoxes('76')
+		expect(after).toHaveLength(2)
+		expect(key(after[0])).not.toBe(key(after[1]))
 	})
 
 	test('POST /api/gamerewards/v1/request claims once an hour per reward type', async () => {

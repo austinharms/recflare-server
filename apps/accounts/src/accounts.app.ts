@@ -11,9 +11,18 @@ import {
 	searchAccounts,
 	updateAccount,
 } from '@repo/domain'
-import { logger, withCleanSpec, withDefaultCors, withNotFound, withOnError } from '@repo/hono-helpers'
+import {
+	logger,
+	withCleanSpec,
+	withDefaultCors,
+	withNotFound,
+	withOnError,
+} from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
+// The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
+// value — the enum has no runtime dependencies.
+import { NotificationType } from '../../notify/src/notification-types'
 import {
 	AccountDto,
 	BioRequest,
@@ -138,9 +147,13 @@ async function pushAccountUpdate(c: Context<App>, account: Account): Promise<voi
 	try {
 		const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
 		const publicDto = toAccountDto(account)
-		await hub.notifyPlayer(account.accountId, 'SelfAccountUpdate', toSelfAccountDto(account))
-		await hub.notifyPlayer(account.accountId, 'AccountUpdate', publicDto)
-		await hub.broadcast('AccountUpdate', publicDto)
+		await hub.notifyPlayer(
+			account.accountId,
+			NotificationType.SubscriptionUpdateSelfProfile,
+			toSelfAccountDto(account)
+		)
+		await hub.notifyPlayer(account.accountId, NotificationType.SubscriptionUpdateProfile, publicDto)
+		await hub.broadcast(NotificationType.SubscriptionUpdateProfile, publicDto)
 	} catch (err) {
 		logger.error('failed to push account update notifications', {
 			accountId: account.accountId,

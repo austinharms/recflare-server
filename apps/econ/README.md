@@ -71,9 +71,9 @@ The core flow. The client posts the storefront/item ids, the currency, and the
 2. rejects a stale price (`409`) — this stops a stale or tampered client buying at a
    price the catalog no longer offers;
 3. debits the buyer **atomically** (`400` on insufficient balance);
-4. grants the drop — an avatar item into the `inventory` table (own-once), a consumable
-   into the `consumable` table (each buy stacks a new instance); currency/xp drops
-   aren't granted yet;
+4. grants the drop — an avatar item into the `inventory` table (own-once), equipment into
+   `equipment`, a consumable into `consumable` (each buy stacks a new instance), or, for a
+   query drop, whatever the roll lands on (below); currency/xp drops aren't granted yet;
 5. returns a **gift box** and pushes a `StorefrontBalanceUpdate` over the socket.
 
 Two things are easy to get wrong:
@@ -86,6 +86,46 @@ Two things are easy to get wrong:
 
 A `Gift` block routes the item (and box) to another player, but the caller always pays.
 A self-buy or anonymous gift is attributed to the "Coach" system account (id 1).
+
+## Query drops — the loot boxes (`IsQuery`)
+
+A gift-drop with `IsQuery: true` is not an item, it is a **roll**: all of its item fields
+(`AvatarItemDesc`, `EquipmentModificationGuid`, `ConsumableItemDesc`) are empty on purpose,
+and what the player gets is picked at grant time. sf2's tooltip states the rule outright —
+_"A random 4-star item that you don't have."_ Eight ship in the catalogs, two families of
+the same ladder:
+
+| sf2 "Star Boxes" (`ItemSetId` 44, `Unique`) | Rarity | sf3 "Random box" family |
+| ------------------------------------------- | ------ | ----------------------- |
+| —                                           | 0      | Common Random box       |
+| 2-Star Unique Box                           | 10     | Uncommon Random box     |
+| 3-Star Unique Box                           | 20     | Rare Random box         |
+| 4-Star Unique Box                           | 30     | Epic Random box         |
+| —                                           | 50     | Legendary Random box    |
+
+That table is the **star ↔ rarity ladder** (`STAR_RARITY` in `econ.app.ts`): sf2's three
+boxes pin 2/3/4 → 10/20/30 by carrying both their name and their `QueryRedirectRarity`, and
+sf3's five-name ladder fills in the ends. It's the same tier list twice, so read a rarity
+number in either dialect.
+
+`rollQueryDrop` resolves one inside `grantGiftDrop`, so both faucets — a purchase and the
+weekly gift — hand over a real item rather than an unopenable box:
+
+- **The pool is sf3**, the general store (`ROLL_STOREFRONT_TYPE`). It's the only catalog
+  with a real pool at every tier (1161 items against 8–40 in the themed ones), it's where
+  the Random box family itself sells, and "a random 4-star item" means the item universe,
+  not whichever seasonal shelf the box came off.
+- **Filtered to what the player doesn't own**, which is the `Unique` promise and the only
+  reading of "an item you don't have" that means anything.
+- **Avatar items and equipment only.** Other query drops are excluded (a box that rolls a
+  box), and so are consumables: they stack, so "don't have" never becomes false and they'd
+  crowd out the real prizes.
+- **`QueryRedirectRarity` wins over `Rarity`** when present — sf2 carries both and they
+  agree; sf3's boxes carry only `Rarity`.
+- **An empty pool grants nothing** (logged `query gift-drop rolled nothing`) — an owner of
+  every 4-star item still gets the box, just nothing in it. The `buyItem` response still
+  echoes the drop the player _bought_, i.e. the box; the rolled item shows up in the box
+  itself, via `GET /api/avatar/v2/gifts`.
 
 ## Consume envelopes
 
@@ -215,8 +255,65 @@ feed one shape to the other's reader.
 guid bytes in .NET little-endian order, padding stripped (`g5u0weNLmkCLeUXFUVn74Q` →
 `c1b49b83-4be3-409a-8b79-45c55159fbe1`). The reward is identified by prefab + that guid,
 _not_ by `GiftDropId`: this block's `GiftDropId` is `3994`, while the same skin sells in
-`sf3.json` as `2121` ("Camera Skin (Comic)"). Nothing grants it — the reward is preview
-only (see Known gaps).
+`sf3.json` as `2121` ("Camera Skin (Comic)").
+
+**Granted when the set is finished** — see below. The grant path is `buyItem`'s, so the
+block is translated into a storefront gift-drop first (`toChallengeGiftDrop`); the renamed
+`GiftContext`/`GiftRarity` are exactly what that translation is for.
+
+The block carries no display strings and a `GiftRarity` of `0` for an item that sells at
+rarity `5`, so both are taken from the catalog entry selling the same item (matched on
+equipment guid / avatar desc) — the reward reads as "Camera Skin (Comic)", not as the box it
+might have arrived in. An explicit `FriendlyName`/`Tooltip` on the block wins over the
+catalog if a rotation we publish sets them; neither is present in the captured one.
+
+**`FallbackGiftName` is the other half of the reward, not just a label.** "4-Star Box" is
+what the player gets _instead_ when they already own the item — the real game phrased it
+"…or a 4-Star Box!" — so it is granted as a query drop (a roll) at the tier its star count
+names, via the ladder in the query-drop section. Renaming it to `3-Star Box` retunes the
+consolation tier with no code change; a name that doesn't parse falls back to 4 stars.
+
+### Winning the gift (`challenge_gift`)
+
+There is no claim endpoint and the client never asks: the reward is handed out from the
+`updateProgress` call that completes the set. Every completing report on the **live**
+rotation re-reads the caller's completions and, if every challenge in
+`weekly-challenge.json` is there, grants the `Gift` the way a purchase grants a drop — the
+item into `inventory`/`equipment`/`consumable`, plus a gift box (message
+`Weekly challenge complete!`) the player finds in `GET /api/avatar/v2/gifts`.
+
+**The item, or a roll.** If the player already owns the `Gift`'s item — likely, since the
+rotation's reward is one fixed item that sells in the store — they get the
+`FallbackGiftName` box instead, rolled at its star tier. Finishing the week can't be worth
+nothing. A `Gift` block carrying no ownable item at all (no avatar desc, no equipment guid)
+counts as "already owned", so a rotation whose reward is _only_ a box is written by leaving
+the block empty and naming the tier.
+
+- **`challenge_gift` makes it happen once.** One row per (account, rotation); the row's
+  existence _is_ the grant. The client keeps reporting after the set is finished, so the
+  insert is the gate: `ON CONFLICT … DO NOTHING … RETURNING` claims it in one statement, and
+  a second report returns no row and grants nothing.
+- **Claim first, grant second** — at-most-once. If the grant then fails the reward is lost
+  rather than doubled; it's logged (`failed to grant weekly challenge gift`) and re-granted
+  by hand if it ever happens. A faucet that sticks is easier to spot than one that leaks.
+- **The response is unchanged; the socket carries the news.** `updateProgress` answers the
+  same four fields whether or not a gift was won, and a `GiftPackageReceivedImmediate` (31)
+  frame goes out over the hub with the box — that's what pops the reward panel the moment
+  the set is finished, instead of the player finding it on the next read of the gifts list.
+  The payload is the reference server's field-for-field (`Id`, `FromGiftDropId: 0`,
+  `FromPlayerId`, the item fields, `Platform`/`PlatformsToSpawnOn: -1`, `BalanceType: -2`,
+  `Message`), and it names the **rolled** item when the fallback box is what was granted.
+  `Immediate` (31) rather than `GiftPackageReceived` (30) is what the reference sends for a
+  box the server hands over unasked; the sender is Coach (1). Best-effort — a hub failure is
+  logged and swallowed, since the gift is already granted and stored.
+- **`CompletedRequired` is not consulted.** Its meaning is inferred, and the only reading
+  under which the gift is due _before_ the set is done would pay out on the first challenge.
+- **`Xp`/`Level` on the block are ignored**, as on a purchase — same gap, and both are `0`
+  in the captured rotation.
+- **A report against an old rotation never wins anything**, and an empty `Challenges` array
+  is not a finished set (without that guard "every challenge complete" is vacuously true).
+- **Players who finished the set before this shipped still get it**: the client re-reports
+  completed challenges, and the first such report is a completing report.
 
 ### Progress (`challenge_status`)
 
@@ -293,11 +390,19 @@ Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no cod
 
 ## Known gaps
 
-- Gifting to another player grants the item and box but does not notify the recipient.
-- `buyItem` grants avatar-item and consumable drops; currency/xp drops aren't granted.
+- Gifting to another player grants the item and box but does not notify the recipient — the
+  reference sends `GiftPackageReceivedImmediate` there too (`buy.go`, when the body carries
+  a `Gift`), and `pushGiftReceived` is now sitting right there to do it.
+- `buyItem` grants avatar-item, equipment, consumable and query (box) drops; currency/xp
+  drops aren't granted.
+- A query drop rolls uniformly across the tier and can't run at a rarity sf3 doesn't
+  publish; per-item weighting and a multi-catalog pool would both need a manifest of the
+  storefronts, which the ASSETS binding can't enumerate.
 - Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
 - Several routes (room keys, wishlist, equipment, room consumables/currencies) are
   empty-list stubs pending their own stores.
 - Game rewards gate correctly but pay nothing out — see the `reward_status` section.
-- Weekly-challenge completion is persisted, but the rotation's `Gift` is never granted —
-  nothing watches for the last challenge finishing, and there is no claim endpoint.
+- The weekly-challenge gift is granted but not announced: the box appears in the gifts list
+  with no `GiftPackageReceived` notification, so the player sees it the next time the client
+  reads that list rather than the moment they finish the set. Same gap as gifting to another
+  player, and the same reason — the frame's payload shape hasn't been captured.

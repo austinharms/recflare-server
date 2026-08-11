@@ -1,8 +1,14 @@
 /**
- * The client's `NotificationType` enum — the integer `Id` carried on a hub
- * notification frame (`{ Id, Msg }`, see {@link NotificationsHub}). The reference
- * server sends these as the notification type so the client's dispatcher can route
- * each frame (e.g. remove a consumed item from inventory on ConsumableMappingRemoved).
+ * The client's `NotificationType` enum — the `Id` carried on a hub notification frame
+ * (`{ Id, Msg }`, see {@link NotificationsHub}). The reference server sends these as the
+ * notification type so the client's dispatcher can route each frame (e.g. remove a consumed
+ * item from inventory on ConsumableMappingRemoved).
+ *
+ * Mostly integers, but some members are STRINGS, and that is not an inconsistency to tidy
+ * up: the reference's hub sends a wire name for those frames (`"AccountUpdate"`,
+ * `"RoomUpdate"`, …) even where its own Go enum has a number for them, and the frame's `Id`
+ * is stringified as-is — so a member's value is whatever that frame is actually addressed
+ * by. Where the two disagree, the wire wins; the number is noted in the member's comment.
  *
  * Lives in the `notify` worker (the hub owner); other workers import it to send a
  * typed notification instead of a magic number. No runtime dependencies, so it's safe
@@ -15,16 +21,31 @@ export enum NotificationType {
 	PresenceHeartbeatResponse = 4,
 	RefreshLogin = 5,
 	Logout = 6,
-	SubscriptionUpdateProfile = "AccountUpdate",
-	SubscriptionUpdatePresence = "PresenceUpdate",
-	SubscriptionUpdateGameSession = "RoomInstanceUpdate",
-	SubscriptionUpdateRoom = 15,
+	SubscriptionUpdateProfile = 'AccountUpdate',
+	/**
+	 * The owner-only twin of {@link SubscriptionUpdateProfile}: the same account, rendered
+	 * with the private fields (email, birthday, remaining username changes). The reference
+	 * sends both on connect and after a profile mutation — everyone gets the public frame,
+	 * the owner additionally gets this one. Named after its twin rather than after a client
+	 * enum member, since the client's enum doesn't list it; the WIRE name is what matters.
+	 */
+	SubscriptionUpdateSelfProfile = 'SelfAccountUpdate',
+	SubscriptionUpdatePresence = 'PresenceUpdate',
+	SubscriptionUpdateGameSession = 'RoomInstanceUpdate',
+	/**
+	 * A room the player is subscribed to changed. STRING-valued like its neighbours even
+	 * though the reference's own enum numbers it `15`: its hub sends the wire name
+	 * (`NotifFrame("RoomUpdate", room)`) and never the number, and the payload builder
+	 * stringifies whatever it is given, so `15` would go out as the unrelated `"15"`.
+	 */
+	SubscriptionUpdateRoom = 'RoomUpdate',
+	/** Unverified: nothing sends it here, and the reference's hub never puts it on the wire. */
 	SubscriptionUpdateRoomPlaylist = 16,
 	ModerationQuitGame = 20,
 	ModerationUpdateRequired = 21,
 	ModerationKick = 22,
 	ModerationKickAttemptFailed = 23,
-	ModerationRoomBan = "ModerationRoomBan",
+	ModerationRoomBan = 'ModerationRoomBan',
 	ServerMaintenance = 25,
 	GiftPackageReceived = 30,
 	GiftPackageReceivedImmediate = 31,
@@ -42,7 +63,7 @@ export enum NotificationType {
 	PlayerEventResponseChanged = 83,
 	PlayerEventResponseDeleted = 84,
 	PlayerEventStateChanged = 85,
-	ChatMessageReceived = "ChatMessageReceived",
+	ChatMessageReceived = 'ChatMessageReceived',
 	CommunityBoardUpdate = 95,
 	CommunityBoardAnnouncementUpdate = 96,
 	InventionModerationStateChanged = 100,

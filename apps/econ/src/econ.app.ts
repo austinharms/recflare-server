@@ -36,7 +36,11 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
-import { getCompletedChallengeIds, recordChallengeProgress } from './challenge-db'
+import {
+	claimChallengeGift,
+	getCompletedChallengeIds,
+	recordChallengeProgress,
+} from './challenge-db'
 import {
 	consumeConsumable,
 	countConsumable,
@@ -288,6 +292,20 @@ interface StoreGiftDrop {
 	Context: number
 	Currency: number
 	CurrencyType: number
+	/**
+	 * A QUERY drop — a loot box rather than an item. Its item fields are all empty on
+	 * purpose: what the player gets is rolled at grant time from everything of the target
+	 * rarity they don't already own (see {@link rollQueryDrop}). sf2's "Star Boxes" set and
+	 * sf3's "Random box" family are the two that ship; sf2's tooltip says it outright — "A
+	 * random 4-star item that you don't have."
+	 */
+	IsQuery?: boolean
+	/**
+	 * The rarity a query drop rolls at, when it differs from the box's own `Rarity`. The
+	 * sf2 boxes carry both and they agree; sf3's don't carry it at all, hence the fallback
+	 * to `Rarity`.
+	 */
+	QueryRedirectRarity?: number
 }
 interface StorePrice {
 	CurrencyType: number
@@ -383,6 +401,404 @@ function toGiftContent(
 		Platform: -1,
 		PlatformsToSpawnOn: -1,
 		BalanceType: null,
+	}
+}
+
+/**
+ * Push a GiftPackageReceivedImmediate notification for a gift box the player didn't ask
+ * for, mirroring the reference's
+ * `HubSendToPlayer(accountID, NotifFrame(GiftPackageReceivedImmediate, {...}))` — the
+ * client pops the "you got something" panel from it instead of waiting for the next read of
+ * `GET /api/avatar/v2/gifts`.
+ *
+ * The payload is the reference's field-for-field: the stored box's contents plus its `Id`,
+ * a `FromGiftDropId` of 0 (the reference never populates it either) and the
+ * platform/balance constants. `Xp` and `Level` are 0 — the drop shape doesn't carry them
+ * and nothing grants them yet.
+ *
+ * "Immediate" (31) rather than GiftPackageReceived (30) is what the reference sends for a
+ * box handed over by the server: a purchase gifted to another player, an admin token grant,
+ * a report reward. This is the same case — the player is being handed a box they never
+ * clicked for. Best-effort: a hub failure is logged and swallowed, since the gift itself is
+ * already granted and stored.
+ */
+async function pushGiftReceived(
+	c: Context<App>,
+	accountId: number,
+	gift: GrantedGift,
+	message: string,
+	fromPlayerId: number
+): Promise<void> {
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			accountId,
+			NotificationType.GiftPackageReceivedImmediate,
+			{
+				Id: gift.id,
+				FromGiftDropId: 0,
+				FromPlayerId: fromPlayerId,
+				ConsumableItemDesc: gift.drop.ConsumableItemDesc,
+				AvatarItemDesc: gift.drop.AvatarItemDesc,
+				AvatarItemType: gift.drop.AvatarItemType ?? 0,
+				EquipmentPrefabName: gift.drop.EquipmentPrefabName,
+				EquipmentModificationGuid: gift.drop.EquipmentModificationGuid,
+				CurrencyType: gift.drop.CurrencyType,
+				Currency: gift.drop.Currency,
+				Xp: 0,
+				Level: 0,
+				Platform: -1,
+				PlatformsToSpawnOn: -1,
+				BalanceType: ALL_PLATFORMS,
+				GiftContext: gift.drop.Context,
+				GiftRarity: gift.drop.Rarity,
+				Message: message,
+			}
+		)
+	} catch (err) {
+		logger.error('failed to push GiftPackageReceivedImmediate notification', {
+			accountId,
+			giftId: gift.id,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
+ * The catalog a query drop rolls from: sf3, the general store. It is the only catalog with
+ * a real pool at every rarity (1161 items against 8–40 in the themed ones), it's where the
+ * "Random box" family itself sells, and a box promising "a random 4-star item" plainly
+ * means the whole item universe rather than whichever seasonal shelf it was bought from.
+ */
+const ROLL_STOREFRONT_TYPE = 3
+
+/** Every item in the roll catalog, or `[]` if it can't be read (a roll then yields nothing). */
+async function loadRollCatalog(c: Context<App>): Promise<StoreItem[]> {
+	const res = await c.env.ASSETS.fetch(new URL(`/sf${ROLL_STOREFRONT_TYPE}.json`, c.req.url))
+	if (!res.ok) return []
+	const storefront = (await res.json()) as Storefront
+	return storefront.StoreItems
+}
+
+/**
+ * Whether the player already owns what a drop carries — the question a query drop's "an
+ * item that you don't have" turns on, and the one that decides whether the weekly gift
+ * hands over its item or rolls the fallback box instead.
+ *
+ * Ownership is boolean for avatar items and equipment, which is what makes "already have
+ * it" meaningful. A drop carrying neither (a consumable, a currency drop, an empty query
+ * box) counts as owned: there is nothing ownable to hand over, so callers offering a
+ * fallback should take it.
+ */
+async function ownsGiftDrop(
+	db: D1Database,
+	accountId: number,
+	giftDrop: StoreGiftDrop
+): Promise<boolean> {
+	if (typeof giftDrop.AvatarItemDesc === 'string' && giftDrop.AvatarItemDesc !== '') {
+		const owned = await getInventory(db, accountId)
+		return owned.some((item) => item.AvatarItemDesc === giftDrop.AvatarItemDesc)
+	}
+	if (
+		typeof giftDrop.EquipmentModificationGuid === 'string' &&
+		giftDrop.EquipmentModificationGuid !== ''
+	) {
+		const owned = await getEquipment(db, accountId)
+		return owned.some((eq) => eq.ModificationGuid === giftDrop.EquipmentModificationGuid)
+	}
+	return true
+}
+
+/**
+ * Roll a query drop: pick, uniformly at random, one item of `rarity` from the roll catalog
+ * that the player doesn't already own. Returns null when the pool is empty — an unreadable
+ * catalog, a rarity nothing is published at, or a player who owns every item of that tier.
+ *
+ * The pool is deliberately narrow. Other query drops are excluded (a box that rolls a box
+ * would either loop or hand over an unopenable one), and so is everything that isn't an
+ * avatar item or a piece of equipment: "an item you don't have" only means anything for
+ * things owned once, and consumables stack, so a consumable would be rollable forever and
+ * would crowd out the real prizes.
+ */
+async function rollQueryDrop(
+	c: Context<App>,
+	accountId: number,
+	rarity: number,
+	rollCatalog?: StoreItem[]
+): Promise<StoreGiftDrop | null> {
+	const [catalog, ownedItems, ownedEquipment] = await Promise.all([
+		rollCatalog ?? loadRollCatalog(c),
+		getInventory(c.env.DB, accountId),
+		getEquipment(c.env.DB, accountId),
+	])
+	const haveItem = new Set(ownedItems.map((item) => item.AvatarItemDesc))
+	const haveEquipment = new Set(ownedEquipment.map((eq) => eq.ModificationGuid))
+	const pool = catalog.filter(({ GiftDrop: drop }) => {
+		if (drop.IsQuery === true || drop.Rarity !== rarity) return false
+		if (typeof drop.AvatarItemDesc === 'string' && drop.AvatarItemDesc !== '') {
+			return !haveItem.has(drop.AvatarItemDesc)
+		}
+		if (
+			typeof drop.EquipmentModificationGuid === 'string' &&
+			drop.EquipmentModificationGuid !== ''
+		) {
+			return !haveEquipment.has(drop.EquipmentModificationGuid)
+		}
+		return false
+	})
+	const rolled = pool[Math.floor(Math.random() * pool.length)]
+	return rolled?.GiftDrop ?? null
+}
+
+/**
+ * A gift box that was just created, and the drop it ended up holding. The drop is the
+ * RESOLVED one — what a query drop rolled, not the box that promised it — so a caller
+ * announcing the gift names the item the player actually won.
+ */
+interface GrantedGift {
+	id: number
+	drop: StoreGiftDrop
+}
+
+/**
+ * Hand a gift-drop to a player: grant whatever it turns out to carry (an avatar item, an
+ * equipment skin, a consumable, or none of these — currency/xp drops aren't granted yet)
+ * and create the gift box that renders it.
+ *
+ * A query drop is ROLLED here first, so what gets granted — and what the box shows — is the
+ * item the player actually won, not the box that promised it. A roll with nothing left to
+ * give falls through with the box itself, which grants nothing: no worse than not rolling,
+ * and the warning says which rarity ran dry.
+ *
+ * Both faucets share this — a storefront purchase and the weekly-challenge reward — so a
+ * drop lands in a player's inventory the same way whichever one it came from. The item is
+ * granted here, not when the box is opened: consuming a box only deletes the row.
+ */
+async function grantGiftDrop(
+	c: Context<App>,
+	accountId: number,
+	drop: StoreGiftDrop,
+	message: string,
+	// The roll catalog, when the caller has already read it — it's the big one (sf3), and
+	// the weekly gift has to consult it before it knows whether it's rolling at all.
+	rollCatalog?: StoreItem[]
+): Promise<GrantedGift> {
+	let giftDrop = drop
+	if (drop.IsQuery === true) {
+		const rarity = drop.QueryRedirectRarity ?? drop.Rarity
+		const rolled = await rollQueryDrop(c, accountId, rarity, rollCatalog)
+		if (rolled === null) {
+			logger.warn('query gift-drop rolled nothing', {
+				accountId,
+				rarity,
+				friendlyName: drop.FriendlyName,
+			})
+		} else {
+			giftDrop = rolled
+		}
+	}
+	const db = c.env.DB
+	if (typeof giftDrop.AvatarItemDesc === 'string' && giftDrop.AvatarItemDesc !== '') {
+		await grantItem(db, accountId, toAvatarItem(giftDrop))
+	}
+	if (
+		typeof giftDrop.EquipmentModificationGuid === 'string' &&
+		giftDrop.EquipmentModificationGuid !== ''
+	) {
+		await grantEquipment(db, accountId, toEquipment(giftDrop))
+	}
+	const isConsumable =
+		typeof giftDrop.ConsumableItemDesc === 'string' && giftDrop.ConsumableItemDesc !== ''
+	const consumableCount = isConsumable ? CONSUMABLE_GRANT_COUNT : 0
+	// Capture the granted consumable's row id and the player's pre-existing count so the
+	// gift box can carry them — gift-consume fires ConsumableMappingAdded from these.
+	let consumableMappingId = 0
+	let consumablePreExisting = 0
+	if (isConsumable) {
+		consumablePreExisting = await countConsumable(db, accountId, giftDrop.ConsumableItemDesc)
+		consumableMappingId = await grantConsumable(
+			db,
+			accountId,
+			giftDrop.ConsumableItemDesc,
+			consumableCount
+		)
+	}
+	const { id } = await createGift(
+		db,
+		accountId,
+		toGiftContent(giftDrop, message, consumableCount, consumableMappingId, consumablePreExisting)
+	)
+	return { id, drop: giftDrop }
+}
+
+/**
+ * The rotation's reward, as static/weekly-challenge.json writes it. Same item vocabulary as
+ * a storefront `GiftDrop` but with `Context`/`Rarity` spelled `GiftContext`/`GiftRarity`,
+ * so it has to be translated before the grant path can read it (see
+ * {@link toChallengeGiftDrop}).
+ *
+ * `FriendlyName`/`Tooltip` are OPTIONAL because the captured rotation has neither — the
+ * client resolves the reward's name from the item itself, falling back to
+ * `FallbackGiftName`. A rotation we publish can carry them to name the granted item
+ * properly without a code change.
+ */
+interface ChallengeGift {
+	AvatarItemDesc: string
+	AvatarItemType: number
+	ConsumableItemDesc: string
+	EquipmentPrefabName: string
+	EquipmentModificationGuid: string
+	GiftContext: number
+	GiftRarity: number
+	Xp: number
+	FriendlyName?: string
+	Tooltip?: string
+}
+
+/** The message on the gift box the weekly reward arrives in. */
+const CHALLENGE_GIFT_MESSAGE = 'Weekly challenge complete!'
+
+/**
+ * The star rating → `Rarity` ladder, indexed by stars - 1. Pinned by sf2's "Star Boxes"
+ * item set, whose three members name their own tier and carry the rarity they roll at:
+ * 2-Star → 10, 3-Star → 20, 4-Star → 30. The ends are extrapolated from sf3's parallel
+ * "Random box" family (Common 0, Uncommon 10, Rare 20, Epic 30, Legendary 50), which is the
+ * same ladder under the other naming.
+ */
+const STAR_RARITY = [0, 10, 20, 30, 50]
+
+/** The tier a "4-Star Box" rolls at, used when a rotation's fallback name doesn't parse. */
+const DEFAULT_FALLBACK_STARS = 4
+
+/**
+ * The rarity the rotation's `FallbackGiftName` promises, read off the leading star count
+ * ("4-Star Box" → 30). That string is the whole specification of the consolation prize —
+ * it is what the client renders when the gift resolves to a box rather than a named item —
+ * so a rotation can retune the tier by renaming it, with no code change.
+ */
+function fallbackGiftRarity(): number {
+	const stars = Number(/^(\d+)-star/i.exec(weeklyChallenge.FallbackGiftName)?.[1])
+	return STAR_RARITY[stars - 1] ?? STAR_RARITY[DEFAULT_FALLBACK_STARS - 1] ?? 0
+}
+
+/**
+ * Translate the rotation's `Gift` block into the storefront gift-drop shape the grant path
+ * reads. The renamed fields are the whole point — feeding one shape to the other's reader
+ * silently drops the rarity and context.
+ *
+ * The reward carries no price, so `Currency`/`CurrencyType` are zero: the box shows an
+ * item, not a payout. Display strings come from the block when it carries them; a block
+ * that doesn't (the captured rotation names neither) borrows them from the catalog entry
+ * selling the same item, so the granted item reads as itself — "Camera Skin (Comic)" rather
+ * than the name of the box it might have arrived in.
+ */
+function toChallengeGiftDrop(catalog: StoreItem[]): StoreGiftDrop {
+	const gift = weeklyChallenge.Gift as ChallengeGift
+	const sold = catalog.find(
+		({ GiftDrop: drop }) =>
+			(gift.EquipmentModificationGuid !== '' &&
+				drop.EquipmentModificationGuid === gift.EquipmentModificationGuid) ||
+			(gift.AvatarItemDesc !== '' && drop.AvatarItemDesc === gift.AvatarItemDesc)
+	)?.GiftDrop
+	return {
+		FriendlyName: gift.FriendlyName ?? sold?.FriendlyName ?? weeklyChallenge.FallbackGiftName,
+		Tooltip: gift.Tooltip ?? sold?.Tooltip ?? '',
+		ConsumableItemDesc: gift.ConsumableItemDesc,
+		AvatarItemDesc: gift.AvatarItemDesc,
+		AvatarItemType: gift.AvatarItemType,
+		EquipmentPrefabName: gift.EquipmentPrefabName,
+		EquipmentModificationGuid: gift.EquipmentModificationGuid,
+		// The block's own `GiftRarity` is 0 in the captured rotation even though the item it
+		// names sells at rarity 5, so the catalog's rarity wins where there is one.
+		Rarity: sold?.Rarity ?? gift.GiftRarity,
+		Context: gift.GiftContext,
+		Currency: 0,
+		CurrencyType: 0,
+	}
+}
+
+/**
+ * The consolation box: a query drop at the rarity `FallbackGiftName` promises, named after
+ * it. Handed over instead of the rotation's item when that item would be a duplicate, which
+ * is what the fallback name is for — the reward reads "the Camera Skin, or a 4-Star Box".
+ */
+function toChallengeFallbackDrop(): StoreGiftDrop {
+	return {
+		FriendlyName: weeklyChallenge.FallbackGiftName,
+		Tooltip: '',
+		ConsumableItemDesc: '',
+		AvatarItemDesc: '',
+		AvatarItemType: null,
+		EquipmentPrefabName: '',
+		EquipmentModificationGuid: '',
+		Rarity: fallbackGiftRarity(),
+		Context: (weeklyChallenge.Gift as ChallengeGift).GiftContext,
+		Currency: 0,
+		CurrencyType: 0,
+		IsQuery: true,
+	}
+}
+
+/**
+ * Award the rotation's `Gift` if this player has just finished the whole set, doing nothing
+ * otherwise. Called after each completing progress report, since `updateProgress` is the
+ * only place a challenge is ever finished — there is no separate claim endpoint, and the
+ * client never asks for this reward.
+ *
+ * "The whole set" is every challenge in the current rotation, read back from
+ * `challenge_status`. The rotation's `CompletedRequired` flag is NOT consulted: what it
+ * means is inferred, and the only reading under which the gift is due before the set is
+ * finished would pay out on the first challenge, which no rotation can have intended.
+ *
+ * What lands is the `Gift` block's item — or, if the player already owns it, the box named
+ * by `FallbackGiftName`, which rolls something they don't have at that tier. Finishing the
+ * week can't be worth nothing, and the rotation's reward is one fixed item that plenty of
+ * players will have bought already.
+ *
+ * A grant that throws is swallowed: the client is reporting gameplay progress, and failing
+ * that report (which it would then retry with the same completion) is worse than missing
+ * the reward — the claim row is already taken, so the miss is permanent but visible in the
+ * logs. An empty rotation is not "all complete"; without the guard, `every` on it is
+ * vacuously true and every report would win a gift.
+ */
+async function awardChallengeGift(c: Context<App>, accountId: number): Promise<void> {
+	try {
+		if (weeklyChallenge.Challenges.length === 0) return
+		const complete = await getCompletedChallengeIds(
+			c.env.DB,
+			accountId,
+			weeklyChallenge.ChallengeMapId
+		)
+		if (!weeklyChallenge.Challenges.every((ch) => complete.has(ch.ChallengeId))) return
+		// Claim first: this is what stops the next report paying out a second time.
+		const claimed = await claimChallengeGift(c.env.DB, accountId, weeklyChallenge.ChallengeMapId)
+		if (!claimed) return
+		const catalog = await loadRollCatalog(c)
+		const reward = toChallengeGiftDrop(catalog)
+		const duplicate = await ownsGiftDrop(c.env.DB, accountId, reward)
+		const granted = await grantGiftDrop(
+			c,
+			accountId,
+			duplicate ? toChallengeFallbackDrop() : reward,
+			CHALLENGE_GIFT_MESSAGE,
+			catalog
+		)
+		// Nobody asked for this box, so the client has no reason to re-read the gifts list:
+		// the notification is what makes the reward show up at the moment the set is finished.
+		// From "Coach", the same system sender a self-buy is attributed to — the rotation is
+		// the server handing something over, not another player.
+		await pushGiftReceived(c, accountId, granted, CHALLENGE_GIFT_MESSAGE, COACH_ACCOUNT_ID)
+		logger.info('weekly challenge gift granted', {
+			accountId,
+			challengeMapId: weeklyChallenge.ChallengeMapId,
+			giftId: granted.id,
+			fallbackRoll: duplicate,
+		})
+	} catch (err) {
+		logger.error('failed to grant weekly challenge gift', {
+			accountId,
+			challengeMapId: weeklyChallenge.ChallengeMapId,
+			error: err instanceof Error ? err.message : String(err),
+		})
 	}
 }
 
@@ -1143,50 +1559,9 @@ const app = new Hono<App>({ strict: false })
 			)
 			if (!paid) return c.json({ error: 'Insufficient balance' }, 400)
 
-			// Grant the item to the recipient. A gift-drop carries an avatar item, a consumable,
-			// an equipment skin, or none of these (currency/xp drops aren't granted yet); grant
-			// whichever it actually has.
-			if (typeof item.GiftDrop.AvatarItemDesc === 'string' && item.GiftDrop.AvatarItemDesc !== '') {
-				await grantItem(c.env.DB, receiverId, toAvatarItem(item.GiftDrop))
-			}
-			if (
-				typeof item.GiftDrop.EquipmentModificationGuid === 'string' &&
-				item.GiftDrop.EquipmentModificationGuid !== ''
-			) {
-				await grantEquipment(c.env.DB, receiverId, toEquipment(item.GiftDrop))
-			}
-			const isConsumable =
-				typeof item.GiftDrop.ConsumableItemDesc === 'string' &&
-				item.GiftDrop.ConsumableItemDesc !== ''
-			const consumableCount = isConsumable ? CONSUMABLE_GRANT_COUNT : 0
-			// Capture the granted consumable's row id and the player's pre-existing count so
-			// the gift box can carry them — gift-consume fires ConsumableMappingAdded from these.
-			let consumableMappingId = 0
-			let consumablePreExisting = 0
-			if (isConsumable) {
-				consumablePreExisting = await countConsumable(
-					c.env.DB,
-					receiverId,
-					item.GiftDrop.ConsumableItemDesc
-				)
-				consumableMappingId = await grantConsumable(
-					c.env.DB,
-					receiverId,
-					item.GiftDrop.ConsumableItemDesc,
-					consumableCount
-				)
-			}
-			const { id: giftId } = await createGift(
-				c.env.DB,
-				receiverId,
-				toGiftContent(
-					item.GiftDrop,
-					message,
-					consumableCount,
-					consumableMappingId,
-					consumablePreExisting
-				)
-			)
+			// Grant the item to the recipient, with the gift box that renders it. A box (an
+			// `IsQuery` drop, e.g. sf2's "4-Star Unique Box") rolls its prize in here.
+			const { id: giftId } = await grantGiftDrop(c, receiverId, item.GiftDrop, message)
 
 			// Push the debit over the socket so the buyer's client updates the shown total
 			// immediately — the buyer (`id`) is who was charged, in the currency they spent. The
@@ -1479,6 +1854,15 @@ const app = new Hono<App>({ strict: false })
 							challengeId,
 							complete: parseBool(body.Complete),
 						})
+			// This report may have been the last one of the set. Only a completing report on
+			// the LIVE rotation can be — an old rotation's set can no longer be finished, and
+			// an unfinished challenge means the set isn't either, so neither is worth a read.
+			// The response is unchanged whether or not a gift was won: the client learns about
+			// the box from `GET /api/avatar/v2/gifts`, and adding a field here would be
+			// inventing response shape the client never sent us.
+			if (complete && challengeId !== 0 && challengeMapId === weeklyChallenge.ChallengeMapId) {
+				await awardChallengeGift(c, id)
+			}
 			return c.json({
 				ChallengeMapId: challengeMapId,
 				ChallengeId: challengeId,

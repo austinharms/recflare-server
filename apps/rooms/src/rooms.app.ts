@@ -402,7 +402,7 @@ async function pushRoomUpdate(
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			playerId,
-			'RoomUpdate',
+			NotificationType.SubscriptionUpdateRoom,
 			room
 		)
 	} catch (err) {
