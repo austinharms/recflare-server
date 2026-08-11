@@ -121,16 +121,28 @@ inconsistency here without checking the client first.
   the owner whether to load the latest or the published version and resolves it from the
   `/subrooms/:sid/saves` list — the matchmake call is identical either way. Don't make
   this server-side: it would put two people in one instance on different versions.
-- Every `StorefrontBalance*` socket frame (`econ` → `notify` hub) is ADDITIVE: the client
-  ADDS the frame's `Balance` to the total it is already showing. That includes
-  `StorefrontBalancePurchase`, whose `Delta`/`BalanceAddType` fields make it look like an
-  idempotent "here is your new total" frame — it isn't, and the client never applies
-  `Delta` itself. So never send a total, and never push a frame to the player who is
-  reading the HTTP response for the same change: they apply both. A storefront purchase
-  (`/api/storefronts/v2/buyItem`) therefore pushes NOTHING — the buyer applies the body's
-  `Balance` (the negated price) — and `buyInvention` pushes only the CREATOR's payout, not
-  the buyer's debit. Pushing the resulting total on a buy showed 33,200 tokens to a player
-  who spent 900 of 17,500 (the correct 16,600, twice); pushing the change debits twice.
+- A balance lives in a `(CurrencyType, Platform)` BUCKET and the client shows the SUM of the
+  buckets, so `Platform` is a balance's identity, not a label. This server uses exactly one
+  bucket per currency — `ALL_PLATFORMS`, -2 `NonPurchasedNotUsableInP2P` — and every surface
+  must name it: the balance DTO (`econ`: `GET /api/storefronts/v4/balance/:type`), the
+  `BalanceType` the storefront bodies echo, and the `Platform` on every `StorefrontBalance*`
+  socket frame. Two traps, which produced two "balance doubling" bugs that both looked like
+  the frames being additive when they are not:
+  - Each frame SETS the bucket it names to an absolute value — `Balance` is the RESULTING
+    TOTAL, never the change (`StorefrontBalancePurchase`'s `Delta`/`BalanceAddType` are
+    display-only; the client logs them and stores `Balance` outright). Send a change and the
+    balance becomes that change. Being absolute, a frame is idempotent: re-sending one, or
+    racing a `GET /balance`, cannot drift the total, so the player reading the HTTP response
+    for the same change gets a frame too.
+  - The bucket key on the wire is `Platform`. The client's property is named `BalanceType`
+    but carries a `[DataMember]` rename, and its decoder drops unknown members silently, so
+    a frame saying `BalanceType` lands in `Platform` 0 (`SteamPurchased`) and adds a phantom
+    balance to the real one — 10,000 tokens + a 250 reward read 20,250. Sending a real-but-
+    different platform does the same: `Platform: RecNet` on a buy showed 34,100 to a player
+    who spent 900 of 17,500, then 33,200 once the body's -900 reached the true bucket.
+  The payload shapes are recovered from the client's own decoder in
+  `apps/notify/src/notification-payloads.ts` — build frames against those interfaces (econ
+  does) so a renamed key fails the build instead of silently vanishing on the wire.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

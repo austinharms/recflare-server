@@ -20,8 +20,11 @@ import { validateAndGetAccountId } from '@repo/jwt'
 // Imported directly rather than copied: these are plain D1 helpers with no bindings of
 // their own, and buyInvention has to read the very rows `api` writes.
 import { getInventionById, toSaveResult } from '../../api/src/inventions-db'
-// The notification-type ids the hub carries (owned by the `notify` worker). Imported
-// as a value — the enum has no runtime dependencies.
+// The notification-type ids the hub carries, and the payload shapes recovered from the
+// client's own decoder (both owned by the `notify` worker). Imported rather than copied so
+// the frames this worker builds are typed by the shapes the client actually parses — a
+// wrong or renamed key (see the `Platform`/`BalanceType` trap) fails the build here.
+import { BalanceAddType } from '../../notify/src/notification-payloads'
 import { NotificationType } from '../../notify/src/notification-types'
 import adCarouselItems from '../static/ad-carousel-items.json'
 import defaultAvatarItems from '../static/default-avatar-items.json'
@@ -87,6 +90,10 @@ import { claimReward } from './reward-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Progression, StoredGift, XpGrant } from '@repo/domain'
+import type {
+	BalanceResponsePayload,
+	PurchaseBalanceModificationPayload,
+} from '../../notify/src/notification-payloads'
 import type { Avatar } from './avatar-db'
 import type { ConsumeResult } from './consumables-db'
 import type { App } from './context'
@@ -223,49 +230,105 @@ async function pushConsumableAdded(
 }
 
 /**
- * Push a StorefrontBalanceUpdate to a player after their balance changes, mirroring the
- * reference's
- * `HubSendToPlayer(accountID, NotifFrame(StorefrontBalanceUpdate, {Balance, CurrencyType, BalanceType}))`.
- * The client applies it to the shown balance so a change reflects immediately, without
- * waiting for a `GET /balance` re-fetch.
+ * THE BALANCE-FRAME RULE, which both balance bugs came from getting wrong.
  *
- * `Balance` is the CHANGE — negative for a debit, positive for a payout — not the
- * resulting total. The client ADDS what it receives to the balance it is already showing,
- * so sending the total made a 10,000-token player who earned 250 read 20,250: their own
- * balance plus the new total. That also makes this frame non-idempotent, so push exactly
- * once per change and never re-send it as a "refresh".
+ * The client holds a balance PER `(CurrencyType, Platform)` bucket and shows the SUM of the
+ * buckets. Every `StorefrontBalance*` frame is an absolute SET of the one bucket it names —
+ * not a change to apply — so:
  *
- * Every StorefrontBalance* frame is additive this way, StorefrontBalancePurchase included
- * — it is NOT the idempotent "here is your new total" frame it looks like. Sending the
- * total on a purchase doubled the buyer's balance on screen (17,500 − 900 spent showed
- * 33,200: the correct 16,600 twice over), which is why the purchase paths below push
- * nothing to the buyer at all.
+ *  1. `Balance` is the RESULTING TOTAL. Sending the change sets the bucket TO that change.
+ *  2. The bucket key on the wire is `Platform`. The client's property is called
+ *     `BalanceType` but carries a `[DataMember]` rename, and its decoder drops unknown
+ *     members in silence — so a frame that says `BalanceType` lands in `Platform` 0,
+ *     `SteamPurchased`, and creates a SECOND bucket that is added to the real one forever.
+ *  3. That bucket must be the same one `GET /api/storefronts/v4/balance/:type` reports,
+ *     `ALL_PLATFORMS`. One account-wide bucket per currency is the whole model here; a
+ *     frame naming any other Platform is a phantom balance, not a per-store nicety.
  *
- * So: a frame goes to a player whose client is NOT reading this response — the invention
- * creator collecting a payout. The caller learns their own new balance from the HTTP body
- * and must not also be pushed one, or they apply both.
+ * Both live bugs were rule 2 or 3, and both looked like the frame being "additive":
+ *  - A player who earned 250 on 10,000 read 20,250 — `BalanceType: -2` was dropped, so the
+ *    total landed in a phantom Steam bucket beside the real one.
+ *  - A player who spent 900 of 17,500 read 34,100, then 33,200 once the purchase response's
+ *    -900 reached the real bucket — same phantom bucket, this time from `Platform: RecNet`.
+ * Neither was additivity: the totals were right, the bucket was wrong. Frames as specified
+ * here are idempotent, so re-sending one or racing a `GET /balance` cannot drift the total.
  *
- * `BalanceType` is -2 (account-wide, all platforms). Best-effort: a hub failure is logged
- * and swallowed, since the balance change has already committed.
+ * See apps/notify/src/notification-payloads.ts for the payload shapes this is recovered
+ * from — the interfaces there type these calls, so a wrong key is now a build error.
+ */
+
+/**
+ * Push a StorefrontBalanceUpdate (61) — "your balance in this bucket is now X" — after a
+ * player's balance changes for a reason that is not their own purchase. `balance` is their
+ * resulting TOTAL in that currency, per the rule above.
+ *
+ * A player who is reading the HTTP response for the same change gets this too: it sets the
+ * bucket to the same total the body reports, so the two agree rather than compound. Pushing
+ * it is what saves them a `GET /balance` re-fetch.
+ *
+ * Best-effort: a hub failure is logged and swallowed, since the change has already committed.
  */
 async function pushBalanceUpdate(
 	c: Context<App>,
 	accountId: number,
 	currencyType: number,
-	change: number
+	balance: number
 ): Promise<void> {
+	// `satisfies` rather than a type annotation: the hub takes a Record<string, unknown>, and
+	// an interface (unlike an inferred object type) has no implicit index signature to match
+	// it. This still checks every key against the shape the client's decoder parses.
+	const payload = {
+		Balance: balance,
+		CurrencyType: currencyType,
+		Platform: ALL_PLATFORMS,
+	} satisfies BalanceResponsePayload
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			accountId,
 			NotificationType.StorefrontBalanceUpdate,
-			{
-				Balance: change,
-				CurrencyType: currencyType,
-				BalanceType: ALL_PLATFORMS,
-			}
+			payload
 		)
 	} catch (err) {
 		logger.error('failed to push StorefrontBalanceUpdate notification', {
+			accountId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
+ * Push a StorefrontBalancePurchase (62) — the frame the reference sends when the balance
+ * moved because the player BOUGHT something, as opposed to the plain update above. Same
+ * absolute-set semantics: `balance` is the resulting total.
+ *
+ * `Delta` (the negated price) and `BalanceAddType` are display/telemetry only — the client
+ * logs them and then stores `Balance` outright, so a correct `Delta` beside a stale
+ * `Balance` still leaves the player's balance wrong. `Platform` is `ALL_PLATFORMS`, NOT
+ * `RecNetPurchased`: it has to name the bucket `GET /balance` reports, and sending RecNet
+ * here is exactly what doubled a buyer's tokens on screen. Best-effort, as above.
+ */
+async function pushBalancePurchase(
+	c: Context<App>,
+	accountId: number,
+	currencyType: number,
+	delta: number,
+	balance: number
+): Promise<void> {
+	const payload = {
+		BalanceAddType: BalanceAddType.CommercePurchase,
+		Delta: delta,
+		Balance: balance,
+		Platform: ALL_PLATFORMS,
+		CurrencyType: currencyType,
+	} satisfies PurchaseBalanceModificationPayload
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			accountId,
+			NotificationType.StorefrontBalancePurchase,
+			payload
+		)
+	} catch (err) {
+		logger.error('failed to push StorefrontBalancePurchase notification', {
 			accountId,
 			error: err instanceof Error ? err.message : String(err),
 		})
@@ -1713,9 +1776,9 @@ const app = new Hono<App>({ strict: false })
 				'still matches, debits the buyer atomically, grants the item (into the inventory or',
 				'consumable table), and returns a gift box. A `Gift` block routes the item to another',
 				'player, but the caller always pays. `Balance` in the response is the CHANGE (negated',
-				'price), not the new total. No balance socket frame is pushed: the buyer is the caller,',
-				'and the client ADDS any StorefrontBalance* frame on top of the change it already',
-				'applied from this body — pushing the total here doubled the balance on screen.',
+				'price), not the new total. Pushes a StorefrontBalancePurchase socket frame that SETS the',
+				'buyer’s account-wide bucket to the RESULTING total, so the frame, this body and a',
+				'`GET /balance` re-fetch all agree (`Delta` there is display-only).',
 			].join(' '),
 			security: AUTHED,
 			requestBody: jsonBody(BuyItemRequest, 'The item, currency, price, and optional Gift'),
@@ -1803,13 +1866,13 @@ const app = new Hono<App>({ strict: false })
 				message
 			)
 
-			// NO balance frame is pushed here, deliberately. The buyer is the caller: they get
-			// the debit from the response below (and re-read `GET /balance`), and the client ADDS
-			// any StorefrontBalance* frame on top of that — including StorefrontBalancePurchase,
-			// which is additive like the rest despite carrying a `Delta` field. Pushing the
-			// resulting total doubled the shown balance (17,500 − 900 read 33,200 = 16,600 twice);
-			// pushing the change debited it twice. Only a player who is NOT reading this response
-			// needs a frame — see the invention creator's payout in buyInvention.
+			// Push the spend to the buyer (`id` — the caller is who was charged) so their client
+			// updates without waiting for a `GET /balance` re-fetch. StorefrontBalancePurchase
+			// SETS the account-wide bucket to the resulting total read back from D1, so it agrees
+			// with both the response body below and any re-fetch instead of compounding with them
+			// — see the frame rule above pushBalanceUpdate. Best-effort.
+			const newBalance = await getBalance(c.env.DB, id, currencyType as number, startingTokens)
+			await pushBalancePurchase(c, id, currencyType as number, -price.Price, newBalance)
 
 			// The response mirrors a captured real buyItem: `Balance` is the change applied (the
 			// negated price), not the resulting balance (the client reads its new total from
@@ -1879,9 +1942,9 @@ const app = new Hono<App>({ strict: false })
 				'its stored `Price`, debits the buyer and pays the creator that price in',
 				'RecCenterTokens (a free invention moves nothing), records ownership in',
 				'`inventory_invention`, and returns the invention alongside the buyer’s resulting',
-				'balance. When tokens moved, the CREATOR gets a StorefrontBalanceUpdate push carrying',
-				'their payout, which their client adds to the balance it is showing. The buyer gets no',
-				'push: this response body already replaces the balance their client shows.',
+				'balance. When tokens moved, both players get a socket push carrying their RESULTING',
+				'total — the buyer a StorefrontBalancePurchase, the CREATOR a StorefrontBalanceUpdate —',
+				'which sets the account-wide bucket their client shows, agreeing with this body.',
 				'A GET because that is how the client sends it.',
 			].join(' '),
 			security: AUTHED,
@@ -1969,26 +2032,35 @@ const app = new Hono<App>({ strict: false })
 				// creator who had never touched their balance would otherwise have the row created
 				// here and lose their starting tokens forever.
 				await ensureStartingBalances(c.env.DB, invention.CreatorPlayerId, startingTokens)
-				await creditCurrency(
+				const creatorBalance = await creditCurrency(
 					c.env.DB,
 					invention.CreatorPlayerId,
 					CurrencyType.RecCenterTokens,
 					price,
 					startingTokens
 				)
-				// The creator is a different, probably-online player: push the payout so a sale
-				// lands on their shown balance without a re-fetch. Positive, because the frame
-				// carries the change. Best-effort, as everywhere.
-				await pushBalanceUpdate(c, invention.CreatorPlayerId, CurrencyType.RecCenterTokens, price)
+				// The creator is a different, probably-online player with no response to read:
+				// push the sale so it lands on their shown balance without a re-fetch. The frame
+				// carries their resulting TOTAL (what `creditCurrency` returns), not the payout —
+				// sending the payout would set their whole balance to it. A plain update rather
+				// than a purchase frame: they sold, they didn't buy. Best-effort, as everywhere.
+				await pushBalanceUpdate(
+					c,
+					invention.CreatorPlayerId,
+					CurrencyType.RecCenterTokens,
+					creatorBalance
+				)
 			}
 
 			// Unlike buyItem — whose `Balance` is the change applied — the reference server
 			// answers this one with the RESULTING total (a first read seeds the buyer's starting
-			// grant, as everywhere else). That total REPLACES the balance the buyer's client is
-			// showing, which is why the buyer gets no socket frame: a StorefrontBalance* push is
-			// ADDED to what the client shows, so one here would debit them a second time on
-			// screen. The creator, whose client never sees this response, is pushed above.
+			// grant, as everywhere else). The buyer's frame carries that same total, so the body
+			// and the push land the client on one number.
 			const balance = await getBalance(c.env.DB, id, CurrencyType.RecCenterTokens, startingTokens)
+			// A free invention moved nothing, so there is no purchase to report.
+			if (price > 0) {
+				await pushBalancePurchase(c, id, CurrencyType.RecCenterTokens, -price, balance)
+			}
 			return c.json({
 				BalanceUpdateResponse: {
 					Balance: balance,

@@ -777,12 +777,27 @@ describe('econ endpoints', () => {
 		expect(gift.AvatarItemDesc).not.toBe('')
 		expect(gift.Id).toBeGreaterThan(0)
 
-		// A purchase pushes NO balance frame. The buyer is the caller: they apply the change
-		// from the body above, and the client ADDS any StorefrontBalance* frame on top of it —
-		// StorefrontBalancePurchase included, despite its `Delta` field. Pushing the resulting
-		// total is what made a live 17,500-token player read 33,200 after spending 900 (16,600
-		// twice over); pushing the change would debit them twice instead.
-		expect(await drainFrames()).toEqual([])
+		// A purchase pushes StorefrontBalancePurchase, which SETS one (CurrencyType, Platform)
+		// bucket to an absolute value: `Balance` is the resulting total (10000 - 450) and `Delta`
+		// is display-only. The bucket key is `Platform`, and it MUST be the -2 the balance
+		// endpoint reports below — the client sums its buckets, so a frame naming any other
+		// platform (or spelling the key `BalanceType`, which the client's decoder drops) invents
+		// a second balance beside the real one. That is what showed a live player 34,100 tokens
+		// after spending 900 of 17,500, then 33,200 once the body's -900 landed.
+		expect(await drainFrames()).toEqual([
+			{
+				accountId: 20,
+				notificationType: NotificationType.StorefrontBalancePurchase,
+				payload: {
+					// 1400 = CommercePurchase; -2 = NonPurchasedNotUsableInP2P, the only bucket we use.
+					BalanceAddType: 1400,
+					Delta: -450,
+					Balance: 9550,
+					Platform: -2,
+					CurrencyType: 2,
+				},
+			},
+		])
 
 		// The balance endpoint reflects the debit (this is the resulting total, 10000 - 450).
 		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
@@ -1131,16 +1146,31 @@ describe('econ endpoints', () => {
 		).toBe(DEFAULT_STARTING_TOKENS + 250)
 		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([9])
 
-		// Only the CREATOR gets a socket frame, carrying their CHANGE rather than their new
-		// total: the client ADDS what it receives to the balance it is showing, so a total would
-		// have them reading their own balance plus the payout. The buyer gets none — the
-		// response body already replaced the balance their client shows, and a frame on top of
-		// it would debit them twice on screen.
+		// Both sides get a frame carrying their RESULTING TOTAL, into the same -2 bucket the
+		// balance endpoint reports — a StorefrontBalance* push SETS that bucket, so sending the
+		// change (250 / -250) would set their whole balance to it. The creator sold, so theirs is
+		// a plain update; the buyer bought, so theirs is a purchase frame with a display-only
+		// `Delta`. Note the key is `Platform`: the client renames `BalanceType` away and drops it.
 		expect(await drainFrames()).toEqual([
 			{
 				accountId: 999,
 				notificationType: NotificationType.StorefrontBalanceUpdate,
-				payload: { Balance: 250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
+				payload: {
+					Balance: DEFAULT_STARTING_TOKENS + 250,
+					CurrencyType: CurrencyType.RecCenterTokens,
+					Platform: -2,
+				},
+			},
+			{
+				accountId: 51,
+				notificationType: NotificationType.StorefrontBalancePurchase,
+				payload: {
+					BalanceAddType: 1400,
+					Delta: -250,
+					Balance: DEFAULT_STARTING_TOKENS - 250,
+					Platform: -2,
+					CurrencyType: CurrencyType.RecCenterTokens,
+				},
 			},
 		])
 	})

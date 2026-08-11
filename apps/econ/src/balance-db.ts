@@ -1,3 +1,5 @@
+import { BalancePlatform } from '../../notify/src/notification-payloads'
+
 /**
  * Currency balances on the shared `recflare` D1 database.
  *
@@ -91,75 +93,23 @@ export function startingBalances(
 }
 
 /**
- * The client's `Platform` enum (obfuscated `DEKBHBDENBA`) — WHERE a balance came from,
- * carried on the balance DTO and on the `StorefrontBalance*` socket frames. The store
- * platforms (Steam … Pico) mean tokens bought with real money there; the negative and
- * 100+ members are the "not purchased" kinds, split by whether they may be spent
- * player-to-player.
+ * The ONE balance bucket this server uses: `NonPurchasedNotUsableInP2P` (-2).
  *
- * We sell nothing, so only one of these is ever on the wire from us: balances read back as
- * `NonPurchasedNotUsableInP2P` (see `ALL_PLATFORMS`). The rest is recorded for when a frame
- * from a real capture has to be read.
- */
-export const Platform = {
-	NonPurchasedNotUsableInP2P: -2,
-	NonPurchasedDefault: -1,
-	Steam: 0,
-	Oculus: 1,
-	PlayStation: 2,
-	Microsoft: 3,
-	RecNet: 4,
-	IOS: 5,
-	GooglePlay: 6,
-	Pico: 8,
-	PlayStationNonPurchasedP2P: 100,
-	NonPlayStationNonPurchasedP2P: 101,
-	NonPurchasedEarnedByP2P: 1000,
-} as const
-
-/**
- * `Platform` in the client's balance DTO: -2, `NonPurchasedNotUsableInP2P`. We don't track
- * per-platform wallets (real RecNet did, for platform-purchased tokens), and everything we
- * hand out is minted rather than bought, so one account-wide balance answers for all of them.
- */
-export const ALL_PLATFORMS: number = Platform.NonPurchasedNotUsableInP2P
-
-/**
- * The client's `BalanceAddType` enum (obfuscated `EPJJLKAOOLD`) — WHY a balance changed,
- * tagged onto a `StorefrontBalance*` frame. Log-only: the client shows/records the reason
- * but never derives the balance from it, so a wrong value here is cosmetic, not a wrong
- * number on screen.
+ * The client keys a balance by `(CurrencyType, Platform)` and shows the SUM of the buckets,
+ * so which Platform a balance is reported under is not cosmetic — it is the bucket's
+ * identity. Everything we hand out is minted rather than bought, and we track no
+ * per-platform wallets (real RecNet did, for tokens paid for on each store), so one
+ * account-wide bucket per currency answers for all of them.
  *
- * Nothing here sends one today: the `StorefrontBalanceUpdate` frames this worker pushes
- * carry only `{ Balance, CurrencyType, BalanceType }`, and the purchase paths push no frame
- * at all (see `pushBalanceUpdate` in econ.app.ts). Recorded because the reasons a balance
- * moves (challenges, level-ups, creator payouts, manual grants) are paths this worker will
- * grow into, and for reading a frame out of a real capture.
+ * Every surface that names the bucket must name THIS one: the balance DTO's `Platform`, the
+ * `BalanceType` the storefront HTTP bodies echo, and the `Platform` on every
+ * `StorefrontBalance*` socket frame. Naming a second one there invents a balance the client
+ * adds to the real total — see the frame rule in econ.app.ts.
+ *
+ * The enum itself lives in the notify worker's `notification-payloads.ts`, recovered from
+ * the client's decoder, rather than being duplicated here.
  */
-export const BalanceAddType = {
-	Invalid: 0,
-	DirectBalanceWithMultiplier: 1,
-	FromGiftBox: 2,
-	NUXChallenge: 10,
-	AllNUXChallenges: 11,
-	DailyChallenge: 100,
-	AllDailyChallenges: 101,
-	FinishActivity: 200,
-	RecRoyaleMatchFinished: 250,
-	ChecklistCredit: 303,
-	WonGame: 1000,
-	LostGame: 1001,
-	WonGameRateLimited: 1002,
-	WonGamePartial: 1003,
-	LevelUp: 1100,
-	Registered: 1200,
-	CreatorReward: 1300,
-	CommercePurchase: 1400,
-	CommercePurchaseRevoked: 1401,
-	Manual_Refund: 2000,
-	Manual_Thanks: 2010,
-	Manual_Apology: 2020,
-} as const
+export const ALL_PLATFORMS: BalancePlatform = BalancePlatform.NonPurchasedNotUsableInP2P
 
 /** Schema DDL (mirror of migrations 0001_balance.sql) — also used to build the table in tests. */
 export const BALANCE_SCHEMA_DDL: string[] = [
