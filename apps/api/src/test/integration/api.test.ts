@@ -311,8 +311,9 @@ describe('public endpoints', () => {
 	})
 
 	test('progression reads back the XP game rewards banked, levelled up', async () => {
-		// What `econ` writes when a game reward is claimed — the two workers share the table.
-		// 25 XP from level 1 pays the 10 to reach 2 and the 10 to reach 3, leaving 5.
+		// The two workers share this table; `econ` writes it when a game reward is claimed (5 XP
+		// at a time). Granted in one lump here to exercise a multi-level climb: 25 XP from level
+		// 1 pays the 10 to reach 2 and the 10 to reach 3, leaving 5.
 		expect(await addXp(env.DB, 4242, 25)).toEqual({
 			progression: { PlayerId: 4242, Level: 3, XP: 5 },
 			levelsGained: 2,

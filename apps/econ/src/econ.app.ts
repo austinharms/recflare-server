@@ -708,8 +708,12 @@ async function grantGiftDrop(
  * XP paid for a claimed game reward. One flat amount for every reward type, matching the
  * one flat cooldown they share — "First Game of the Day" and "Activity completed!" are the
  * same size of pat on the back until there's reason to price them apart.
+ *
+ * Deliberately smaller than the 10 XP the first level costs: a single action shouldn't be a
+ * level-up, let alone two of them. At 5 it takes two rewards to reach level 2, and the early
+ * levels are paced by the hourly cooldown rather than cleared in one match.
  */
-const GAME_REWARD_XP = 25
+const GAME_REWARD_XP = 5
 
 /**
  * `GiftContext.GameRewards` — what the box says it came from, so the client files it under
@@ -769,9 +773,9 @@ function toLevelUpDrop(rarity: number): StoreGiftDrop {
 
 /**
  * Hand over the rewards a run of level-ups earned — ONE PER LEVEL crossed, since the
- * published table names a reward for every level and a single grant can cross several (25 XP
- * takes a fresh player from 1 to 3, so two rewards). Each arrives as a gift box, announced
- * like any other unasked-for gift.
+ * published table names a reward for every level and a single grant can cross several (a
+ * large enough grant could clear the first three levels at 10 XP each). Each arrives as a
+ * gift box, announced like any other unasked-for gift.
  *
  * Which reward is per level, not per tier: the early levels pay CONSUMABLES and the rest pay
  * clothing at a rising star rating. The catalog is read once and shared across the boxes.

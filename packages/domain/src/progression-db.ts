@@ -64,64 +64,22 @@ export const CONSUMABLE_REWARD = -1
  * 20 there — and this table is the one we grant from, being per-level and explicit. See the
  * econ README.
  */
+// prettier-ignore — the row-per-decade layout is the table; packing it hides the shape.
+// prettier-ignore
 export const LEVEL_REWARDS: readonly number[] = [
 	// Level 0 is not a level anyone reaches; 0 is "no reward" rather than a rarity.
 	0,
 	// 1–10: consumables interleaved with the first clothing drops.
-	CONSUMABLE_REWARD,
-	10,
-	CONSUMABLE_REWARD,
-	10,
-	CONSUMABLE_REWARD,
-	CONSUMABLE_REWARD,
-	CONSUMABLE_REWARD,
-	10,
-	CONSUMABLE_REWARD,
-	10,
+	CONSUMABLE_REWARD, 10, CONSUMABLE_REWARD, 10, CONSUMABLE_REWARD,
+	CONSUMABLE_REWARD, CONSUMABLE_REWARD, 10, CONSUMABLE_REWARD, 10,
 	// 11–20: 2-Star clothing all the way.
-	10,
-	10,
-	10,
-	10,
-	10,
-	10,
-	10,
-	10,
-	10,
-	10,
+	10, 10, 10, 10, 10, 10, 10, 10, 10, 10,
 	// 21–30: 2-Star alternating with 3-Star.
-	10,
-	20,
-	10,
-	20,
-	10,
-	20,
-	10,
-	20,
-	10,
-	20,
+	10, 20, 10, 20, 10, 20, 10, 20, 10, 20,
 	// 31–40: 3-Star with a 4-Star every few levels.
-	30,
-	20,
-	20,
-	20,
-	30,
-	20,
-	20,
-	20,
-	20,
-	30,
+	30, 20, 20, 20, 30, 20, 20, 20, 20, 30,
 	// 41–50: 4-Star to the top, then the game's only 5-Star.
-	30,
-	30,
-	30,
-	30,
-	30,
-	30,
-	30,
-	30,
-	30,
-	50,
+	30, 30, 30, 30, 30, 30, 30, 30, 30, 50,
 ]
 
 /** What reaching a level pays out, or null when it pays nothing. */
@@ -145,7 +103,8 @@ export const MAX_LEVEL = LEVEL_REQUIRED_XP.length - 1
 /**
  * Spend XP on levels: while the current level's cost is met, subtract it and step up. The
  * remainder stays as progress into the next level, and a big enough grant can cross several
- * at once (25 XP takes a fresh player from level 1 to level 3).
+ * at once (a 25 XP grant would take a fresh player from level 1 to level 3, the first two
+ * levels costing 10 each).
  *
  * A cost of 0 or less stops the loop rather than looping forever — the level-0 entry is 0,
  * and a future config could zero one by mistake.
@@ -181,9 +140,10 @@ export interface XpGrant {
 }
 
 /**
- * The levels a grant took the player THROUGH, in order — `[2, 3]` for the 25 XP that lifts a
+ * The levels a grant took the player THROUGH, in order — `[2, 3]` for a grant that lifts a
  * fresh player from level 1 to level 3. One entry per level reached, which is one reward
- * each; an empty list when the grant only moved the bar.
+ * each; an empty list when the grant only moved the bar, which is the common case for a
+ * game reward.
  */
 export function levelsReached(grant: XpGrant): number[] {
 	const from = grant.progression.Level - grant.levelsGained

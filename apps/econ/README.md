@@ -46,7 +46,7 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | GET      | `/api/challenge/v2/getCurrent`                       | ~    | Weekly rotation + the caller's progress |
 | POST     | `/api/challenge/v2/updateProgress`                   | ✓    | Report challenge progress               |
 | GET      | `/api/gamerewards/v1/pending`                        |      | Pending game rewards (stub `[]`)        |
-| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 25 XP + gift box  |
+| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 5 XP + gift box   |
 | GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
 | GET      | `/api/roomkeys/v1/room`                              |      | Room keys for a room (stub `[]`)        |
 | POST     | `/api/CampusCard/v1/UpdateAndGetSubscription`        |      | Subscription lookup (both null)         |
@@ -381,7 +381,7 @@ keyed by type.
 - **`giftContext` (the activity, e.g. `Soccer`) is accepted and ignored** — the cooldown is
   per type, shared across activities, so it is not part of the key.
 
-**What a claim pays: 25 XP, in a gift box.** The XP (`GAME_REWARD_XP`) is banked in
+**What a claim pays: 5 XP, in a gift box.** The XP (`GAME_REWARD_XP`) is banked in
 `progression` and the box is the wrapper the client shows for it — no item, every item field
 empty, `GiftContext` 50 (`GameRewards`). The box wears the `Message` the client posted
 (`First Game of the Day`), and a `GiftPackageReceivedImmediate` frame goes out with it, the
@@ -391,6 +391,9 @@ failure can't leave a box promising XP nobody was credited.
 - **One flat amount for every reward type**, matching the one flat cooldown they share.
   Pricing `FirstActivityOfDay` differently from `PostGameActivity` is a map keyed by type,
   the same shape the per-type cooldown would take.
+- **Deliberately smaller than a level.** The first level costs 10 XP, so a single action
+  can't be a level-up — it takes two rewards to reach level 2, and the early levels are paced
+  by the hourly cooldown rather than cleared in one match.
 - **The response stays `[]`.** It's what the client already accepts, and the reward is
   delivered as a box, so there's nothing to put in the body. The reference answers its own
   (different) flow with `{ error, success, value: null }`, not a list of rewards.
@@ -404,9 +407,9 @@ inserts.
 
 **Levelling spends the XP.** `xp` is progress into the current level, not a lifetime total:
 `addXp` adds the grant, then walks the ladder in `LEVEL_REQUIRED_XP`, subtracting each
-level's cost while it's covered. One 25 XP reward takes a fresh player from level 1 to level
-**3** with 5 XP over (10 + 10 spent), because the early tiers are cheap — the ladder steps
-10 → 20 → 45 → 115 → 360 → 1080 every ten levels and stops at 50.
+level's cost while it's covered — so a big enough grant can cross several levels at once.
+The ladder steps 10 → 20 → 45 → 115 → 360 → 1080 every ten levels and stops at 50, so the
+first level costs 10 XP and the last costs a hundred times that.
 
 That table is copied from the `LevelProgressionMaps` the client is served in
 `apps/api/static/api-config-v2.json`, and **both sides have to agree** or the bar fills to a
@@ -429,9 +432,10 @@ costs are easy to edit one at a time and hard to eyeball as a curve.
 | 40 – 49          | 4-Star Clothing (rarity 30)                |
 | 50               | 5-Star Clothing (rarity 50) — the only one |
 
-**One reward per level crossed**, so the 25 XP that takes a fresh player from 1 to 3 hands
-over three boxes: the XP reward itself, 2-Star Clothing for level 2, and a consumable for
-level 3. Each arrives as a gift box announced like any other (`Level 3!`).
+**One reward per level crossed** — a grant spanning several levels pays each of them. In
+practice a 5 XP game reward crosses at most one, so the second reward a fresh player claims
+hands over two boxes: the XP reward itself and the 2-Star Clothing for reaching level 2. Each
+arrives as a gift box announced like any other (`Level 2!`).
 
 - **"Clothing" is why the roll passes `avatarItemsOnly`** — the prize has to be something the
   player can wear and be seen in, never an equipment skin for a weapon they may not own.
@@ -487,9 +491,8 @@ Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no cod
 - Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
 - Several routes (room keys, wishlist, equipment, room consumables/currencies) are
   empty-list stubs pending their own stores.
-- Game rewards pay a flat 25 XP; there is no daily XP cap beyond the hourly cooldown (the
+- Game rewards pay a flat 5 XP; there is no daily XP cap beyond the hourly cooldown (the
   reference caps activity XP per day in `daily_xp_ledgers`).
-- The weekly-challenge gift is granted but not announced: the box appears in the gifts list
-  with no `GiftPackageReceived` notification, so the player sees it the next time the client
-  reads that list rather than the moment they finish the set. Same gap as gifting to another
-  player, and the same reason — the frame's payload shape hasn't been captured.
+- The level-reward table and the served config's `GiftRarity` disagree in places (see the
+  level section); we grant from the table and leave the config as captured, so a client that
+  previews an upcoming reward would preview the config's answer, not ours.
