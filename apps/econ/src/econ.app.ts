@@ -1777,8 +1777,16 @@ const app = new Hono<App>({ strict: false })
 			if (!paid) return c.json({ error: 'Insufficient balance' }, 400)
 
 			// Grant the item to the recipient, with the gift box that renders it. A box (an
-			// `IsQuery` drop, e.g. sf2's "4-Star Unique Box") rolls its prize in here.
-			const { id: giftId } = await grantGiftDrop(c, receiverId, item.GiftDrop, message)
+			// `IsQuery` drop, e.g. sf2's "4-Star Unique Box") rolls its prize in here, and
+			// `granted.drop` is what the roll landed on — the response has to describe THAT, not
+			// the box, or a query purchase answers with every item field empty and the client
+			// draws an empty box.
+			const { id: giftId, drop: granted } = await grantGiftDrop(
+				c,
+				receiverId,
+				item.GiftDrop,
+				message
+			)
 
 			// Push the debit over the socket so the buyer's client updates the shown total
 			// immediately — the buyer (`id`) is who was charged, in the currency they spent. The
@@ -1789,8 +1797,9 @@ const app = new Hono<App>({ strict: false })
 			// The response mirrors a captured real buyItem: `Balance` is the change applied (the
 			// negated price), not the resulting balance (the client reads its new total from
 			// `GET /balance/:type`); `BalanceType` is -2 (account-wide, all platforms). The Data
-			// entry is the gift-drop the client received — it carries no FriendlyName or
-			// consumable count (the count is a getUnlocked concept; each box is one instance).
+			// entry is the gift-drop the client RECEIVED — the rolled item for a query box, the
+			// bought drop otherwise — and it carries no FriendlyName or consumable count (the
+			// count is a getUnlocked concept; each box is one instance).
 			return c.json({
 				BalanceUpdates: [
 					{
@@ -1799,22 +1808,22 @@ const app = new Hono<App>({ strict: false })
 							{
 								Id: giftId,
 								FromPlayerId: fromPlayerId,
-								ConsumableItemDesc: item.GiftDrop.ConsumableItemDesc,
-								AvatarItemDesc: item.GiftDrop.AvatarItemDesc,
-								AvatarItemType: item.GiftDrop.AvatarItemType ?? 0,
-								EquipmentPrefabName: item.GiftDrop.EquipmentPrefabName,
-								EquipmentModificationGuid: item.GiftDrop.EquipmentModificationGuid,
-								CurrencyType: item.GiftDrop.CurrencyType,
-								Currency: item.GiftDrop.Currency,
-								Xp: 0,
+								ConsumableItemDesc: granted.ConsumableItemDesc,
+								AvatarItemDesc: granted.AvatarItemDesc,
+								AvatarItemType: granted.AvatarItemType ?? 0,
+								EquipmentPrefabName: granted.EquipmentPrefabName,
+								EquipmentModificationGuid: granted.EquipmentModificationGuid,
+								CurrencyType: granted.CurrencyType,
+								Currency: granted.Currency,
+								Xp: granted.Xp ?? 0,
 								Level: 0,
 								Platform: -1,
 								PlatformsToSpawnOn: -1,
 								BalanceType: ALL_PLATFORMS,
 								GiftContext: Number.isInteger(gift?.GiftContext)
 									? (gift?.GiftContext as number)
-									: item.GiftDrop.Context,
-								GiftRarity: item.GiftDrop.Rarity,
+									: granted.Context,
+								GiftRarity: granted.Rarity,
 								Message: message,
 							},
 						],

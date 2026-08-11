@@ -125,9 +125,11 @@ weekly gift — hand over a real item rather than an unopenable box:
 - **`QueryRedirectRarity` wins over `Rarity`** when present — sf2 carries both and they
   agree; sf3's boxes carry only `Rarity`.
 - **An empty pool grants nothing** (logged `query gift-drop rolled nothing`) — an owner of
-  every 4-star item still gets the box, just nothing in it. The `buyItem` response still
-  echoes the drop the player _bought_, i.e. the box; the rolled item shows up in the box
-  itself, via `GET /api/avatar/v2/gifts`.
+  every 4-star item still gets the box, just nothing in it.
+- **`buyItem` answers with the ROLLED item, not the box.** The client draws the purchase
+  from `BalanceUpdates[0].Data[0]`, and a query drop's own item fields are all empty — echo
+  those and the player sees an empty box for a purchase that actually granted something. The
+  stored box was always correct; only the response was wrong.
 
 ## Consume envelopes
 

@@ -1611,10 +1611,26 @@ describe('econ endpoints', () => {
 		})
 		expect(res.status).toBe(200)
 
+		// The RESPONSE describes what the roll landed on, not the box that was bought: the
+		// client draws the purchase from this entry, and the box's own fields are all empty.
+		const bought = (await res.json()) as {
+			BalanceUpdates: Array<{
+				Data: Array<{
+					AvatarItemDesc: string
+					EquipmentModificationGuid: string
+					GiftRarity: number
+				}>
+			}>
+		}
+		const entry = bought.BalanceUpdates[0]?.Data[0]
+		expect(entry?.GiftRarity).toBe(30)
+		expect(`${entry?.AvatarItemDesc ?? ''}${entry?.EquipmentModificationGuid ?? ''}`).not.toBe('')
+
 		const boxes = await giftBoxes('76')
 		expect(boxes).toHaveLength(1)
 		// The box shows what was rolled — a real 4-star item, not the empty box drop.
 		expect(boxes[0]?.GiftRarity).toBe(30)
+		expect(entry?.AvatarItemDesc).toBe(boxes[0]?.AvatarItemDesc)
 		const key = (box?: { AvatarItemDesc: string; EquipmentModificationGuid: string }) =>
 			`${box?.AvatarItemDesc ?? ''}|${box?.EquipmentModificationGuid ?? ''}`
 		expect(key(boxes[0])).not.toBe('|')
@@ -1645,6 +1661,38 @@ describe('econ endpoints', () => {
 		const after = await giftBoxes('76')
 		expect(after).toHaveLength(2)
 		expect(key(after[0])).not.toBe(key(after[1]))
+	})
+
+	test('buying sf3’s Uncommon Random box answers with the rolled item', async () => {
+		// The purchase that came back as an empty box: an sf3 query drop, rolled out of the very
+		// catalog it sells in.
+		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await bearer('77')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: 2455,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				RequestedPrice: 200,
+				CouponConsumablePlayerMappingId: null,
+				Gift: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as {
+			BalanceUpdates: Array<{
+				Data: Array<{ Id: number; AvatarItemDesc: string; GiftRarity: number }>
+			}>
+		}
+		const entry = body.BalanceUpdates[0]?.Data[0]
+		// Uncommon: rarity 10, and a real item rather than the box's empty fields.
+		expect(entry?.GiftRarity).toBe(10)
+		expect(entry?.AvatarItemDesc).not.toBe('')
+
+		const boxes = await giftBoxes('77')
+		expect(boxes).toHaveLength(1)
+		expect(boxes[0]?.Id).toBe(entry?.Id)
+		expect(boxes[0]?.AvatarItemDesc).toBe(entry?.AvatarItemDesc)
 	})
 
 	test('POST /api/gamerewards/v1/request claims once an hour per reward type', async () => {
