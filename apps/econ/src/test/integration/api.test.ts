@@ -6,7 +6,9 @@ import '../../econ.app'
 
 import {
 	getOwnedInventionIds,
+	getProgression,
 	INVENTORY_INVENTION_SCHEMA_DDL,
+	PROGRESSION_SCHEMA_DDL,
 	RECEIVED_GIFT_SCHEMA_DDL,
 } from '@repo/domain'
 
@@ -55,6 +57,7 @@ beforeAll(async () => {
 	for (const stmt of OUTFIT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CHALLENGE_STATUS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CHALLENGE_GIFT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of PROGRESSION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of REWARD_STATUS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTORY_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CONSUMABLE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -1661,7 +1664,7 @@ describe('econ endpoints', () => {
 				.bind(rewardType)
 				.first<{ granted_at: string; grant_count: number }>()
 
-		// The payload is stubbed, so a claim still answers the empty list the client accepts.
+		// A claim answers the empty list the client accepts — the reward rides in a gift box.
 		const first = await request(
 			'rewardType=FirstActivityOfDay&Message=First%20Game%20of%20the%20Day'
 		)
@@ -1701,6 +1704,58 @@ describe('econ endpoints', () => {
 			.run()
 		expect((await request('rewardType=FirstActivityOfDay&Message=tomorrow')).status).toBe(200)
 		expect((await statusOf('FirstActivityOfDay'))?.grant_count).toBe(2)
+	})
+
+	test('a claimed game reward pays XP into a gift box, and announces it', async () => {
+		const request = async (body: string) =>
+			exports.default.fetch(`${ORIGIN}/api/gamerewards/v1/request`, {
+				method: 'POST',
+				headers: {
+					...(await bearer('82')),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body,
+			})
+
+		await drainFrames()
+		expect((await getProgression(env.DB, 82)).XP).toBe(0)
+		const res = await request('rewardType=FirstActivityOfDay&Message=First%20Game%20of%20the%20Day')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([])
+
+		// The XP is banked, not just displayed on the box.
+		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 1, XP: 25 })
+
+		// The box carries the XP and the message the client asked to show, and nothing else —
+		// a game reward is not an item.
+		const boxes = await giftBoxes('82')
+		expect(boxes).toHaveLength(1)
+		expect(boxes[0]).toMatchObject({
+			Xp: 25,
+			Message: 'First Game of the Day',
+			AvatarItemDesc: '',
+			EquipmentModificationGuid: '',
+			ConsumableItemDesc: '',
+		})
+
+		const frames = await drainFrames()
+		expect(frames).toHaveLength(1)
+		expect(frames[0]?.accountId).toBe(82)
+		expect(frames[0]?.notificationType).toBe(NotificationType.GiftPackageReceivedImmediate)
+		expect(frames[0]?.payload).toMatchObject({
+			Id: boxes[0]?.Id,
+			FromPlayerId: 1,
+			Xp: 25,
+			// GiftContext.GameRewards — the box came from gameplay, not a purchase.
+			GiftContext: 50,
+			Message: 'First Game of the Day',
+		})
+
+		// An on-cooldown ask pays nothing: no second box, no second frame, no more XP.
+		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
+		expect((await getProgression(env.DB, 82)).XP).toBe(25)
+		expect(await giftBoxes('82')).toHaveLength(1)
+		expect(await drainFrames()).toEqual([])
 	})
 
 	test('POST /api/gamerewards/v1/request is 401 without a token, and ignores a typeless ask', async () => {

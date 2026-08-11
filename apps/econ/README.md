@@ -46,7 +46,7 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | GET      | `/api/challenge/v2/getCurrent`                       | ~    | Weekly rotation + the caller's progress |
 | POST     | `/api/challenge/v2/updateProgress`                   | ✓    | Report challenge progress               |
 | GET      | `/api/gamerewards/v1/pending`                        |      | Pending game rewards (stub `[]`)        |
-| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward (hourly, per type)  |
+| POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 25 XP + gift box  |
 | GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
 | GET      | `/api/roomkeys/v1/room`                              |      | Room keys for a room (stub `[]`)        |
 | POST     | `/api/CampusCard/v1/UpdateAndGetSubscription`        |      | Subscription lookup (both null)         |
@@ -377,24 +377,47 @@ keyed by type.
 - **`giftContext` (the activity, e.g. `Soccer`) is accepted and ignored** — the cooldown is
   per type, shared across activities, so it is not part of the key.
 
-**The reward payload itself is a stub:** a successful claim records the cooldown, logs a
-`game reward claimed` line, and grants nothing, so a claim and an on-cooldown ask both
-answer the same empty list the client already accepts. Paying one out is the
-`claimed !== null` branch in the handler. Getting eligibility right first is the point —
-it's what stops a repeat ask paying twice once there's something to pay.
+**What a claim pays: 25 XP, in a gift box.** The XP (`GAME_REWARD_XP`) is banked in
+`progression` and the box is the wrapper the client shows for it — no item, every item field
+empty, `GiftContext` 50 (`GameRewards`). The box wears the `Message` the client posted
+(`First Game of the Day`), and a `GiftPackageReceivedImmediate` frame goes out with it, the
+same push the weekly-challenge gift uses. XP is banked **before** the box is created, so a
+failure can't leave a box promising XP nobody was credited.
+
+- **One flat amount for every reward type**, matching the one flat cooldown they share.
+  Pricing `FirstActivityOfDay` differently from `PostGameActivity` is a map keyed by type,
+  the same shape the per-type cooldown would take.
+- **The response stays `[]`.** It's what the client already accepts, and the reward is
+  delivered as a box, so there's nothing to put in the body. The reference answers its own
+  (different) flow with `{ error, success, value: null }`, not a list of rewards.
+- **An on-cooldown ask pays nothing** — no XP, no box, no frame. That's the whole point of
+  getting eligibility right first: a client that retries in a loop must not mint boxes.
+
+**Progression (`progression`) is shared.** `econ` writes it here; `api` reads it back for
+`GET /api/players/v{1,2}/progression/…`. It lives in `@repo/domain` for that reason, the
+same split as gift boxes. A player with no row reads as level 1 / 0 XP, so a GET never
+inserts. `Level` is stored but never moves: the reference levels up by subtracting a tier's
+`RequiredXp` from the running XP, with thresholds from a config file (`configv2.json`'s
+`LevelProgressionMaps`) we don't have.
+
+**Not ported:** the reference's `request` doesn't grant at all — it offers **three** drops,
+pushes a `RewardSelectionReceived` frame and waits for `POST /api/gamerewards/v1/select` to
+grant the one the player picked. We grant on request instead, so there is no selection state
+and no `/select`. It also caps activity XP per day (`daily_xp_ledgers`); the hourly cooldown
+is our cap.
 
 `GET /api/gamerewards/v1/pending` stays `[]`: with rewards claimed on request, nothing sits
 waiting to be collected.
 
 ## Bindings
 
-| Binding                      | Type           | Notes                                                    |
-| ---------------------------- | -------------- | -------------------------------------------------------- |
-| `DB`                         | D1             | Shared `recflare` database — balances, inventory, etc.   |
-| `JWT_SECRET`                 | Secrets Store  | Shared HS256 signing key (see the `auth` README)         |
-| `ASSETS`                     | static assets  | Serves `sf{N}.json` storefront catalogs                  |
-| `RECFLARE_NOTIFICATIONS_HUB` | Durable Object | Cross-worker RPC to the `notify` worker's hub            |
-| `STARTING_TOKENS`            | var            | Optional; new-player token grant (default in balance-db) |
+| Binding                      | Type           | Notes                                                      |
+| ---------------------------- | -------------- | ---------------------------------------------------------- |
+| `DB`                         | D1             | Shared `recflare` database — balances, inventory, XP, etc. |
+| `JWT_SECRET`                 | Secrets Store  | Shared HS256 signing key (see the `auth` README)           |
+| `ASSETS`                     | static assets  | Serves `sf{N}.json` storefront catalogs                    |
+| `RECFLARE_NOTIFICATIONS_HUB` | Durable Object | Cross-worker RPC to the `notify` worker's hub              |
+| `STARTING_TOKENS`            | var            | Optional; new-player token grant (default in balance-db)   |
 
 Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no code change.
 
@@ -411,7 +434,8 @@ Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no cod
 - Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
 - Several routes (room keys, wishlist, equipment, room consumables/currencies) are
   empty-list stubs pending their own stores.
-- Game rewards gate correctly but pay nothing out — see the `reward_status` section.
+- Game rewards pay a flat 25 XP into `progression`; levelling never happens (no curve) and
+  there is no daily XP cap beyond the hourly cooldown.
 - The weekly-challenge gift is granted but not announced: the box appears in the gifts list
   with no `GiftPackageReceived` notification, so the player sees it the next time the client
   reads that list rather than the moment they finish the set. Same gap as gifting to another

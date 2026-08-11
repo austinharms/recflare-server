@@ -1,6 +1,8 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
+import { getProgression, getProgressions } from '@repo/domain'
+
 import { parseFormIds, queryIds } from '../http'
 import {
 	BulkIdsRequest,
@@ -69,13 +71,16 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 		describeRoute({
 			tags: ['Progression'],
 			summary: 'A player’s level and XP',
-			description: 'Nothing awards XP yet, so everyone is level 1 with 0 XP.',
+			description:
+				'The XP banked in `progression` (game rewards pay into it from the `econ` worker). ' +
+				'A player who has earned none has no row and reads back as level 1 with 0 XP. ' +
+				'Levelling is not wired up yet, so `Level` is always 1.',
 			parameters: [idParam('id', 'Account id')],
 			responses: { 200: json(ProgressionDto, 'The player’s progression') },
 		}),
-		(c) => {
+		async (c) => {
 			const id = Number.parseInt(c.req.param('id'), 10)
-			return c.json({ PlayerId: id, Level: 1, XP: 0 })
+			return c.json(await getProgression(c.env.DB, id))
 		}
 	)
 	.post(
@@ -160,12 +165,13 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 			tags: ['Progression'],
 			summary: 'Progressions in bulk (GET form)',
 			description:
-				'What the 2023 client sends. Unlike the POST forms this one does answer — a ' +
-				'default level-1 progression per requested id, in request order.',
+				'What the 2023 client sends. Unlike the POST forms this one does answer — one ' +
+				'progression per requested id, in request order, defaulting to level 1 / 0 XP for ' +
+				'ids that have earned nothing.',
 			parameters: BULK_ID_QUERY,
 			responses: { 200: json(ProgressionDto.array(), 'One progression per requested id') },
 		}),
-		(c) => c.json(queryIds(c).map((id) => ({ PlayerId: id, Level: 1, XP: 0 })))
+		async (c) => c.json(await getProgressions(c.env.DB, queryIds(c)))
 	)
 	.post(
 		'/api/v1/progression/bulk',

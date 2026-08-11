@@ -3,6 +3,7 @@ import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
+	addXp,
 	consumeGift,
 	createGift,
 	getGift,
@@ -306,6 +307,12 @@ interface StoreGiftDrop {
 	 * to `Rarity`.
 	 */
 	QueryRedirectRarity?: number
+	/**
+	 * XP the drop pays out. No storefront catalog sets it — a bought item is an item — but a
+	 * game reward is XP in a gift box, so the box and its notification carry the amount from
+	 * here. The XP itself is banked in `progression`, not read back off the box.
+	 */
+	Xp?: number
 }
 interface StorePrice {
 	CurrencyType: number
@@ -392,7 +399,7 @@ function toGiftContent(
 		AvatarItemType: giftDrop.AvatarItemType,
 		CurrencyType: giftDrop.CurrencyType,
 		Currency: giftDrop.Currency,
-		Xp: 0,
+		Xp: giftDrop.Xp ?? 0,
 		PackageType: 0,
 		Message: message,
 		EquipmentPrefabName: giftDrop.EquipmentPrefabName,
@@ -413,8 +420,8 @@ function toGiftContent(
  *
  * The payload is the reference's field-for-field: the stored box's contents plus its `Id`,
  * a `FromGiftDropId` of 0 (the reference never populates it either) and the
- * platform/balance constants. `Xp` and `Level` are 0 — the drop shape doesn't carry them
- * and nothing grants them yet.
+ * platform/balance constants. `Xp` is the drop's, so a game reward's box announces the XP it
+ * paid; `Level` is 0, since nothing levels a player up yet.
  *
  * "Immediate" (31) rather than GiftPackageReceived (30) is what the reference sends for a
  * box handed over by the server: a purchase gifted to another player, an admin token grant,
@@ -444,7 +451,7 @@ async function pushGiftReceived(
 				EquipmentModificationGuid: gift.drop.EquipmentModificationGuid,
 				CurrencyType: gift.drop.CurrencyType,
 				Currency: gift.drop.Currency,
-				Xp: 0,
+				Xp: gift.drop.Xp ?? 0,
 				Level: 0,
 				Platform: -1,
 				PlatformsToSpawnOn: -1,
@@ -628,6 +635,46 @@ async function grantGiftDrop(
 		toGiftContent(giftDrop, message, consumableCount, consumableMappingId, consumablePreExisting)
 	)
 	return { id, drop: giftDrop }
+}
+
+/**
+ * XP paid for a claimed game reward. One flat amount for every reward type, matching the
+ * one flat cooldown they share — "First Game of the Day" and "Activity completed!" are the
+ * same size of pat on the back until there's reason to price them apart.
+ */
+const GAME_REWARD_XP = 25
+
+/**
+ * `GiftContext.GameRewards` — what the box says it came from, so the client files it under
+ * gameplay rewards rather than a purchase or a player's gift. (`51` is the tokens variant,
+ * for when a reward pays currency instead of XP.)
+ */
+const GIFT_CONTEXT_GAME_REWARDS = 50
+
+/** Shown on the box when the client asks for a reward without saying what to call it. */
+const DEFAULT_GAME_REWARD_MESSAGE = 'Reward earned!'
+
+/**
+ * The gift-drop a claimed game reward hands over: XP in a box, no item. Every item field is
+ * empty on purpose — this is not a purchase and not a roll, so `grantGiftDrop` grants
+ * nothing into the inventory and only creates the box. The XP is banked in `progression`;
+ * the copy here is what the box and its notification display.
+ */
+function toGameRewardDrop(): StoreGiftDrop {
+	return {
+		FriendlyName: '',
+		Tooltip: '',
+		ConsumableItemDesc: '',
+		AvatarItemDesc: '',
+		AvatarItemType: null,
+		EquipmentPrefabName: '',
+		EquipmentModificationGuid: '',
+		Rarity: 0,
+		Context: GIFT_CONTEXT_GAME_REWARDS,
+		Currency: 0,
+		CurrencyType: 0,
+		Xp: GAME_REWARD_XP,
+	}
 }
 
 /**
@@ -1905,10 +1952,15 @@ const app = new Hono<App>({ strict: false })
 	// completed!&giftContext=Soccer`) — so whether a reward is actually OWED is decided
 	// here, from `reward_status`: one claim per type per hour, atomically.
 	//
-	// The reward itself is still a stub: a claim records the cooldown and grants nothing,
-	// so both outcomes answer the same empty list the client already accepts. Paying one
-	// out later is the `claimed !== null` branch below — the eligibility half is what has
-	// to be right first, since that's what stops a repeat ask paying twice.
+	// A claim pays GAME_REWARD_XP into `progression` and hands over a gift box carrying that
+	// XP, announced with the same GiftPackageReceivedImmediate frame the weekly gift uses —
+	// the client posted the message to show, so the box wears it. An on-cooldown ask changes
+	// nothing and pays nothing.
+	//
+	// The response stays `[]` either way. It is what the client already accepts, and the box
+	// is how a reward is delivered, so there is no captured shape to put the payout in — the
+	// reference answers its own (different, selection-based) flow with a success envelope,
+	// not a list of rewards.
 	//
 	// `giftContext` (the activity, e.g. `Soccer`) is accepted and ignored: the cooldown is
 	// per reward type, shared across activities.
@@ -1937,16 +1989,26 @@ const app = new Hono<App>({ strict: false })
 			// No type, nothing to gate: don't write a row keyed on an empty string.
 			if (rewardType === '') return c.json([])
 			const claimed = await claimReward(c.env.DB, id, rewardType)
-			if (claimed !== null) {
-				// The reward would be granted here. Logged for now so the faucet is visible in
-				// production before it pays anything out.
-				logger.info('game reward claimed', {
-					accountId: id,
-					rewardType,
-					grantCount: claimed,
-					message: typeof body.Message === 'string' ? body.Message : '',
-				})
-			}
+			// On cooldown: nothing was claimed, so nothing is paid and nothing is announced.
+			if (claimed === null) return c.json([])
+			const message =
+				typeof body.Message === 'string' && body.Message !== ''
+					? body.Message
+					: DEFAULT_GAME_REWARD_MESSAGE
+			// Bank the XP first: it is the reward, and the box is the wrapper the client shows.
+			// A failure here must not leave a box promising XP that was never credited.
+			const progression = await addXp(c.env.DB, id, GAME_REWARD_XP)
+			const granted = await grantGiftDrop(c, id, toGameRewardDrop(), message)
+			await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
+			logger.info('game reward claimed', {
+				accountId: id,
+				rewardType,
+				grantCount: claimed,
+				message,
+				xp: GAME_REWARD_XP,
+				totalXp: progression.XP,
+				giftId: granted.id,
+			})
 			return c.json([])
 		}
 	)

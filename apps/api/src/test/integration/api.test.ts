@@ -3,9 +3,11 @@ import { exports } from 'cloudflare:workers'
 import { beforeAll, describe, expect, test } from 'vitest'
 
 import {
+	addXp,
 	GAME_VERSION,
 	grantInvention,
 	INVENTORY_INVENTION_SCHEMA_DDL,
+	PROGRESSION_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
@@ -104,6 +106,7 @@ beforeAll(async () => {
 
 	// Bought-invention ownership (owned by the econ worker) — `v2/mine` folds it in.
 	for (const stmt of INVENTORY_INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of PROGRESSION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Reports table (owned by the api worker) — player reports are recorded here.
 	for (const stmt of REPORTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -301,6 +304,25 @@ describe('public endpoints', () => {
 		const body = (await res.json()) as Array<{ PlayerId: number; Level: number }>
 		expect(body.map((p) => p.PlayerId)).toEqual([1, 2])
 		expect(body[0]).toMatchObject({ Level: 1, XP: 0 })
+	})
+
+	test('progression reads back the XP game rewards banked', async () => {
+		// What `econ` writes when a game reward is claimed — the two workers share the table.
+		await addXp(env.DB, 4242, 25)
+		await addXp(env.DB, 4242, 25)
+
+		const single = await exports.default.fetch(`${ORIGIN}/api/players/v1/progression/4242`)
+		expect(await single.json()).toEqual({ PlayerId: 4242, Level: 1, XP: 50 })
+
+		// A player who has earned nothing has no row, and still gets a record — the bulk form
+		// renders a card per id, so a missing one must not shorten the list.
+		const bulk = await exports.default.fetch(
+			`${ORIGIN}/api/players/v2/progression/bulk?id=4242&id=4243`
+		)
+		expect(await bulk.json()).toEqual([
+			{ PlayerId: 4242, Level: 1, XP: 50 },
+			{ PlayerId: 4243, Level: 1, XP: 0 },
+		])
 	})
 
 	test('POST /api/players/v2/progression/bulk returns an array', async () => {
