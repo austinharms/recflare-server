@@ -777,24 +777,12 @@ describe('econ endpoints', () => {
 		expect(gift.AvatarItemDesc).not.toBe('')
 		expect(gift.Id).toBeGreaterThan(0)
 
-		// A purchase pushes StorefrontBalancePurchase, NOT the additive StorefrontBalanceUpdate:
-		// `Balance` is the RESULTING total (10000 - 450), which the client shows as-is, and
-		// `Delta`/`BalanceAddType` are log-only — the client never subtracts `Delta` itself.
-		// Sending the change here would leave the client showing 9550 less than it should.
-		expect(await drainFrames()).toEqual([
-			{
-				accountId: 20,
-				notificationType: NotificationType.StorefrontBalancePurchase,
-				payload: {
-					// 1400 = CommercePurchase, 4 = RecNet (the store, not the buyer's device).
-					BalanceAddType: 1400,
-					Delta: -450,
-					Balance: 9550,
-					Platform: 4,
-					CurrencyType: 2,
-				},
-			},
-		])
+		// A purchase pushes NO balance frame. The buyer is the caller: they apply the change
+		// from the body above, and the client ADDS any StorefrontBalance* frame on top of it —
+		// StorefrontBalancePurchase included, despite its `Delta` field. Pushing the resulting
+		// total is what made a live 17,500-token player read 33,200 after spending 900 (16,600
+		// twice over); pushing the change would debit them twice instead.
+		expect(await drainFrames()).toEqual([])
 
 		// The balance endpoint reflects the debit (this is the resulting total, 10000 - 450).
 		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
@@ -1143,19 +1131,16 @@ describe('econ endpoints', () => {
 		).toBe(DEFAULT_STARTING_TOKENS + 250)
 		expect(await getOwnedInventionIds(env.DB, 51)).toEqual([9])
 
-		// Both sides get a socket frame carrying their CHANGE, not their new total: the client
-		// ADDS what it receives to the balance it is showing, so a total would have the creator
-		// reading their own balance plus the payout. Equal and opposite, like the ledger.
+		// Only the CREATOR gets a socket frame, carrying their CHANGE rather than their new
+		// total: the client ADDS what it receives to the balance it is showing, so a total would
+		// have them reading their own balance plus the payout. The buyer gets none — the
+		// response body already replaced the balance their client shows, and a frame on top of
+		// it would debit them twice on screen.
 		expect(await drainFrames()).toEqual([
 			{
 				accountId: 999,
 				notificationType: NotificationType.StorefrontBalanceUpdate,
 				payload: { Balance: 250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
-			},
-			{
-				accountId: 51,
-				notificationType: NotificationType.StorefrontBalanceUpdate,
-				payload: { Balance: -250, CurrencyType: CurrencyType.RecCenterTokens, BalanceType: -2 },
 			},
 		])
 	})

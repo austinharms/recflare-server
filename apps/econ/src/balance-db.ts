@@ -97,9 +97,9 @@ export function startingBalances(
  * 100+ members are the "not purchased" kinds, split by whether they may be spent
  * player-to-player.
  *
- * We sell nothing, so only two of these are ever on the wire from us: balances read back
- * as `NonPurchasedNotUsableInP2P` (see `ALL_PLATFORMS`) and a storefront purchase reports
- * `RecNet`. The rest is recorded for when a frame from a real capture has to be read.
+ * We sell nothing, so only one of these is ever on the wire from us: balances read back as
+ * `NonPurchasedNotUsableInP2P` (see `ALL_PLATFORMS`). The rest is recorded for when a frame
+ * from a real capture has to be read.
  */
 export const Platform = {
 	NonPurchasedNotUsableInP2P: -2,
@@ -130,9 +130,11 @@ export const ALL_PLATFORMS: number = Platform.NonPurchasedNotUsableInP2P
  * but never derives the balance from it, so a wrong value here is cosmetic, not a wrong
  * number on screen.
  *
- * `CommercePurchase` (1400) is a storefront buy — what `buyItem` sends. Kept whole because
- * the reasons a balance moves (challenges, level-ups, creator payouts, manual grants) are
- * paths this worker will grow into, and the client already has a name for each.
+ * Nothing here sends one today: the `StorefrontBalanceUpdate` frames this worker pushes
+ * carry only `{ Balance, CurrencyType, BalanceType }`, and the purchase paths push no frame
+ * at all (see `pushBalanceUpdate` in econ.app.ts). Recorded because the reasons a balance
+ * moves (challenges, level-ups, creator payouts, manual grants) are paths this worker will
+ * grow into, and for reading a frame out of a real capture.
  */
 export const BalanceAddType = {
 	Invalid: 0,

@@ -121,6 +121,16 @@ inconsistency here without checking the client first.
   the owner whether to load the latest or the published version and resolves it from the
   `/subrooms/:sid/saves` list — the matchmake call is identical either way. Don't make
   this server-side: it would put two people in one instance on different versions.
+- Every `StorefrontBalance*` socket frame (`econ` → `notify` hub) is ADDITIVE: the client
+  ADDS the frame's `Balance` to the total it is already showing. That includes
+  `StorefrontBalancePurchase`, whose `Delta`/`BalanceAddType` fields make it look like an
+  idempotent "here is your new total" frame — it isn't, and the client never applies
+  `Delta` itself. So never send a total, and never push a frame to the player who is
+  reading the HTTP response for the same change: they apply both. A storefront purchase
+  (`/api/storefronts/v2/buyItem`) therefore pushes NOTHING — the buyer applies the body's
+  `Balance` (the negated price) — and `buyInvention` pushes only the CREATOR's payout, not
+  the buyer's debit. Pushing the resulting total on a buy showed 33,200 tokens to a player
+  who spent 900 of 17,500 (the correct 16,600, twice); pushing the change debits twice.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members
