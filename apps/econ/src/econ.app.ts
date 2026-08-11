@@ -739,15 +739,35 @@ function toChallengeFallbackDrop(): StoreGiftDrop {
 }
 
 /**
- * Award the rotation's `Gift` if this player has just finished the whole set, doing nothing
- * otherwise. Called after each completing progress report, since `updateProgress` is the
- * only place a challenge is ever finished — there is no separate claim endpoint, and the
- * client never asks for this reward.
+ * How many of a rotation's challenges earn its gift. A week presents five and asks for
+ * three: the reward is for playing most of the week's set, not for clearing all of it, so
+ * the two a player can't reach (a quest they don't own, a mode they don't like) don't sink
+ * the whole week.
+ */
+const CHALLENGES_REQUIRED_FOR_GIFT = 3
+
+/**
+ * How many completions this rotation's gift needs. `CompletedRequired` makes the set
+ * all-or-nothing when it's true — the reading its name and the partial default suggest —
+ * and a rotation shorter than the threshold can only ever ask for what it publishes.
+ */
+function challengesRequiredForGift(): number {
+	const published = weeklyChallenge.Challenges.length
+	return weeklyChallenge.CompletedRequired
+		? published
+		: Math.min(CHALLENGES_REQUIRED_FOR_GIFT, published)
+}
+
+/**
+ * Award the rotation's `Gift` if this player has just earned it, doing nothing otherwise.
+ * Called after each completing progress report, since `updateProgress` is the only place a
+ * challenge is ever finished — there is no separate claim endpoint, and the client never
+ * asks for this reward.
  *
- * "The whole set" is every challenge in the current rotation, read back from
- * `challenge_status`. The rotation's `CompletedRequired` flag is NOT consulted: what it
- * means is inferred, and the only reading under which the gift is due before the set is
- * finished would pay out on the first challenge, which no rotation can have intended.
+ * Earning it takes {@link challengesRequiredForGift} of the rotation's challenges, counted
+ * from `challenge_status`. Only challenges the rotation still publishes count: a report can
+ * carry an id this week's set no longer lists (an edited rotation under a live client), and
+ * three of those shouldn't buy a gift the player never worked for.
  *
  * What lands is the `Gift` block's item — or, if the player already owns it, the box named
  * by `FallbackGiftName`, which rolls something they don't have at that tier. Finishing the
@@ -757,8 +777,8 @@ function toChallengeFallbackDrop(): StoreGiftDrop {
  * A grant that throws is swallowed: the client is reporting gameplay progress, and failing
  * that report (which it would then retry with the same completion) is worse than missing
  * the reward — the claim row is already taken, so the miss is permanent but visible in the
- * logs. An empty rotation is not "all complete"; without the guard, `every` on it is
- * vacuously true and every report would win a gift.
+ * logs. An empty rotation earns nothing: its threshold clamps to zero, which every player
+ * would otherwise meet without playing.
  */
 async function awardChallengeGift(c: Context<App>, accountId: number): Promise<void> {
 	try {
@@ -768,7 +788,8 @@ async function awardChallengeGift(c: Context<App>, accountId: number): Promise<v
 			accountId,
 			weeklyChallenge.ChallengeMapId
 		)
-		if (!weeklyChallenge.Challenges.every((ch) => complete.has(ch.ChallengeId))) return
+		const done = weeklyChallenge.Challenges.filter((ch) => complete.has(ch.ChallengeId)).length
+		if (done < challengesRequiredForGift()) return
 		// Claim first: this is what stops the next report paying out a second time.
 		const claimed = await claimChallengeGift(c.env.DB, accountId, weeklyChallenge.ChallengeMapId)
 		if (!claimed) return
@@ -792,6 +813,7 @@ async function awardChallengeGift(c: Context<App>, accountId: number): Promise<v
 			challengeMapId: weeklyChallenge.ChallengeMapId,
 			giftId: granted.id,
 			fallbackRoll: duplicate,
+			challengesComplete: done,
 		})
 	} catch (err) {
 		logger.error('failed to grant weekly challenge gift', {

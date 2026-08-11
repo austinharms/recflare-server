@@ -156,7 +156,7 @@ rotation to differ.
 | Field                  | Example                        | Notes                                                                                                                        |
 | ---------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
 | `ChallengeMapId`       | `17`                           | Id of the rotation as a whole ("map" of challenges). Echoed back on `updateProgress`; bump it when you publish a new week.   |
-| `CompletedRequired`    | `false`                        | _(inferred)_ Whether every challenge must be finished before the `Gift` is claimable.                                        |
+| `CompletedRequired`    | `false`                        | _(inferred)_ All-or-nothing: `true` makes the `Gift` need every challenge, `false` the three-of-five threshold below.        |
 | `StartAt` / `EndAt`    | `2026-03-25T21:00:00`          | The window, 7 days apart, **no timezone suffix** — unlike `ServerTime`. Treat as UTC.                                        |
 | `ServerTime`           | `2026-03-31T14:42:54.2754728Z` | .NET round-trip timestamp (7-digit fraction, `Z`). The client dates the countdown off this, so it is **frozen** — see below. |
 | `Challenges`           | array                          | The week's challenges, rendered in order.                                                                                    |
@@ -276,11 +276,18 @@ consolation tier with no code change; a name that doesn't parse falls back to 4 
 ### Winning the gift (`challenge_gift`)
 
 There is no claim endpoint and the client never asks: the reward is handed out from the
-`updateProgress` call that completes the set. Every completing report on the **live**
-rotation re-reads the caller's completions and, if every challenge in
-`weekly-challenge.json` is there, grants the `Gift` the way a purchase grants a drop — the
-item into `inventory`/`equipment`/`consumable`, plus a gift box (message
+`updateProgress` call that reaches the threshold. Every completing report on the **live**
+rotation re-reads the caller's completions and, once enough of `weekly-challenge.json`'s
+challenges are there, grants the `Gift` the way a purchase grants a drop — the item into
+`inventory`/`equipment`/`consumable`, plus a gift box (message
 `Weekly challenge complete!`) the player finds in `GET /api/avatar/v2/gifts`.
+
+**Three of five, not five of five** (`CHALLENGES_REQUIRED_FOR_GIFT`). A week publishes five
+challenges and the gift is for playing most of them, so the two a player can't reach — a
+quest they don't own, a mode they don't like — don't sink the whole week. The count is of
+challenges the rotation still **publishes**: a live client can report an id an edited
+rotation no longer lists, and three of those shouldn't buy a gift nobody worked for. A
+rotation publishing fewer than three can only ask for what it has.
 
 **The item, or a roll.** If the player already owns the `Gift`'s item — likely, since the
 rotation's reward is one fixed item that sells in the store — they get the
@@ -306,14 +313,17 @@ the block empty and naming the tier.
   `Immediate` (31) rather than `GiftPackageReceived` (30) is what the reference sends for a
   box the server hands over unasked; the sender is Coach (1). Best-effort — a hub failure is
   logged and swallowed, since the gift is already granted and stored.
-- **`CompletedRequired` is not consulted.** Its meaning is inferred, and the only reading
-  under which the gift is due _before_ the set is done would pay out on the first challenge.
+- **`CompletedRequired: true` makes the rotation all-or-nothing** — the threshold becomes
+  every published challenge. That reading of the flag is still _inferred_ (it is `false` in
+  the captured rotation, which is the partial default), but it's the one its name and the
+  three-of-five rule agree on.
 - **`Xp`/`Level` on the block are ignored**, as on a purchase — same gap, and both are `0`
   in the captured rotation.
 - **A report against an old rotation never wins anything**, and an empty `Challenges` array
-  is not a finished set (without that guard "every challenge complete" is vacuously true).
-- **Players who finished the set before this shipped still get it**: the client re-reports
-  completed challenges, and the first such report is a completing report.
+  earns nothing (its threshold clamps to zero, which every player would otherwise meet
+  without playing).
+- **Players already past the threshold when this shipped still get it**: the client
+  re-reports completed challenges, and the first such report is a completing report.
 
 ### Progress (`challenge_status`)
 

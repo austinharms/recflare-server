@@ -1443,7 +1443,15 @@ describe('econ endpoints', () => {
 		expect(await completeOf(await post('18', 'True'))).toBe(true)
 	})
 
-	/** Report every challenge of the live rotation complete, for one player. */
+	/**
+	 * How many of the rotation's challenges earn the gift — three, unless the rotation
+	 * publishes fewer or declares itself all-or-nothing (`CHALLENGES_REQUIRED_FOR_GIFT`).
+	 */
+	const REQUIRED_FOR_GIFT = weeklyChallenge.CompletedRequired
+		? weeklyChallenge.Challenges.length
+		: Math.min(3, weeklyChallenge.Challenges.length)
+
+	/** Report the live rotation's challenges complete, for one player. */
 	async function finishTheRotation(sub: string) {
 		const headers = { ...(await bearer(sub)), 'Content-Type': 'application/json' }
 		const ids = weeklyChallenge.Challenges.map((challenge) => challenge.ChallengeId)
@@ -1474,15 +1482,21 @@ describe('econ endpoints', () => {
 		}>
 	}
 
-	test('finishing every challenge in the rotation grants its gift, once', async () => {
-		// The whole live rotation, so this follows whatever static/weekly-challenge.json holds.
+	test('completing enough of the rotation grants its gift, once', async () => {
+		// The live rotation, so this follows whatever static/weekly-challenge.json holds.
 		const { ids, report } = await finishTheRotation('74')
-		for (const id of ids.slice(0, -1)) expect((await report(id)).status).toBe(200)
-		// One challenge short of the set — the gift isn't due yet.
+		// The whole point of the threshold: the gift lands before the set is finished (the
+		// published week is five challenges for three).
+		expect(REQUIRED_FOR_GIFT).toBeLessThan(ids.length)
+		for (const id of ids.slice(0, REQUIRED_FOR_GIFT - 1)) {
+			expect((await report(id)).status).toBe(200)
+		}
+		// One short of the threshold — the gift isn't due yet, even though challenges remain
+		// unfinished either way.
 		expect(await giftBoxes('74')).toEqual([])
 		await drainFrames()
 
-		expect((await report(ids[ids.length - 1] ?? 0)).status).toBe(200)
+		expect((await report(ids[REQUIRED_FOR_GIFT - 1] ?? 0)).status).toBe(200)
 		const won = await giftBoxes('74')
 		expect(won).toHaveLength(1)
 		expect(won[0]?.Message).toBe('Weekly challenge complete!')
@@ -1525,8 +1539,8 @@ describe('econ endpoints', () => {
 			weeklyChallenge.Gift.EquipmentModificationGuid
 		)
 
-		// The client keeps reporting progress after the set is finished; a second pass over
-		// the same completions must not mint a second reward.
+		// Finishing the REST of the set, and re-reporting what's already done (which the client
+		// keeps doing), must not mint a second reward.
 		for (const id of ids) expect((await report(id)).status).toBe(200)
 		expect(await giftBoxes('74')).toHaveLength(1)
 	})
@@ -1544,9 +1558,11 @@ describe('econ endpoints', () => {
 		})
 
 		const { ids, report } = await finishTheRotation('75')
-		for (const id of ids.slice(0, -1)) expect((await report(id)).status).toBe(200)
+		for (const id of ids.slice(0, REQUIRED_FOR_GIFT - 1)) {
+			expect((await report(id)).status).toBe(200)
+		}
 		await drainFrames()
-		expect((await report(ids[ids.length - 1] ?? 0)).status).toBe(200)
+		expect((await report(ids[REQUIRED_FOR_GIFT - 1] ?? 0)).status).toBe(200)
 
 		const won = await giftBoxes('75')
 		expect(won).toHaveLength(1)

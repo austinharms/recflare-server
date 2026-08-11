@@ -16,8 +16,8 @@
  * unique within a rotation, so a challenge that returns in a later week would otherwise
  * start out already complete on the old week's row.
  *
- * Finishing every challenge in a rotation earns the rotation's `Gift`, which is handed out
- * from the same `updateProgress` call that completes the set. That payout is gated by a
+ * Finishing enough of a rotation's challenges earns its `Gift`, which is handed out from the
+ * same `updateProgress` call that reaches the threshold. That payout is gated by a
  * second table here, `challenge_gift` — one row per (account, rotation), claimed once.
  *
  * The `econ` worker owns both tables and their migrations
@@ -88,8 +88,9 @@ export async function recordChallengeProgress(
  * so a stale row from an earlier week — same challenge id, different `challenge_map_id` —
  * doesn't show up pre-completed before the client has reported anything against it.
  *
- * Also what "the whole set is finished" is decided from: the rotation's `Gift` is due once
- * every challenge in static/weekly-challenge.json appears here.
+ * Also what earning the rotation's `Gift` is decided from: it is due once ENOUGH of the
+ * challenges in static/weekly-challenge.json appear here — three of the five a week
+ * publishes, not all of them (see `CHALLENGES_REQUIRED_FOR_GIFT` in econ.app.ts).
  */
 export async function getCompletedChallengeIds(
 	db: D1Database,
