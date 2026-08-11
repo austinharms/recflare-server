@@ -14,13 +14,12 @@ import {
 	KeepsakeConfig,
 	SanitizeRequest,
 	stringParam,
-	SubscriptionResponse,
 } from '../openapi'
 
 import type { App } from '../context'
 
-// Text sanitization, keepsakes, objectives/events/rewards, and the misc
-// analytics/subscription sinks the client hits during load.
+// Text sanitization, keepsakes, objectives/events/rewards, and the misc analytics
+// sinks the client hits during load.
 export const gameplayRoutes = new Hono<App>({ strict: false })
 	// Text sanitization (display names, room names, chat). `v1` echoes the input
 	// value back; `isPure` reports the text is clean.
@@ -149,18 +148,4 @@ export const gameplayRoutes = new Hono<App>({ strict: false })
 			responses: { 200: { description: 'Accepted (empty body)' } },
 		}),
 		(c) => c.body(null, 200)
-	)
-
-	// ---- Subscription ---------------------------------------------------------
-	.post(
-		'/api/CampusCard/v1/UpdateAndGetSubscription',
-		describeRoute({
-			tags: ['Gameplay'],
-			summary: 'The caller’s subscription',
-			description:
-				'Rec Room Plus subscription state. There are no subscriptions on this server, so ' +
-				'both fields are null. Also served by the `econ` worker on its own host.',
-			responses: { 200: json(SubscriptionResponse, 'No subscription') },
-		}),
-		(c) => c.json({ subscription: null, platformAccountSubscribedPlayerId: null })
 	)

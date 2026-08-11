@@ -5,13 +5,17 @@ import { beforeAll, describe, expect, test } from 'vitest'
 import {
 	addXp,
 	applyLevelUps,
+	createImage,
 	GAME_VERSION,
+	getImageByName,
 	grantInvention,
+	IMAGE_SCHEMA_DDL,
 	INVENTORY_INVENTION_SCHEMA_DDL,
 	LEVEL_REQUIRED_XP,
 	LEVEL_REWARDS,
 	MAX_LEVEL,
 	PROGRESSION_SCHEMA_DDL,
+	RELATIONSHIP_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
@@ -27,9 +31,7 @@ import {
 	getEventAttendees,
 	getEventResponse,
 } from '../../events-db'
-import { createImage, getImageByName, SCHEMA_DDL as IMAGES_SCHEMA_DDL } from '../../images-db'
 import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
-import { SCHEMA_DDL as RELATIONSHIPS_SCHEMA_DDL } from '../../relationships-db'
 import {
 	banFromReport,
 	createReport,
@@ -40,9 +42,9 @@ import {
 } from '../../reports-db'
 import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
+import type { SavedImage } from '@repo/domain'
 import type { Env } from '../../context'
 import type { PlayerEvent, PlayerEventResult } from '../../events-db'
-import type { SavedImage } from '../../images-db'
 import type { InventionSaveResult, SavedInvention } from '../../inventions-db'
 
 declare module 'cloudflare:test' {
@@ -100,10 +102,10 @@ beforeAll(async () => {
 		.run()
 
 	// Images table (owned by the img worker) — uploadsaved records a row here.
-	for (const stmt of IMAGES_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of IMAGE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Relationships table (owned by the api worker) — friendship endpoints use it.
-	for (const stmt of RELATIONSHIPS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of RELATIONSHIP_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Inventions table (owned by the api worker) — invention save/mine use it.
 	for (const stmt of INVENTIONS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
@@ -3246,7 +3248,6 @@ describe('openapi', () => {
 			'GET /api/rooms/v1/filters',
 			'GET /api/versioncheck/v4',
 			'GET /voice/config',
-			'POST /api/CampusCard/v1/UpdateAndGetSubscription',
 			'POST /api/PlayerReporting/v1/deviceId',
 			'POST /api/PlayerReporting/v1/hile',
 			'POST /api/PlayerReporting/v3/create',

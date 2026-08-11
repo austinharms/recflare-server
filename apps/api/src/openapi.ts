@@ -505,12 +505,6 @@ export const PlayerEventsPage = z.object({
 	Events: JsonArray,
 })
 
-/** `POST /api/CampusCard/v1/UpdateAndGetSubscription` — both null (no subs yet). */
-export const SubscriptionResponse = z.object({
-	subscription: z.null(),
-	platformAccountSubscribedPlayerId: z.null(),
-})
-
 // ---- Moderation ------------------------------------------------------------
 
 /**
