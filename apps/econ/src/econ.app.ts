@@ -14,7 +14,7 @@ import {
 	ownsInvention,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 
 // Invention storage (owned by the `api` worker, on this same `recflare` database).
 // Imported directly rather than copied: these are plain D1 helpers with no bindings of
@@ -118,6 +118,16 @@ import type { Outfit } from './outfit-db'
  */
 async function authedId(c: Context<App>): Promise<number | null> {
 	return validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
+}
+
+/**
+ * The `role` claim from a Bearer token — the operator-granted roles the auth worker stamps
+ * from the account's flags, so a plain player's token is just `['gameClient']`. `null` when
+ * the request carries no valid token; an empty array means a valid token with no roles.
+ * Shaped to mirror {@link authedId}.
+ */
+async function authedRoles(c: Context<App>): Promise<string[] | null> {
+	return validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
 }
 
 /** Results.Unauthorized() equivalent — 401 with empty body. */
@@ -332,6 +342,60 @@ async function pushBalancePurchase(
 			accountId,
 			error: err instanceof Error ? err.message : String(err),
 		})
+	}
+}
+
+/** The operator-granted role that comes with a complimentary subscription. */
+const DEVELOPER_ROLE = 'developer'
+
+/** `SubscriptionLevel.Gold`. 1 is Platinum. */
+const SUBSCRIPTION_LEVEL_GOLD = 0
+
+/** `SubscriptionPeriod.Year`. 0 is Month, 2 ThreeMonth, 3 SixMonth. */
+const SUBSCRIPTION_PERIOD_YEAR = 1
+
+/**
+ * `PlatformType.All` (-1) — the subscription belongs to no single store, which is the honest
+ * answer when no store sold it. The rest of the enum: 0 Steam, 1 Oculus, 2 PlayStation,
+ * 3 Xbox, 4 RecNet, 5 IOS, 6 GooglePlay, 7 Standalone, 8 Pico.
+ */
+const SUBSCRIPTION_PLATFORM_ALL = -1
+
+/** The id every reported subscription carries — a placeholder, since none is stored. */
+const STUB_SUBSCRIPTION_ID = 1
+
+/**
+ * The complimentary subscription a `developer` account reports — Rec Room Plus, which the
+ * client's API calls a `CampusCard`.
+ *
+ * Nothing here sells subscriptions, so holding the role IS the subscription: it's how the
+ * paid-tier surfaces get exercised without a store. Every field is computed per call and
+ * none of it is persisted, so this is not a record of anything — revoking the role revokes
+ * the subscription, and no expiry sweep or renewal exists.
+ *
+ * `ExpirationDate` is a year out from THIS call rather than a fixed date: a hard-coded one
+ * lapses on a day nobody is expecting, and the client would start showing an expired
+ * subscription with no way to renew it. `IsAutoRenewing` tells the client the same thing.
+ * The dates are milliseconds-precision ISO like the rest of this worker's timestamps.
+ */
+function developerSubscription(accountId: number) {
+	const now = new Date()
+	// Calendar arithmetic, not now + 365 days: setUTCFullYear lands on the same date next
+	// year whether or not a leap day falls in between.
+	const expires = new Date(now)
+	expires.setUTCFullYear(expires.getUTCFullYear() + 1)
+	return {
+		SubscriptionId: STUB_SUBSCRIPTION_ID,
+		RecNetPlayerId: accountId,
+		PlatformType: SUBSCRIPTION_PLATFORM_ALL,
+		PlatformId: '',
+		PlatformPurchaseId: '',
+		Level: SUBSCRIPTION_LEVEL_GOLD,
+		Period: SUBSCRIPTION_PERIOD_YEAR,
+		ExpirationDate: expires.toISOString(),
+		IsAutoRenewing: true,
+		CreatedAt: now.toISOString(),
+		ModifiedAt: now.toISOString(),
 	}
 }
 
@@ -2272,16 +2336,42 @@ const app = new Hono<App>({ strict: false })
 		c.json([])
 	)
 
-	// Subscription lookup. Returns both fields null with no auth.
+	// Subscription lookup (Rec Room Plus, the client's `CampusCard`). There is no store to
+	// buy one from, so the `developer` role stands in for a paid subscription: a developer
+	// reports an active Gold year, everyone else reports none. Nothing is stored — see
+	// `developerSubscription`.
+	//
+	// Auth is OPTIONAL, and a missing or invalid token answers "no subscription" rather than
+	// 401: the client posts this while loading, so an error here can stall its load
+	// orchestration, and "you aren't subscribed" is the truthful answer for an anonymous
+	// caller anyway. The role is read from the token's `role` claim, never from the body.
 	.post(
 		'/api/CampusCard/v1/UpdateAndGetSubscription',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Subscription lookup',
-			description: 'No subscriptions yet — both fields null. No auth.',
-			responses: { 200: json(SubscriptionResponse, 'Both fields null') },
+			description: [
+				'The caller’s Rec Room Plus subscription. Nothing sells subscriptions here, so the',
+				'operator-granted `developer` role stands in for one: a developer’s token reports an',
+				'active Gold (`Level` 0) yearly (`Period` 1) subscription on `PlatformType` -1 (All),',
+				'expiring a year from the call, and every other caller gets `{}`. Auth is optional —',
+				'a missing or invalid token reads as “not subscribed”, not 401. Nothing is persisted:',
+				'the role IS the subscription, so revoking it revokes this.',
+			].join(' '),
+			responses: {
+				200: json(SubscriptionResponse, 'The subscription, or `{}` for no subscription'),
+			},
 		}),
-		(c) => c.json({ subscription: null, platformAccountSubscribedPlayerId: null })
+		async (c) => {
+			const roles = await authedRoles(c)
+			if (!roles?.includes(DEVELOPER_ROLE)) return c.json({})
+			const id = await authedId(c)
+			if (id === null) return c.json({})
+			return c.json({
+				Subscription: developerSubscription(id),
+				PlatformAccountSubscribedPlayerId: null,
+			})
+		}
 	)
 
 // The generated spec. Documentation only — no request is validated against it (see

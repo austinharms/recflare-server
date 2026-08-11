@@ -162,10 +162,17 @@ function b64url(input: ArrayBuffer | string): string {
 	return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
 }
 
-async function bearer(sub = '42'): Promise<Record<string, string>> {
+/**
+ * A bearer token for `sub`. `roles` becomes the `role` claim the auth worker stamps from an
+ * account's flags — pass `['gameClient', 'developer']` for an elevated account; the default
+ * is no claim at all, which reads as no roles.
+ */
+async function bearer(sub = '42', roles?: string[]): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
+	const claims =
+		roles === undefined ? { sub, exp: now + 3600 } : { sub, exp: now + 3600, role: roles }
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
-		JSON.stringify({ sub, exp: now + 3600 })
+		JSON.stringify(claims)
 	)}`
 	const key = await crypto.subtle.importKey(
 		'raw',
@@ -1923,18 +1930,53 @@ describe('econ endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	test('POST /api/CampusCard/v1/UpdateAndGetSubscription returns null fields', async () => {
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/CampusCard/v1/UpdateAndGetSubscription`,
-			{
-				method: 'POST',
-			}
-		)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({
-			subscription: null,
-			platformAccountSubscribedPlayerId: null,
+	const getSubscription = async (headers: Record<string, string> = {}) =>
+		exports.default.fetch(`${ORIGIN}/api/CampusCard/v1/UpdateAndGetSubscription`, {
+			method: 'POST',
+			headers,
 		})
+
+	test('POST /api/CampusCard/v1/UpdateAndGetSubscription gives a developer a Gold year', async () => {
+		const res = await getSubscription(await bearer('205', ['gameClient', 'developer']))
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as {
+			Subscription: Record<string, unknown>
+			PlatformAccountSubscribedPlayerId: null
+		}
+		expect(body.PlatformAccountSubscribedPlayerId).toBeNull()
+		expect(body.Subscription).toMatchObject({
+			SubscriptionId: 1,
+			// The subscribed player is the caller, not a fixed id.
+			RecNetPlayerId: 205,
+			// -1 All: no store sold this. 0 = Gold (1 is Platinum), 1 = Year.
+			PlatformType: -1,
+			PlatformId: '',
+			PlatformPurchaseId: '',
+			Level: 0,
+			Period: 1,
+			IsAutoRenewing: true,
+		})
+
+		// The subscription runs a year from the call rather than to a hard-coded date, so it
+		// cannot lapse on a day nobody is expecting.
+		const created = new Date(body.Subscription.CreatedAt as string)
+		const expires = new Date(body.Subscription.ExpirationDate as string)
+		expect(body.Subscription.ModifiedAt).toBe(body.Subscription.CreatedAt)
+		expect(expires.getTime()).toBeGreaterThan(Date.now())
+		expect(expires.getUTCFullYear()).toBe(created.getUTCFullYear() + 1)
+		expect(expires.getUTCMonth()).toBe(created.getUTCMonth())
+		expect(expires.getUTCDate()).toBe(created.getUTCDate())
+	})
+
+	test('POST /api/CampusCard/v1/UpdateAndGetSubscription is {} without the developer role', async () => {
+		// A plain player's token: valid, but no elevated role.
+		expect(await (await getSubscription(await bearer('206', ['gameClient']))).json()).toEqual({})
+		// A token with no `role` claim at all.
+		expect(await (await getSubscription(await bearer('206'))).json()).toEqual({})
+		// No token: "not subscribed" rather than 401, so a loading client isn't stalled.
+		const anon = await getSubscription()
+		expect(anon.status).toBe(200)
+		expect(await anon.json()).toEqual({})
 	})
 
 	test('unknown path returns 404', async () => {

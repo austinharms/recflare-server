@@ -49,7 +49,7 @@ missing/invalid). `~` = optional auth: served to anyone, personalised for a vali
 | POST     | `/api/gamerewards/v1/request`                        | ✓    | Claim a game reward → 5 XP + gift box   |
 | GET      | `/api/roomkeys/v1/mine`                              |      | The player's room keys (stub `[]`)      |
 | GET      | `/api/roomkeys/v1/room`                              |      | Room keys for a room (stub `[]`)        |
-| POST     | `/api/CampusCard/v1/UpdateAndGetSubscription`        |      | Subscription lookup (both null)         |
+| POST     | `/api/CampusCard/v1/UpdateAndGetSubscription`        | ~    | Gold year for `developer`s, else `{}`   |
 | GET      | `/openapi.json`                                      |      | Generated OpenAPI 3.1 spec (see below)  |
 
 The app runs with `strict: false`, so trailing-slash variants match (the client posts
