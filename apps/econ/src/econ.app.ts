@@ -9,6 +9,8 @@ import {
 	getGift,
 	getPendingGifts,
 	grantInvention,
+	levelReward,
+	levelsReached,
 	ownsInvention,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
@@ -84,7 +86,7 @@ import { getOutfits, setOutfit } from './outfit-db'
 import { claimReward } from './reward-db'
 
 import type { Context } from 'hono'
-import type { GiftContent, StoredGift } from '@repo/domain'
+import type { GiftContent, Progression, StoredGift, XpGrant } from '@repo/domain'
 import type { Avatar } from './avatar-db'
 import type { ConsumeResult } from './consumables-db'
 import type { App } from './context'
@@ -471,6 +473,34 @@ async function pushGiftReceived(
 }
 
 /**
+ * Push a PlayerProgressionLevelUpdate so the client's level bar moves when XP lands, instead
+ * of waiting for its next progression read. `XP` is the progress into the current level (the
+ * ladder spends the rest on the level-ups), which is what the bar draws against the
+ * `LevelProgressionMaps` the client is served.
+ *
+ * Best-effort: the XP is already banked, so a hub failure costs a bar animation, not the
+ * reward.
+ */
+async function pushProgressionUpdate(
+	c: Context<App>,
+	accountId: number,
+	progression: Progression
+): Promise<void> {
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			accountId,
+			NotificationType.PlayerProgressionLevelUpdate,
+			{ PlayerId: progression.PlayerId, Level: progression.Level, XP: progression.XP }
+		)
+	} catch (err) {
+		logger.error('failed to push PlayerProgressionLevelUpdate notification', {
+			accountId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
  * The catalog a query drop rolls from: sf3, the general store. It is the only catalog with
  * a real pool at every rarity (1161 items against 8–40 in the themed ones), it's where the
  * "Random box" family itself sells, and a box promising "a random 4-star item" plainly
@@ -515,6 +545,20 @@ async function ownsGiftDrop(
 	return true
 }
 
+/** How a query drop is rolled — what it may land on, and whose catalog copy to use. */
+interface RollOptions {
+	/**
+	 * Restrict the roll to avatar items, leaving equipment skins out of the pool. Off by
+	 * default: a bought box says "a random item", and the catalog's own boxes mean both.
+	 */
+	avatarItemsOnly?: boolean
+	/**
+	 * The roll catalog, when the caller has already read it — it's the big one (sf3), and a
+	 * caller granting several boxes at once shouldn't re-read it per box.
+	 */
+	rollCatalog?: StoreItem[]
+}
+
 /**
  * Roll a query drop: pick, uniformly at random, one item of `rarity` from the roll catalog
  * that the player doesn't already own. Returns null when the pool is empty — an unreadable
@@ -525,17 +569,22 @@ async function ownsGiftDrop(
  * avatar item or a piece of equipment: "an item you don't have" only means anything for
  * things owned once, and consumables stack, so a consumable would be rollable forever and
  * would crowd out the real prizes.
+ *
+ * `avatarItemsOnly` narrows it further to things worn on the avatar, leaving equipment
+ * skins out — a level-up prize should be something the player can see on themselves, not a
+ * skin for a weapon they may not own. It also skips the equipment read entirely, since
+ * nothing in the pool can match it.
  */
 async function rollQueryDrop(
 	c: Context<App>,
 	accountId: number,
 	rarity: number,
-	rollCatalog?: StoreItem[]
+	options: RollOptions = {}
 ): Promise<StoreGiftDrop | null> {
 	const [catalog, ownedItems, ownedEquipment] = await Promise.all([
-		rollCatalog ?? loadRollCatalog(c),
+		options.rollCatalog ?? loadRollCatalog(c),
 		getInventory(c.env.DB, accountId),
-		getEquipment(c.env.DB, accountId),
+		options.avatarItemsOnly === true ? [] : getEquipment(c.env.DB, accountId),
 	])
 	const haveItem = new Set(ownedItems.map((item) => item.AvatarItemDesc))
 	const haveEquipment = new Set(ownedEquipment.map((eq) => eq.ModificationGuid))
@@ -544,6 +593,7 @@ async function rollQueryDrop(
 		if (typeof drop.AvatarItemDesc === 'string' && drop.AvatarItemDesc !== '') {
 			return !haveItem.has(drop.AvatarItemDesc)
 		}
+		if (options.avatarItemsOnly === true) return false
 		if (
 			typeof drop.EquipmentModificationGuid === 'string' &&
 			drop.EquipmentModificationGuid !== ''
@@ -567,6 +617,25 @@ interface GrantedGift {
 }
 
 /**
+ * Pick a random consumable from the roll catalog — the reward the published level table
+ * hands out for the early levels.
+ *
+ * Unlike a clothing roll this one has no rarity and no ownership filter: the table names no
+ * star tier for a consumable, and consumables STACK, so "one you don't have" is meaningless
+ * (a second Confetti Cannon is a fine prize). Returns a concrete drop rather than a query
+ * one, so the grant path just grants it.
+ */
+function rollConsumableDrop(catalog: StoreItem[]): StoreGiftDrop | null {
+	const pool = catalog.filter(
+		({ GiftDrop: drop }) =>
+			drop.IsQuery !== true &&
+			typeof drop.ConsumableItemDesc === 'string' &&
+			drop.ConsumableItemDesc !== ''
+	)
+	return pool[Math.floor(Math.random() * pool.length)]?.GiftDrop ?? null
+}
+
+/**
  * Hand a gift-drop to a player: grant whatever it turns out to carry (an avatar item, an
  * equipment skin, a consumable, or none of these — currency/xp drops aren't granted yet)
  * and create the gift box that renders it.
@@ -585,14 +654,12 @@ async function grantGiftDrop(
 	accountId: number,
 	drop: StoreGiftDrop,
 	message: string,
-	// The roll catalog, when the caller has already read it — it's the big one (sf3), and
-	// the weekly gift has to consult it before it knows whether it's rolling at all.
-	rollCatalog?: StoreItem[]
+	options: RollOptions = {}
 ): Promise<GrantedGift> {
 	let giftDrop = drop
 	if (drop.IsQuery === true) {
 		const rarity = drop.QueryRedirectRarity ?? drop.Rarity
-		const rolled = await rollQueryDrop(c, accountId, rarity, rollCatalog)
+		const rolled = await rollQueryDrop(c, accountId, rarity, options)
 		if (rolled === null) {
 			logger.warn('query gift-drop rolled nothing', {
 				accountId,
@@ -674,6 +741,87 @@ function toGameRewardDrop(): StoreGiftDrop {
 		Currency: 0,
 		CurrencyType: 0,
 		Xp: GAME_REWARD_XP,
+	}
+}
+
+/**
+ * The box a CLOTHING level-up hands over: a query drop at the level's own tier, rolled from
+ * AVATAR ITEMS only. The published table calls these levels "N-Star Clothing", so the prize
+ * has to be something the player can wear and be seen in — never an equipment skin for a
+ * weapon they may not own. This is the one roll that narrows the pool that far.
+ */
+function toLevelUpDrop(rarity: number): StoreGiftDrop {
+	return {
+		FriendlyName: '',
+		Tooltip: '',
+		ConsumableItemDesc: '',
+		AvatarItemDesc: '',
+		AvatarItemType: null,
+		EquipmentPrefabName: '',
+		EquipmentModificationGuid: '',
+		Rarity: rarity,
+		Context: GIFT_CONTEXT_GAME_REWARDS,
+		Currency: 0,
+		CurrencyType: 0,
+		IsQuery: true,
+	}
+}
+
+/**
+ * Hand over the rewards a run of level-ups earned — ONE PER LEVEL crossed, since the
+ * published table names a reward for every level and a single grant can cross several (25 XP
+ * takes a fresh player from 1 to 3, so two rewards). Each arrives as a gift box, announced
+ * like any other unasked-for gift.
+ *
+ * Which reward is per level, not per tier: the early levels pay CONSUMABLES and the rest pay
+ * clothing at a rising star rating. The catalog is read once and shared across the boxes.
+ * Best-effort as a whole: the XP is banked and the levels are already stored, so a failed
+ * roll costs a prize, not the level.
+ */
+async function grantLevelUpGifts(
+	c: Context<App>,
+	accountId: number,
+	grant: XpGrant
+): Promise<void> {
+	const levels = levelsReached(grant)
+	if (levels.length === 0) return
+	try {
+		const rollCatalog = await loadRollCatalog(c)
+		for (const level of levels) {
+			const reward = levelReward(level)
+			if (reward === null) continue
+			const message = `Level ${level}!`
+			// A consumable is rolled to a concrete drop up front; clothing rides the query path,
+			// which rolls it against what the player already owns.
+			const drop =
+				reward.kind === 'consumable'
+					? rollConsumableDrop(rollCatalog)
+					: toLevelUpDrop(reward.rarity)
+			if (drop === null) {
+				logger.warn('level up reward rolled nothing', { accountId, level, kind: reward.kind })
+				continue
+			}
+			const granted = await grantGiftDrop(c, accountId, drop, message, {
+				avatarItemsOnly: reward.kind === 'clothing',
+				rollCatalog,
+			})
+			await pushGiftReceived(c, accountId, granted, message, COACH_ACCOUNT_ID)
+			logger.info('level up gift granted', {
+				accountId,
+				level,
+				kind: reward.kind,
+				rarity: reward.kind === 'clothing' ? reward.rarity : null,
+				giftId: granted.id,
+				avatarItemDesc: granted.drop.AvatarItemDesc,
+				consumableItemDesc: granted.drop.ConsumableItemDesc,
+			})
+		}
+	} catch (err) {
+		logger.error('failed to grant level up gift', {
+			accountId,
+			levels,
+			error: err instanceof Error ? err.message : String(err),
+		})
 	}
 }
 
@@ -848,7 +996,7 @@ async function awardChallengeGift(c: Context<App>, accountId: number): Promise<v
 			accountId,
 			duplicate ? toChallengeFallbackDrop() : reward,
 			CHALLENGE_GIFT_MESSAGE,
-			catalog
+			{ rollCatalog: catalog }
 		)
 		// Nobody asked for this box, so the client has no reason to re-read the gifts list:
 		// the notification is what makes the reward show up at the moment the set is finished.
@@ -1997,16 +2145,22 @@ const app = new Hono<App>({ strict: false })
 					: DEFAULT_GAME_REWARD_MESSAGE
 			// Bank the XP first: it is the reward, and the box is the wrapper the client shows.
 			// A failure here must not leave a box promising XP that was never credited.
-			const progression = await addXp(c.env.DB, id, GAME_REWARD_XP)
+			const { progression, levelsGained } = await addXp(c.env.DB, id, GAME_REWARD_XP)
 			const granted = await grantGiftDrop(c, id, toGameRewardDrop(), message)
 			await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
+			// Every grant moves the bar, whether or not it crossed a level.
+			await pushProgressionUpdate(c, id, progression)
+			// …and every level crossed is worth a box of its own tier.
+			await grantLevelUpGifts(c, id, { progression, levelsGained })
 			logger.info('game reward claimed', {
 				accountId: id,
 				rewardType,
 				grantCount: claimed,
 				message,
 				xp: GAME_REWARD_XP,
-				totalXp: progression.XP,
+				level: progression.Level,
+				levelsGained,
+				levelXp: progression.XP,
 				giftId: granted.id,
 			})
 			return c.json([])

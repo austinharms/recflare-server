@@ -2,7 +2,11 @@ import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
 import { getProgression, getProgressions } from '@repo/domain'
+import { logger } from '@repo/hono-helpers'
 
+// The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
+// value — the enum has no runtime dependencies.
+import { NotificationType } from '../../../notify/src/notification-types'
 import { parseFormIds, queryIds } from '../http'
 import {
 	BulkIdsRequest,
@@ -15,7 +19,34 @@ import {
 	ReputationDto,
 } from '../openapi'
 
+import type { Context } from 'hono'
+import type { Progression } from '@repo/domain'
 import type { App } from '../context'
+
+/** The notifications hub is a single global DO instance (see the `notify` worker). */
+const HUB_INSTANCE = 'global'
+
+/**
+ * Push the caller's own progression back at them over the socket, mirroring the reference's
+ * `HubSendProgressionUpdate` on this same read. Pushing from a GET looks odd, but it is how
+ * a client that just connected gets its level bar right: the frame is what the client acts
+ * on, the response body is only what it asked for. Best-effort — a hub failure leaves the
+ * body correct.
+ */
+async function pushProgression(c: Context<App>, progression: Progression): Promise<void> {
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			progression.PlayerId,
+			NotificationType.PlayerProgressionLevelUpdate,
+			{ PlayerId: progression.PlayerId, Level: progression.Level, XP: progression.XP }
+		)
+	} catch (err) {
+		logger.error('failed to push PlayerProgressionLevelUpdate notification', {
+			accountId: progression.PlayerId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
 
 /**
  * Default reputation for an account — the fallback used with no DB. Nobody has
@@ -72,15 +103,19 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 			tags: ['Progression'],
 			summary: 'A player’s level and XP',
 			description:
-				'The XP banked in `progression` (game rewards pay into it from the `econ` worker). ' +
-				'A player who has earned none has no row and reads back as level 1 with 0 XP. ' +
-				'Levelling is not wired up yet, so `Level` is always 1.',
+				'The level and XP banked in `progression` (game rewards pay into it from the `econ` ' +
+				'worker); `XP` is the progress into the current level, not a lifetime total. A ' +
+				'player who has earned none has no row and reads back as level 1 with 0 XP. Also ' +
+				'pushes the same values as a `PlayerProgressionLevelUpdate` frame, as the reference ' +
+				'does — that is what moves the client’s bar.',
 			parameters: [idParam('id', 'Account id')],
 			responses: { 200: json(ProgressionDto, 'The player’s progression') },
 		}),
 		async (c) => {
 			const id = Number.parseInt(c.req.param('id'), 10)
-			return c.json(await getProgression(c.env.DB, id))
+			const progression = await getProgression(c.env.DB, id)
+			await pushProgression(c, progression)
+			return c.json(progression)
 		}
 	)
 	.post(

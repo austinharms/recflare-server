@@ -50,6 +50,14 @@ export enum NotificationType {
 	GiftPackageReceived = 30,
 	GiftPackageReceivedImmediate = 31,
 	GiftPackageRewardSelectionReceived = 32,
+	/**
+	 * A player's level/XP changed — `{ PlayerId, Level, XP }`, where XP is the progress into
+	 * the current level, not a lifetime total. STRING-valued: the reference's hub sends the
+	 * wire name and its enum has no number for this one at all. It pushes the frame both when
+	 * progression changes and when the player reads it back, which is how a client that just
+	 * connected gets its bar right.
+	 */
+	PlayerProgressionLevelUpdate = 'PlayerProgressionLevelUpdate',
 	ProfileJuniorStatusUpdate = 40,
 	RelationshipsInvalid = 50,
 	StorefrontBalanceAdd = 60,

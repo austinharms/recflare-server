@@ -4,9 +4,13 @@ import { beforeAll, describe, expect, test } from 'vitest'
 
 import {
 	addXp,
+	applyLevelUps,
 	GAME_VERSION,
 	grantInvention,
 	INVENTORY_INVENTION_SCHEMA_DDL,
+	LEVEL_REQUIRED_XP,
+	LEVEL_REWARDS,
+	MAX_LEVEL,
 	PROGRESSION_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
@@ -306,13 +310,18 @@ describe('public endpoints', () => {
 		expect(body[0]).toMatchObject({ Level: 1, XP: 0 })
 	})
 
-	test('progression reads back the XP game rewards banked', async () => {
+	test('progression reads back the XP game rewards banked, levelled up', async () => {
 		// What `econ` writes when a game reward is claimed — the two workers share the table.
-		await addXp(env.DB, 4242, 25)
+		// 25 XP from level 1 pays the 10 to reach 2 and the 10 to reach 3, leaving 5.
+		expect(await addXp(env.DB, 4242, 25)).toEqual({
+			progression: { PlayerId: 4242, Level: 3, XP: 5 },
+			levelsGained: 2,
+		})
+		// The next 25 lands on 5: 10 to reach level 4, then 20 to reach 5, leaving nothing.
 		await addXp(env.DB, 4242, 25)
 
 		const single = await exports.default.fetch(`${ORIGIN}/api/players/v1/progression/4242`)
-		expect(await single.json()).toEqual({ PlayerId: 4242, Level: 1, XP: 50 })
+		expect(await single.json()).toEqual({ PlayerId: 4242, Level: 5, XP: 0 })
 
 		// A player who has earned nothing has no row, and still gets a record — the bulk form
 		// renders a card per id, so a missing one must not shorten the list.
@@ -320,9 +329,67 @@ describe('public endpoints', () => {
 			`${ORIGIN}/api/players/v2/progression/bulk?id=4242&id=4243`
 		)
 		expect(await bulk.json()).toEqual([
-			{ PlayerId: 4242, Level: 1, XP: 50 },
+			{ PlayerId: 4242, Level: 5, XP: 0 },
 			{ PlayerId: 4243, Level: 1, XP: 0 },
 		])
+	})
+
+	test('the level ladder the server uses is the one the client is served', async () => {
+		// The client draws its bar against `LevelProgressionMaps` from this config; the server
+		// levels by LEVEL_REQUIRED_XP. If they drift, the bar fills to a different mark than
+		// the level-up fires at.
+		const res = await exports.default.fetch(`${ORIGIN}/api/config/v2`)
+		expect(res.status).toBe(200)
+		const config = (await res.json()) as {
+			LevelProgressionMaps: Array<{ Level: number; RequiredXp: number; GiftRarity: number }>
+		}
+		expect(config.LevelProgressionMaps.map((m) => m.RequiredXp)).toEqual([...LEVEL_REQUIRED_XP])
+		// The config's own `GiftRarity` is deliberately NOT asserted against `LEVEL_REWARDS`:
+		// it is a coarse per-band tier (flat 10 to level 14, 20 to 39, 30 to 49, 50 at the cap)
+		// and we grant from the published per-level table instead, which disagrees in places —
+		// level 15 is 2-Star there and 20 here. Only the XP costs have to match.
+		expect(config.LevelProgressionMaps.map((m) => m.GiftRarity)).toHaveLength(LEVEL_REWARDS.length)
+		// Indexed by level, so entry N is what a level-N player spends to reach N+1.
+		expect(config.LevelProgressionMaps.map((m) => m.Level)).toEqual(
+			LEVEL_REQUIRED_XP.map((_, level) => level)
+		)
+	})
+
+	test('the level rewards match the published reward table', async () => {
+		// Rec Room's published level-reward table, spot-checked at the points where it turns:
+		// consumables early, then clothing at a rising star rating (2★ = 10, 3★ = 20, 4★ = 30,
+		// 5★ = 50). These are the levels an off-by-one in the table would move.
+		expect(LEVEL_REWARDS[0]).toBe(0) // nobody reaches level 0
+		expect([1, 3, 5, 6, 7, 9].map((level) => LEVEL_REWARDS[level])).toEqual([
+			-1, -1, -1, -1, -1, -1,
+		])
+		expect([2, 4, 8, 10, 21].map((level) => LEVEL_REWARDS[level])).toEqual([10, 10, 10, 10, 10])
+		expect([22, 30].map((level) => LEVEL_REWARDS[level])).toEqual([20, 20])
+		expect([31, 35, 40, 49].map((level) => LEVEL_REWARDS[level])).toEqual([30, 30, 30, 30])
+		expect(LEVEL_REWARDS[50]).toBe(50) // the only 5-Star in the progression
+		expect(LEVEL_REWARDS).toHaveLength(51)
+	})
+
+	test('the ladder matches the published XP curve', async () => {
+		// Rec Room's own level-curve chart, read at its gridlines: cumulative XP to finish each
+		// level. The per-level costs are easy to edit one at a time and hard to eyeball as a
+		// curve, so the milestones are what actually pin the shape.
+		const cumulative = LEVEL_REQUIRED_XP.reduce<number[]>((totals, cost, level) => {
+			totals[level] = level === 0 ? 0 : (totals[level - 1] ?? 0) + cost
+			return totals
+		}, [])
+		expect(cumulative[10]).toBe(170)
+		expect(cumulative[20]).toBe(620)
+		expect(cumulative[30]).toBe(1770)
+		expect(cumulative[40]).toBe(5370)
+		expect(cumulative[50]).toBe(16170)
+	})
+
+	test('levelling stops at the top of the ladder', async () => {
+		// Nothing above MAX_LEVEL to buy, so a huge grant banks XP and stays put.
+		expect(applyLevelUps(MAX_LEVEL, 100_000)).toEqual({ level: MAX_LEVEL, xp: 100_000 })
+		// …and a grant that doesn't cover the current level's cost just accrues.
+		expect(applyLevelUps(1, 9)).toEqual({ level: 1, xp: 9 })
 	})
 
 	test('POST /api/players/v2/progression/bulk returns an array', async () => {

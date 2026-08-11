@@ -1481,6 +1481,7 @@ describe('econ endpoints', () => {
 			Message: string
 			EquipmentModificationGuid: string
 			AvatarItemDesc: string
+			ConsumableItemDesc: string
 			GiftRarity: number
 		}>
 	}
@@ -1723,13 +1724,16 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([])
 
-		// The XP is banked, not just displayed on the box.
-		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 1, XP: 25 })
+		// The XP is banked and spent on levels: 25 pays the 10 to reach level 2 and the 10 to
+		// reach 3, leaving 5 as progress into the next.
+		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 3, XP: 5 })
 
-		// The box carries the XP and the message the client asked to show, and nothing else —
-		// a game reward is not an item.
+		// Three boxes: the XP reward itself, then one per level it crossed.
 		const boxes = await giftBoxes('82')
-		expect(boxes).toHaveLength(1)
+		expect(boxes).toHaveLength(3)
+
+		// The reward box carries the XP and the message the client asked to show, and nothing
+		// else — a game reward is not an item.
 		expect(boxes[0]).toMatchObject({
 			Xp: 25,
 			Message: 'First Game of the Day',
@@ -1738,10 +1742,44 @@ describe('econ endpoints', () => {
 			ConsumableItemDesc: '',
 		})
 
+		// The published table pays 2-Star Clothing for level 2 and a Consumable for level 3.
+		const [clothingBox, consumableBox] = boxes.slice(1)
+		expect(boxes.slice(1).map((b) => b.Message)).toEqual(['Level 2!', 'Level 3!'])
+
+		// Clothing is an AVATAR ITEM — never an equipment skin, which is what the avatar-only
+		// roll is for — at the star tier the table names (2-Star = rarity 10).
+		expect(clothingBox?.AvatarItemDesc).not.toBe('')
+		expect(clothingBox?.EquipmentModificationGuid).toBe('')
+		expect(clothingBox?.ConsumableItemDesc).toBe('')
+		expect(clothingBox?.GiftRarity).toBe(10)
+
+		// The consumable level rolls a consumable instead, at no particular rarity.
+		expect(consumableBox?.ConsumableItemDesc).not.toBe('')
+		expect(consumableBox?.AvatarItemDesc).toBe('')
+		expect(consumableBox?.EquipmentModificationGuid).toBe('')
+
+		// …and both are owned, not just pictured on an unopened box.
+		const items = await exports.default.fetch(`${ORIGIN}/api/avatar/v4/items`, {
+			headers: await bearer('82'),
+		})
+		const owned = (await items.json()) as Array<{ AvatarItemDesc: string }>
+		expect(owned.map((i) => i.AvatarItemDesc)).toContain(clothingBox?.AvatarItemDesc)
+
+		const consumables = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`, {
+			headers: await bearer('82'),
+		})
+		const held = (await consumables.json()) as Array<{ ConsumableItemDesc: string }>
+		expect(held.map((cons) => cons.ConsumableItemDesc)).toContain(consumableBox?.ConsumableItemDesc)
+
+		// One frame per box, plus the progression update between them.
 		const frames = await drainFrames()
-		expect(frames).toHaveLength(1)
+		expect(frames.map((f) => f.notificationType)).toEqual([
+			NotificationType.GiftPackageReceivedImmediate,
+			NotificationType.PlayerProgressionLevelUpdate,
+			NotificationType.GiftPackageReceivedImmediate,
+			NotificationType.GiftPackageReceivedImmediate,
+		])
 		expect(frames[0]?.accountId).toBe(82)
-		expect(frames[0]?.notificationType).toBe(NotificationType.GiftPackageReceivedImmediate)
 		expect(frames[0]?.payload).toMatchObject({
 			Id: boxes[0]?.Id,
 			FromPlayerId: 1,
@@ -1750,11 +1788,18 @@ describe('econ endpoints', () => {
 			GiftContext: 50,
 			Message: 'First Game of the Day',
 		})
+		// The bar moves, which is the only thing that tells the client it levelled.
+		expect(frames[1]?.payload).toEqual({ PlayerId: 82, Level: 3, XP: 5 })
+		expect(frames[3]?.payload).toMatchObject({
+			Id: consumableBox?.Id,
+			ConsumableItemDesc: consumableBox?.ConsumableItemDesc,
+			Message: 'Level 3!',
+		})
 
-		// An on-cooldown ask pays nothing: no second box, no second frame, no more XP.
+		// An on-cooldown ask pays nothing: no more boxes, no frames, no more XP.
 		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
-		expect((await getProgression(env.DB, 82)).XP).toBe(25)
-		expect(await giftBoxes('82')).toHaveLength(1)
+		expect(await getProgression(env.DB, 82)).toEqual({ PlayerId: 82, Level: 3, XP: 5 })
+		expect(await giftBoxes('82')).toHaveLength(3)
 		expect(await drainFrames()).toEqual([])
 	})
 

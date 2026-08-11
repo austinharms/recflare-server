@@ -120,6 +120,8 @@ weekly gift — hand over a real item rather than an unopenable box:
 - **Avatar items and equipment only.** Other query drops are excluded (a box that rolls a
   box), and so are consumables: they stack, so "don't have" never becomes false and they'd
   crowd out the real prizes.
+- **`avatarItemsOnly` narrows it to worn items**, dropping equipment skins from the pool.
+  Level-up boxes use it; storefront boxes don't, since "a random 4-star item" means both.
 - **`QueryRedirectRarity` wins over `Rarity`** when present — sf2 carries both and they
   agree; sf3's boxes carry only `Rarity`.
 - **An empty pool grants nothing** (logged `query gift-drop rolled nothing`) — an owner of
@@ -396,9 +398,58 @@ failure can't leave a box promising XP nobody was credited.
 **Progression (`progression`) is shared.** `econ` writes it here; `api` reads it back for
 `GET /api/players/v{1,2}/progression/…`. It lives in `@repo/domain` for that reason, the
 same split as gift boxes. A player with no row reads as level 1 / 0 XP, so a GET never
-inserts. `Level` is stored but never moves: the reference levels up by subtracting a tier's
-`RequiredXp` from the running XP, with thresholds from a config file (`configv2.json`'s
-`LevelProgressionMaps`) we don't have.
+inserts.
+
+**Levelling spends the XP.** `xp` is progress into the current level, not a lifetime total:
+`addXp` adds the grant, then walks the ladder in `LEVEL_REQUIRED_XP`, subtracting each
+level's cost while it's covered. One 25 XP reward takes a fresh player from level 1 to level
+**3** with 5 XP over (10 + 10 spent), because the early tiers are cheap — the ladder steps
+10 → 20 → 45 → 115 → 360 → 1080 every ten levels and stops at 50.
+
+That table is copied from the `LevelProgressionMaps` the client is served in
+`apps/api/static/api-config-v2.json`, and **both sides have to agree** or the bar fills to a
+different mark than the level-up fires at; an `api` test asserts they stay identical.
+
+It is also the real game's curve, checked against Rec Room's own published level chart —
+cumulative XP to finish a level: 170 by 10, 620 by 20, 1,770 by 30, 5,370 by 40, 16,170 by 50. Nearly flat to level 20, then a knee at 30–40 and a steep climb to the cap; a third of
+the whole grind sits in the last ten levels. A test pins those milestones, since per-level
+costs are easy to edit one at a time and hard to eyeball as a curve.
+
+**Every level pays out a reward**, from Rec Room's published level-reward table
+(`LEVEL_REWARDS` in `@repo/domain`) — per level, not per band:
+
+| Levels           | Reward                                     |
+| ---------------- | ------------------------------------------ |
+| 1, 3, 5, 6, 7, 9 | Consumable                                 |
+| 2, 4, 8, 10 – 21 | 2-Star Clothing (rarity 10)                |
+| 22 – 30          | 3-Star on even levels, 2-Star between      |
+| 31 – 39          | 3-Star, with 4-Star at 31 and 35           |
+| 40 – 49          | 4-Star Clothing (rarity 30)                |
+| 50               | 5-Star Clothing (rarity 50) — the only one |
+
+**One reward per level crossed**, so the 25 XP that takes a fresh player from 1 to 3 hands
+over three boxes: the XP reward itself, 2-Star Clothing for level 2, and a consumable for
+level 3. Each arrives as a gift box announced like any other (`Level 3!`).
+
+- **"Clothing" is why the roll passes `avatarItemsOnly`** — the prize has to be something the
+  player can wear and be seen in, never an equipment skin for a weapon they may not own.
+- **Consumable levels don't roll a rarity.** The table names no star tier for them, and
+  consumables stack, so there's no ownership filter either — a second Confetti Cannon is a
+  fine prize. It's picked as a concrete drop rather than through the query path.
+- **This table is not the served config's `GiftRarity`.** That one is a coarse per-band tier
+  (flat 10 to level 14, 20 to 39, 30 to 49, 50 at the cap) with no notion of consumables, and
+  the two disagree — level 15 is 2-Star in the published table and 20 in the config. We grant
+  from the published table; the config is left as captured, so the drift test asserts only
+  the XP costs. If the client previews an upcoming reward from `GiftRarity`, aligning the two
+  is an edit to the static config.
+- The reference server carries the config data and never reads it: granting anything for a
+  level is ours.
+
+**The client is told, or it shows nothing.** A grant pushes `PlayerProgressionLevelUpdate`
+(`{ PlayerId, Level, XP }`) — without it the bar sits still until something else refreshes
+it, which is what "levelling does nothing" looks like from the game. `api`'s
+`GET /api/players/v1/progression/:id` pushes the same frame on read, as the reference does,
+so a client that just connected gets its bar right.
 
 **Not ported:** the reference's `request` doesn't grant at all — it offers **three** drops,
 pushes a `RewardSelectionReceived` frame and waits for `POST /api/gamerewards/v1/select` to
@@ -434,8 +485,8 @@ Add a storefront by dropping a new `sfN.json` in `static/storefronts` — no cod
 - Consumables are granted and listed but never spent by gameplay, so `Count` only grows.
 - Several routes (room keys, wishlist, equipment, room consumables/currencies) are
   empty-list stubs pending their own stores.
-- Game rewards pay a flat 25 XP into `progression`; levelling never happens (no curve) and
-  there is no daily XP cap beyond the hourly cooldown.
+- Game rewards pay a flat 25 XP; there is no daily XP cap beyond the hourly cooldown (the
+  reference caps activity XP per day in `daily_xp_ledgers`).
 - The weekly-challenge gift is granted but not announced: the box appears in the gifts list
   with no `GiftPackageReceived` notification, so the player sees it the next time the client
   reads that list rather than the moment they finish the set. Same gap as gifting to another
