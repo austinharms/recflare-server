@@ -13,7 +13,8 @@
  */
 
 /**
- * The currencies the client knows about (its `CurrencyType` enum). The client sends
+ * The currencies the client knows about (its `CurrencyType` enum, obfuscated
+ * `GKPEKOLBBJL` — which lists every member below except `RoomInventoryItem`). The client sends
  * these ints in the balance/storefront paths — `/api/storefronts/v4/balance/2` is
  * RecCenterTokens — so the values are fixed by the client, not by us.
  *
@@ -90,10 +91,73 @@ export function startingBalances(
 }
 
 /**
- * `Platform` in the client's balance DTO. -2 is "all platforms" — we don't track
- * per-platform wallets (real RecNet did, for platform-purchased tokens).
+ * The client's `Platform` enum (obfuscated `DEKBHBDENBA`) — WHERE a balance came from,
+ * carried on the balance DTO and on the `StorefrontBalance*` socket frames. The store
+ * platforms (Steam … Pico) mean tokens bought with real money there; the negative and
+ * 100+ members are the "not purchased" kinds, split by whether they may be spent
+ * player-to-player.
+ *
+ * We sell nothing, so only two of these are ever on the wire from us: balances read back
+ * as `NonPurchasedNotUsableInP2P` (see `ALL_PLATFORMS`) and a storefront purchase reports
+ * `RecNet`. The rest is recorded for when a frame from a real capture has to be read.
  */
-export const ALL_PLATFORMS = -2
+export const Platform = {
+	NonPurchasedNotUsableInP2P: -2,
+	NonPurchasedDefault: -1,
+	Steam: 0,
+	Oculus: 1,
+	PlayStation: 2,
+	Microsoft: 3,
+	RecNet: 4,
+	IOS: 5,
+	GooglePlay: 6,
+	Pico: 8,
+	PlayStationNonPurchasedP2P: 100,
+	NonPlayStationNonPurchasedP2P: 101,
+	NonPurchasedEarnedByP2P: 1000,
+} as const
+
+/**
+ * `Platform` in the client's balance DTO: -2, `NonPurchasedNotUsableInP2P`. We don't track
+ * per-platform wallets (real RecNet did, for platform-purchased tokens), and everything we
+ * hand out is minted rather than bought, so one account-wide balance answers for all of them.
+ */
+export const ALL_PLATFORMS: number = Platform.NonPurchasedNotUsableInP2P
+
+/**
+ * The client's `BalanceAddType` enum (obfuscated `EPJJLKAOOLD`) — WHY a balance changed,
+ * tagged onto a `StorefrontBalance*` frame. Log-only: the client shows/records the reason
+ * but never derives the balance from it, so a wrong value here is cosmetic, not a wrong
+ * number on screen.
+ *
+ * `CommercePurchase` (1400) is a storefront buy — what `buyItem` sends. Kept whole because
+ * the reasons a balance moves (challenges, level-ups, creator payouts, manual grants) are
+ * paths this worker will grow into, and the client already has a name for each.
+ */
+export const BalanceAddType = {
+	Invalid: 0,
+	DirectBalanceWithMultiplier: 1,
+	FromGiftBox: 2,
+	NUXChallenge: 10,
+	AllNUXChallenges: 11,
+	DailyChallenge: 100,
+	AllDailyChallenges: 101,
+	FinishActivity: 200,
+	RecRoyaleMatchFinished: 250,
+	ChecklistCredit: 303,
+	WonGame: 1000,
+	LostGame: 1001,
+	WonGameRateLimited: 1002,
+	WonGamePartial: 1003,
+	LevelUp: 1100,
+	Registered: 1200,
+	CreatorReward: 1300,
+	CommercePurchase: 1400,
+	CommercePurchaseRevoked: 1401,
+	Manual_Refund: 2000,
+	Manual_Thanks: 2010,
+	Manual_Apology: 2020,
+} as const
 
 /** Schema DDL (mirror of migrations 0001_balance.sql) — also used to build the table in tests. */
 export const BALANCE_SCHEMA_DDL: string[] = [

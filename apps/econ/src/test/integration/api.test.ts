@@ -777,13 +777,22 @@ describe('econ endpoints', () => {
 		expect(gift.AvatarItemDesc).not.toBe('')
 		expect(gift.Id).toBeGreaterThan(0)
 
-		// The socket frame carries the same change the response does — the client adds it to
-		// the balance it is showing, so the resulting total here would double-count the 9550.
+		// A purchase pushes StorefrontBalancePurchase, NOT the additive StorefrontBalanceUpdate:
+		// `Balance` is the RESULTING total (10000 - 450), which the client shows as-is, and
+		// `Delta`/`BalanceAddType` are log-only — the client never subtracts `Delta` itself.
+		// Sending the change here would leave the client showing 9550 less than it should.
 		expect(await drainFrames()).toEqual([
 			{
 				accountId: 20,
-				notificationType: NotificationType.StorefrontBalanceUpdate,
-				payload: { Balance: -450, CurrencyType: 2, BalanceType: -2 },
+				notificationType: NotificationType.StorefrontBalancePurchase,
+				payload: {
+					// 1400 = CommercePurchase, 4 = RecNet (the store, not the buyer's device).
+					BalanceAddType: 1400,
+					Delta: -450,
+					Balance: 9550,
+					Platform: 4,
+					CurrencyType: 2,
+				},
 			},
 		])
 

@@ -31,12 +31,14 @@ import weeklyChallenge from '../static/weekly-challenge.json'
 import { getAvatar, setAvatar } from './avatar-db'
 import {
 	ALL_PLATFORMS,
+	BalanceAddType,
 	creditCurrency,
 	CurrencyType,
 	DEFAULT_STARTING_TOKENS,
 	ensureStartingBalances,
 	getBalance,
 	isSpendable,
+	Platform,
 	spendCurrency,
 } from './balance-db'
 import {
@@ -223,6 +225,50 @@ async function pushConsumableAdded(
 }
 
 /**
+ * Push a StorefrontBalancePurchase to the buyer after a purchase settles — the frame the
+ * reference sends for a spend, as opposed to the StorefrontBalanceUpdate it sends for a
+ * plain balance change.
+ *
+ * `Balance` is ABSOLUTE — the resulting total — and is the only field that moves the
+ * client's state. `Delta` and `BalanceAddType` are log-only: the client does NOT subtract
+ * `Delta` from what it is showing. That makes this frame idempotent, unlike
+ * `pushBalanceUpdate` below, and is why the purchase path uses it: an additive frame that
+ * raced a `GET /balance` re-fetch (or arrived twice) left the client showing a total the
+ * backend never had.
+ *
+ * `Platform` is `RecNet` — the store the tokens were spent in, not the buyer's device (the
+ * JWT carries no device, and we sell nothing per-platform) — and `CurrencyType` says which
+ * wallet the total belongs to. Best-effort: a hub failure is logged and swallowed, since
+ * the spend has already committed.
+ */
+async function pushBalancePurchase(
+	c: Context<App>,
+	accountId: number,
+	currencyType: number,
+	delta: number,
+	balance: number
+): Promise<void> {
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			accountId,
+			NotificationType.StorefrontBalancePurchase,
+			{
+				BalanceAddType: BalanceAddType.CommercePurchase,
+				Delta: delta,
+				Balance: balance,
+				Platform: Platform.RecNet,
+				CurrencyType: currencyType,
+			}
+		)
+	} catch (err) {
+		logger.error('failed to push StorefrontBalancePurchase notification', {
+			accountId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
+}
+
+/**
  * Push a StorefrontBalanceUpdate to a player after their balance changes, mirroring the
  * reference's
  * `HubSendToPlayer(accountID, NotifFrame(StorefrontBalanceUpdate, {Balance, CurrencyType, BalanceType}))`.
@@ -233,7 +279,8 @@ async function pushConsumableAdded(
  * resulting total. The client ADDS what it receives to the balance it is already showing,
  * so sending the total made a 10,000-token player who earned 250 read 20,250: their own
  * balance plus the new total. That also makes this frame non-idempotent, so push exactly
- * once per change and never re-send it as a "refresh".
+ * once per change and never re-send it as a "refresh". A spend goes through
+ * `pushBalancePurchase` instead, whose `Balance` IS the total.
  *
  * `BalanceType` is -2 (account-wide, all platforms). Best-effort: a hub failure is logged
  * and swallowed, since the balance change has already committed.
@@ -1703,8 +1750,8 @@ const app = new Hono<App>({ strict: false })
 				'still matches, debits the buyer atomically, grants the item (into the inventory or',
 				'consumable table), and returns a gift box. A `Gift` block routes the item to another',
 				'player, but the caller always pays. `Balance` in the response is the CHANGE (negated',
-				'price), not the new total. Pushes a StorefrontBalanceUpdate socket frame carrying the',
-				'same change, which the client ADDS to the balance it is showing.',
+				'price), not the new total. Pushes a StorefrontBalancePurchase socket frame whose',
+				'`Balance` is the RESULTING total (`Delta` is log-only), which the client shows as-is.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: jsonBody(BuyItemRequest, 'The item, currency, price, and optional Gift'),
@@ -1792,11 +1839,15 @@ const app = new Hono<App>({ strict: false })
 				message
 			)
 
-			// Push the debit over the socket so the buyer's client updates the shown total
-			// immediately — the buyer (`id`) is who was charged, in the currency they spent. The
-			// frame carries the CHANGE, so a purchase is negative. Best-effort; the HTTP response
-			// carries the same change either way.
-			await pushBalanceUpdate(c, id, currencyType as number, -price.Price)
+			// Push the spend over the socket so the buyer's client updates the shown total
+			// immediately — the buyer (`id`) is who was charged, in the currency they spent. A
+			// purchase sends StorefrontBalancePurchase, whose `Balance` is the RESULTING total
+			// read back from the DB (`Delta` is log-only), so a frame that arrives late, twice or
+			// alongside a `GET /balance` still lands the client on the balance we hold. The
+			// additive StorefrontBalanceUpdate this used to send could not: two of them, or one
+			// crossing a re-fetch, drifted the shown total off the backend's. Best-effort.
+			const newBalance = await getBalance(c.env.DB, id, currencyType as number, startingTokens)
+			await pushBalancePurchase(c, id, currencyType as number, -price.Price, newBalance)
 
 			// The response mirrors a captured real buyItem: `Balance` is the change applied (the
 			// negated price), not the resulting balance (the client reads its new total from
