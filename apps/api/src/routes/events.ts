@@ -8,20 +8,22 @@ import { logger } from '@repo/hono-helpers'
 import { NotificationType } from '../../../notify/src/notification-types'
 import {
 	createEvent,
+	eventInputRejection,
 	getEventAttendees,
 	getEventById,
+	getEventResponse,
 	getEventsByClubs,
 	getEventsByCreator,
 	getEventsByIds,
 	getLiveEvents,
+	inviteToEvent,
 	isEventResponseType,
-	eventInputRejection,
 	parseEventBody,
 	searchEvents,
 	setEventResponse,
 	toEventListing,
-	toEventResponse,
 	toEventNotification,
+	toEventResponse,
 	toEventResult,
 	updateEvent,
 } from '../events-db'
@@ -33,6 +35,8 @@ import {
 	json,
 	jsonBody,
 	pageParams,
+	PlayerEventBulkInviteRequest,
+	PlayerEventDetailsDto,
 	PlayerEventDto,
 	PlayerEventListingDto,
 	PlayerEventRequest,
@@ -47,8 +51,9 @@ import {
 } from '../openapi'
 
 import type { Context } from 'hono'
+import type { PlayerEventResponsePayload } from '../../../notify/src/notification-payloads'
 import type { App } from '../context'
-import type { PlayerEvent } from '../events-db'
+import type { EventAttendeeRow, PlayerEvent } from '../events-db'
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
@@ -73,6 +78,49 @@ async function notifyEventCreated(c: Context<App>, event: PlayerEvent): Promise<
 			playerEventId: event.PlayerEventId,
 			error: err instanceof Error ? err.message : String(err),
 		})
+	}
+}
+
+/**
+ * Push a `PlayerEventResponseChanged` (83) to each player a bulk invite just added —
+ * what puts the event on their screen without a refetch, since an invite writes their
+ * response row for them.
+ *
+ * Only the players who actually gained a row are notified: an invite that hit an
+ * existing answer changed nothing, so there is nothing to tell them about.
+ *
+ * The frame carries BOTH nested objects the client's decoder expects. That is not
+ * optional — several of its handlers dereference one level down with no null guard, so
+ * omitting one surfaces as a NullReferenceException in the client rather than a missing
+ * field (see notification-payloads.ts). The event goes in the same camelCase
+ * {@link toEventNotification} projection the `PlayerEventCreated` frame uses, and the
+ * response in the PascalCase {@link toEventResponse} one the RSVP list serves; the
+ * decoder accepts either casing, so the two need not agree.
+ *
+ * Hub failures are logged and swallowed, and one player's failure doesn't stop the
+ * rest: the invites are already stored by the time this runs.
+ */
+async function notifyInvited(
+	c: Context<App>,
+	event: PlayerEvent,
+	added: EventAttendeeRow[]
+): Promise<void> {
+	const hub = c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE)
+	const PlayerEvent = { ...toEventNotification(event) }
+	for (const row of added) {
+		const payload = {
+			PlayerEvent,
+			PlayerEventResponse: { ...toEventResponse(row) },
+		} satisfies PlayerEventResponsePayload
+		try {
+			await hub.notifyPlayer(row.player_id, NotificationType.PlayerEventResponseChanged, payload)
+		} catch (err) {
+			logger.error('failed to push PlayerEventResponseChanged notification', {
+				playerEventId: event.PlayerEventId,
+				playerId: row.player_id,
+				error: err instanceof Error ? err.message : String(err),
+			})
+		}
 	}
 }
 
@@ -337,6 +385,74 @@ export const eventRoutes = new Hono<App>({ strict: false })
 		}
 	)
 
+	// Bulk invite — the "invite friends" button on an event. Adds the invited players to
+	// the same `event_attendee` table an RSVP writes to, as Going.
+	.post(
+		'/api/playerevents/v1/bulkInvite',
+		describeRoute({
+			tags: ['Events'],
+			summary: 'Invite players to an event',
+			description:
+				'Adds the invited players to the event as Going — the same `event_attendee` rows ' +
+				'an RSVP writes, so an invited player shows up in `…/responses` and counts toward ' +
+				'`AttendeeCount` immediately, without having answered.\n\n' +
+				'An invite never overwrites an answer: a player who already responded keeps what ' +
+				'they said, so inviting someone who declined does not flip them back to Going, and ' +
+				're-inviting is a no-op. The caller is skipped (they are already on the list), as ' +
+				'are duplicate ids.\n\n' +
+				'The caller must be on the event themselves — its creator, or a player with a ' +
+				'response row of any kind. Anyone else gets 403: an invite adds attendees, so it ' +
+				'is not something a passer-by can do. Answers the same ' +
+				'`{ Result, TagModifyResult, PlayerEvent }` envelope the other event writes do, ' +
+				'carrying the updated attendee count.',
+			security: AUTHED,
+			requestBody: jsonBody(PlayerEventBulkInviteRequest, 'The event and who to invite'),
+			responses: {
+				200: json(PlayerEventResultDto, 'The event, with its updated attendee count'),
+				400: { description: 'Missing `PlayerEventId` or `InvitedPlayerIds` (empty body)' },
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'The caller is not on the event (empty body)' },
+				404: { description: 'No such event (empty body)' },
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = await c.req
+				.json<{ PlayerEventId?: unknown; InvitedPlayerIds?: unknown }>()
+				.catch(() => ({}) as { PlayerEventId?: unknown; InvitedPlayerIds?: unknown })
+			const eventId = Number(body.PlayerEventId)
+			if (!Number.isInteger(eventId) || !Array.isArray(body.InvitedPlayerIds)) {
+				return c.body(null, 400)
+			}
+
+			const event = await getEventById(c.env.DB, eventId)
+			if (event === null) return c.body(null, 404)
+			// On the event themselves, one way or the other. The creator has a Going row from
+			// create, so the response lookup would usually cover them — but it's checked
+			// explicitly so a creator who deleted their own answer can still invite.
+			if (
+				event.CreatorPlayerId !== id &&
+				(await getEventResponse(c.env.DB, eventId, id)) === null
+			) {
+				return c.body(null, 403)
+			}
+
+			// Unusable entries are dropped rather than failing the invite: a client sending one
+			// bad id shouldn't lose the other nine invites.
+			const invited = [
+				...new Set(
+					body.InvitedPlayerIds.map((v) => Number(v)).filter((v) => Number.isInteger(v) && v !== id)
+				),
+			]
+			const result = await inviteToEvent(c.env.DB, eventId, invited)
+			// inviteToEvent only returns null when the row vanished, which the read above rules out.
+			await notifyInvited(c, result!.event, result!.added)
+			return c.json(toEventResult(result!.event))
+		}
+	)
+
 	// Create. The creator comes from the bearer token, never the body — posting someone
 	// else's `CreatorPlayerId` doesn't make it theirs.
 	.post(
@@ -454,15 +570,26 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			summary: 'One player event',
 			description:
 				'A single event by id, served as the bare record — no envelope, unlike the ' +
-				'create/update writes. 404 when there is no such event.',
-			parameters: [idParam('eventId', 'Event id')],
+				'create/update writes. 404 when there is no such event.\n\n' +
+				'`includeDetails=True` adds exactly one field, the lowercase `tags` — that is the ' +
+				'whole of what the flag does. It is always an empty array here: no event tags are ' +
+				'stored (see the tag-filter chips, which are static, and `TagModifyResult`, which ' +
+				'is always null). Without the flag the key is ABSENT rather than empty, since a ' +
+				'caller that didn’t ask for details shouldn’t be told the event has no tags.',
+			parameters: [
+				idParam('eventId', 'Event id'),
+				stringQuery('includeDetails', 'Pass `True` to add the `tags` array'),
+			],
 			responses: {
-				200: json(PlayerEventDto, 'The event'),
+				200: json(PlayerEventDetailsDto, 'The event, with `tags` when details were asked for'),
 				404: { description: 'No such event (empty body)' },
 			},
 		}),
 		async (c) => {
 			const event = await getEventById(c.env.DB, Number.parseInt(c.req.param('eventId'), 10))
-			return event === null ? c.body(null, 404) : c.json(event)
+			if (event === null) return c.body(null, 404)
+			// The client sends `True`; accepted case-insensitively, and `1` alongside it.
+			const details = /^(true|1)$/i.test(c.req.query('includeDetails') ?? '')
+			return c.json(details ? { ...event, tags: [] } : event)
 		}
 	)

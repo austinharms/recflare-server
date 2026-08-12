@@ -3016,6 +3016,23 @@ describe('player events', () => {
 		expect((await get('/api/playerevents/v1/999999')).status).toBe(404)
 	})
 
+	test('GET /api/playerevents/v1/:eventId?includeDetails=True adds only `tags`', async () => {
+		const path = `/api/playerevents/v1/${upcoming.PlayerEventId}`
+		// The flag's whole effect: the lowercase `tags`, empty (no event tags are stored).
+		expect(await (await get(`${path}?includeDetails=True`)).json()).toEqual({
+			...upcoming,
+			tags: [],
+		})
+		// Accepted case-insensitively — the client sends `True`.
+		expect(await (await get(`${path}?includeDetails=true`)).json()).toEqual({
+			...upcoming,
+			tags: [],
+		})
+		// Anything else is the bare record, with no `tags` key at all.
+		expect(await (await get(`${path}?includeDetails=False`)).json()).toEqual(upcoming)
+		expect(await (await get(path)).json()).toEqual(upcoming)
+	})
+
 	test('GET /api/playerevents/v1/bulk answers in request order, skipping unknown ids', async () => {
 		const res = await get(
 			`/api/playerevents/v1/bulk?id=${clubEvent.PlayerEventId}&id=999999&id=${upcoming.PlayerEventId}`
@@ -3246,6 +3263,118 @@ describe('player events', () => {
 		).toBe(404)
 	})
 
+	test('POST /api/playerevents/v1/bulkInvite adds invitees as Going without overwriting answers', async () => {
+		const event = await create({ RoomId: 3, Name: 'Invite Test', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+
+		// 43 declines BEFORE being invited — the invite must not flip that back.
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 2 }, '43')
+
+		const res = await post(
+			'/api/playerevents/v1/bulkInvite',
+			// 42 is the caller (already on the event) and 187 is repeated — both are skipped.
+			{ PlayerEventId: id, InvitedPlayerIds: [187, 2, 187, 42, 43] },
+			'42'
+		)
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as PlayerEventResult
+		expect(body.Result).toBe(0)
+		// The creator plus the two newly invited — 43 keeps their decline, so isn't counted.
+		expect(body.PlayerEvent.AttendeeCount).toBe(3)
+
+		const responses = (await (await get(`/api/playerevents/v1/${id}/responses`)).json()) as Array<{
+			PlayerId: number
+			Type: number
+		}>
+		expect(
+			responses.sort((a, b) => a.PlayerId - b.PlayerId).map((r) => [r.PlayerId, r.Type])
+		).toEqual([
+			[2, 0],
+			[42, 0],
+			[43, 2],
+			[187, 0],
+		])
+
+		// Re-inviting is a no-op, not a reset: 43 still declines and the count holds.
+		const again = await post(
+			'/api/playerevents/v1/bulkInvite',
+			{ PlayerEventId: id, InvitedPlayerIds: [187, 43] },
+			'42'
+		)
+		expect(((await again.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(3)
+
+		// An empty list is a no-op that still answers the event.
+		const none = await post('/api/playerevents/v1/bulkInvite', {
+			PlayerEventId: id,
+			InvitedPlayerIds: [],
+		})
+		expect(((await none.json()) as PlayerEventResult).PlayerEvent.AttendeeCount).toBe(3)
+	})
+
+	test('POST /api/playerevents/v1/bulkInvite notifies only the players it actually added', async () => {
+		const hub = env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const event = await create({ RoomId: 3, Name: 'Invite Frames', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+		// 43 answers first, so the invite leaves them alone — and must not notify them.
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 1 }, '43')
+
+		await hub.fetch('http://do/all', { method: 'DELETE' })
+		await post('/api/playerevents/v1/bulkInvite', { PlayerEventId: id, InvitedPlayerIds: [2, 43] })
+		const sent = (await (await hub.fetch('http://do/all')).json()) as Array<{
+			playerId: number
+			notificationType: number
+			data: Record<string, Record<string, unknown>>
+		}>
+
+		// One frame, to the one player who gained a row. 43 kept their answer, so nothing
+		// changed for them and nothing is pushed.
+		expect(sent).toHaveLength(1)
+		expect(sent[0]!.playerId).toBe(2)
+		expect(sent[0]!.notificationType).toBe(83) // PlayerEventResponseChanged
+
+		// BOTH nested objects are present — the client dereferences them without a null
+		// guard, so a missing one is a NullReferenceException rather than a blank field.
+		expect(sent[0]!.data.PlayerEvent).toMatchObject({
+			playerEventId: id,
+			name: 'Invite Frames',
+			attendeeCount: 2,
+		})
+		expect(sent[0]!.data.PlayerEventResponse).toEqual({
+			PlayerEventResponseId: expect.any(Number),
+			PlayerEventId: id,
+			PlayerId: 2,
+			CreatedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/),
+			Type: 0,
+		})
+	})
+
+	test('POST /api/playerevents/v1/bulkInvite is gated on the caller being on the event', async () => {
+		const event = await create({ RoomId: 3, Name: 'Invite Gate', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+		const invite = async (body: unknown, sub = '42'): Promise<Response> =>
+			post('/api/playerevents/v1/bulkInvite', body, sub)
+
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/api/playerevents/v1/bulkInvite`, {
+					method: 'POST',
+					body: JSON.stringify({ PlayerEventId: id, InvitedPlayerIds: [2] }),
+				})
+			).status
+		).toBe(401)
+
+		// 44 has no response row on this event — not theirs to invite to.
+		expect((await invite({ PlayerEventId: id, InvitedPlayerIds: [2] }, '44')).status).toBe(403)
+		// …until they respond, which puts them on it.
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 1 }, '44')
+		expect((await invite({ PlayerEventId: id, InvitedPlayerIds: [2] }, '44')).status).toBe(200)
+
+		expect((await invite({ PlayerEventId: 999999, InvitedPlayerIds: [2] })).status).toBe(404)
+		expect((await invite({ InvitedPlayerIds: [2] })).status).toBe(400)
+		expect((await invite({ PlayerEventId: id })).status).toBe(400)
+		expect((await invite({})).status).toBe(400)
+	})
+
 	test('POST /api/playerevents/v2/:eventId edits only what the body carries, creator-only', async () => {
 		const event = await create({
 			RoomId: 5,
@@ -3422,6 +3551,7 @@ describe('openapi', () => {
 			'POST /api/messages/v2/send',
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
+			'POST /api/playerevents/v1/bulkInvite',
 			'POST /api/playerevents/v1/respond',
 			'POST /api/playerevents/v2',
 			'POST /api/playerevents/v2/{eventId}',

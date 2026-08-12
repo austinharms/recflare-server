@@ -478,6 +478,52 @@ export async function setEventResponse(
 	return updated
 }
 
+/**
+ * Add invited players to an event as Going — the bulk invite. Returns the updated
+ * event (with its recounted `AttendeeCount`) and the rows actually created, or null
+ * when there's no such event.
+ *
+ * An invite only ever INSERTS: a player who already has a row keeps the answer they
+ * gave, so being invited can't flip a decline back to Going, and re-inviting the same
+ * player is a no-op rather than a reset. Since the rows land as Going, the invited
+ * count toward `AttendeeCount` from the moment they're invited — see the route.
+ *
+ * `added` is what `RETURNING` gave back, so it holds exactly the new rows: a conflict
+ * inserts nothing and returns nothing. That's what the route notifies on — a player
+ * whose existing answer was left alone gets no frame, because nothing changed for them.
+ *
+ * Ids are deduplicated by the composite primary key; an empty list is a no-op that
+ * still returns the event.
+ */
+export async function inviteToEvent(
+	db: D1Database,
+	eventId: number,
+	playerIds: number[]
+): Promise<{ event: PlayerEvent; added: EventAttendeeRow[] } | null> {
+	const event = await getEventById(db, eventId)
+	if (event === null) return null
+	if (playerIds.length === 0) return { event, added: [] }
+
+	const at = eventTime(Date.now())
+	const inserts = await db.batch<EventAttendeeRow>(
+		playerIds.map((playerId) =>
+			db
+				.prepare(
+					`INSERT INTO event_attendee (event_id, player_id, status, responded_at)
+					 VALUES (?1, ?2, ?3, ?4)
+					 ON CONFLICT (event_id, player_id) DO NOTHING
+					 RETURNING rowid AS id, *`
+				)
+				.bind(eventId, playerId, EVENT_RESPONSE.going, at)
+		)
+	)
+	const added = inserts.flatMap((r) => r.results)
+
+	const updated: PlayerEvent = { ...event, AttendeeCount: await countGoing(db, eventId) }
+	await writeEvent(db, updated)
+	return { event: updated, added }
+}
+
 /** How many players said they're Going — an event's `AttendeeCount`. */
 export async function countGoing(db: D1Database, eventId: number): Promise<number> {
 	const row = await db

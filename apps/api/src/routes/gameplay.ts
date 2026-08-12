@@ -111,8 +111,8 @@ export const gameplayRoutes = new Hono<App>({ strict: false })
 			description:
 				'No keepsake catalog yet, so the result set is empty — but it IS a result set ' +
 				'(`{ Results, TotalResults }`), not the empty list the stubs around it serve. ' +
-				'The client parses this one as an object and fails on an array ("expected \'{\', ' +
-				'actual \'[\'"), taking the keepsake load down with it. `TotalResults` counts ' +
+				"The client parses this one as an object and fails on an array (\"expected '{', " +
+				"actual '['\"), taking the keepsake load down with it. `TotalResults` counts " +
 				'`Results` itself — there is no paging here.',
 			responses: { 200: json(KeepsakeCategories, 'An empty result set') },
 		}),

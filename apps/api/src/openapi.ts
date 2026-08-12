@@ -470,6 +470,19 @@ export const PlayerEventDto = z.object({
 })
 
 /**
+ * `GET /api/playerevents/v1/:eventId?includeDetails=True` — the record plus the one
+ * field the flag adds: the LOWERCASE `tags`, in an otherwise PascalCase record. Always
+ * empty, since no event tags are stored; the key is absent altogether when the flag
+ * isn't passed. The entry shape is the one the notification projection declares.
+ */
+export const PlayerEventDetailsDto = PlayerEventDto.extend({
+	tags: z
+		.array(z.object({ tag: z.string(), type: z.int() }))
+		.optional()
+		.describe('Present only with `includeDetails=True`, and always empty'),
+})
+
+/**
  * `GET /api/playerevents/v1` — the browse feed's listing. The same record minus
  * `State`, plus a `BroadcastingRoomInstanceId` (always null — nothing broadcasts an
  * event yet). That's the shape observed on this endpoint; the other reads serve the
@@ -527,6 +540,14 @@ export const PlayerEventResponseDto = z.object({
 export const PlayerEventRespondRequest = z.object({
 	PlayerEventId: z.int(),
 	Type: z.int().describe('0 Going, 1 Interested, 2 Can’t go'),
+})
+
+/** `POST /api/playerevents/v1/bulkInvite` JSON body — who to invite to which event. */
+export const PlayerEventBulkInviteRequest = z.object({
+	PlayerEventId: z.int(),
+	InvitedPlayerIds: z
+		.array(z.int())
+		.describe('Ids to invite; duplicates and the caller are ignored'),
 })
 
 /** `GET /api/playerevents/v1/all` — the caller's created events and RSVPs. */
