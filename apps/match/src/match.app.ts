@@ -3,6 +3,7 @@ import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
+	Accessibility,
 	areFriends,
 	canManageRoom,
 	createRoomInstance,
@@ -42,6 +43,9 @@ import { validateAndGetAccountId } from '@repo/jwt'
 // db module is plain D1 queries with no runtime deps, so it imports cleanly here (the
 // same way econ reads api's inventions-db).
 import { banEvasionMatch, resolveBan } from '../../api/src/bans-db'
+// The player-event tables are the api worker's too (same plain-D1 shape as bans-db):
+// `/matchmake/event` needs the event's room and the caller's invite row.
+import { getEventById, getEventResponse } from '../../api/src/events-db'
 // Value import of the notify worker's NotificationType enum (its bundle has no runtime
 // deps), so /invite sends a typed MessageReceived frame instead of a magic number.
 import { NotificationType } from '../../notify/src/notification-types'
@@ -414,6 +418,15 @@ const NO_SUCH_ROOM = MatchmakingErrorCode.NoSuchRoom
  * mysteriously fails to load.
  */
 const BANNED_FROM_ROOM = MatchmakingErrorCode.BannedFromRoom
+
+/**
+ * "This event isn't open to you" — the refusal on a private event the caller wasn't
+ * invited to. Told plainly rather than hidden behind the opaque NoSuchRoom: a player
+ * reaching this already holds the event id from somewhere that showed it to them, so
+ * the only thing withholding the reason buys is a room that fails to load for no
+ * visible reason.
+ */
+const EVENT_IS_PRIVATE = MatchmakingErrorCode.EventIsPrivate
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
@@ -1237,6 +1250,88 @@ const app = new Hono<App>()
 			)
 			if (!instance) return c.json({ errorCode, roomInstance: null })
 			await enterRoom(c, id, instance)
+			return c.json({ errorCode: 0, roomInstance: instance })
+		}
+	)
+
+	// Matchmake into a player event (`/matchmake/event/{playerEventId}`) — the "join" on
+	// an event. The event names the room (and optionally the subroom) to enter, so this
+	// is a room matchmake behind an access check on the EVENT.
+	.post(
+		'/matchmake/event/:eventId{[0-9]+}',
+		describeRoute({
+			tags: ['Navigation'],
+			summary: 'Matchmake into a player event',
+			description: [
+				'Places the caller into an instance of the event’s room — its subroom too, when the',
+				'event pins one. Who may join: anyone, if the event is Public (1) or Unlisted (2),',
+				'since unlisted only keeps an event out of the listings rather than closing it; and',
+				'otherwise only the event’s creator or a player who has been invited to it (any',
+				'`event_attendee` row, whatever their answer — being able to decline and change your',
+				'mind is the point). Everyone else gets errorCode 35 (EventIsPrivate) with a null',
+				'instance; an unknown event is the opaque errorCode 20, and 55 when the caller is',
+				'banned from the room the event runs in.',
+				'',
+				'The event’s start and end times are NOT enforced — the reference has codes for',
+				'both (4 EventNotStarted, 5 EventAlreadyFinished) but nothing here has been observed',
+				'sending them, and locking a creator out of their own room before the hour would be',
+				'worse than letting people in early.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(MatchmakeRoomRequest, 'Optional JoinMode and AdditionalPlayerIds'),
+			parameters: [
+				{
+					name: 'eventId',
+					in: 'path',
+					required: true,
+					description: 'Player event id (digits only)',
+					schema: { type: 'string', pattern: '^[0-9]+$' },
+				},
+			],
+			responses: {
+				200: json(
+					MatchmakeResponse,
+					'The event’s instance (or a null instance with errorCode 20 / 35 / 55)'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const eventId = Number.parseInt(c.req.param('eventId'), 10)
+			const event = await getEventById(c.env.DB, eventId)
+			// Opaque, like the club path: an unknown event and one the caller can't see
+			// shouldn't be distinguishable by probing ids.
+			if (event === null) return c.json({ errorCode: NO_SUCH_ROOM, roomInstance: null })
+
+			const open =
+				event.Accessibility === Accessibility.Public ||
+				event.Accessibility === Accessibility.Unlisted
+			// An `event_attendee` row is the invite: bulkInvite writes one, and so does
+			// responding, so anyone who was invited or answered passes. The creator is checked
+			// separately so an event whose creator deleted their own response still lets them in.
+			if (
+				!open &&
+				event.CreatorPlayerId !== id &&
+				(await getEventResponse(c.env.DB, eventId, id)) === null
+			) {
+				logger.info('matchmake refused: not invited to private event', { eventId, id })
+				return c.json({ errorCode: EVENT_IS_PRIVATE, roomInstance: null })
+			}
+
+			const { joinMode, additionalPlayerIds } = await readMatchmakeBody(c)
+			const { instance, errorCode } = await resolveRoomInstance(
+				c,
+				String(event.RoomId),
+				joinMode === 2,
+				id,
+				event.SubRoomId ?? undefined
+			)
+			if (!instance) return c.json({ errorCode, roomInstance: null })
+			await enterRoom(c, id, instance)
+			await inviteParty(c, id, additionalPlayerIds, instance)
 			return c.json({ errorCode: 0, roomInstance: instance })
 		}
 	)

@@ -21,6 +21,7 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import { SCHEMA_DDL as EVENTS_SCHEMA_DDL } from '../../../../api/src/events-db'
 import {
 	banFromReport,
 	createReport,
@@ -148,6 +149,49 @@ beforeAll(async () => {
 		insertMember.bind(4, 122, 1), // pending request — not a member yet
 		insertMember.bind(4, 123, -1), // banned
 		insertMember.bind(5, 120, 100),
+	])
+
+	// Player-event tables (owned by the api worker) — matchmake/event reads the event
+	// for its room and the caller's invite row for access.
+	for (const stmt of EVENTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	const insertEvent = env.DB.prepare('INSERT OR IGNORE INTO event (data) VALUES (?1)')
+	const event = (id: number, accessibility: number, extra?: Record<string, unknown>) =>
+		JSON.stringify({
+			PlayerEventId: id,
+			CreatorPlayerId: 300,
+			ImageName: null,
+			RoomId: 2,
+			SubRoomId: null,
+			ClubId: null,
+			Name: `Event ${id}`,
+			Description: '',
+			StartTime: '2020-11-29T22:00:00Z',
+			EndTime: '2020-11-29T23:00:00Z',
+			AttendeeCount: 1,
+			State: 0,
+			Accessibility: accessibility,
+			IsMultiInstance: false,
+			SupportMultiInstanceRoomChat: false,
+			DefaultBroadcastPermissions: 0,
+			CanRequestBroadcastPermissions: 0,
+			...extra,
+		})
+	await env.DB.batch([
+		insertEvent.bind(event(8, 0)), // private
+		insertEvent.bind(event(9, 1)), // public
+		insertEvent.bind(event(10, 2)), // unlisted — listings only, still joinable
+		// A private one in the two-subroom room, pinning the SECOND subroom.
+		insertEvent.bind(event(11, 0, { RoomId: 77, SubRoomId: 35 })),
+	])
+	const insertAttendee = env.DB.prepare(
+		`INSERT INTO event_attendee (event_id, player_id, status, responded_at)
+		 VALUES (?1, ?2, ?3, '2020-11-29T21:00:00Z')`
+	)
+	await env.DB.batch([
+		insertAttendee.bind(8, 300, 0), // the creator, Going from create
+		insertAttendee.bind(8, 301, 0), // invited
+		insertAttendee.bind(8, 302, 2), // invited, but declined — still allowed in
+		insertAttendee.bind(11, 301, 0),
 	])
 
 	// Relationship table (owned by the api worker) — matchmake reads it to push a
@@ -651,6 +695,80 @@ describe('public endpoints', () => {
 
 		// Signed out is a 401, not a matchmaking error.
 		expect((await matchmake('/matchmake/club/4')).status).toBe(401)
+	})
+
+	test('POST /matchmake/event/:eventId gates a private event on the invite list', async () => {
+		const matchmake = async (path: string, sub?: string) =>
+			exports.default.fetch(`${ORIGIN}${path}`, {
+				method: 'POST',
+				headers: {
+					...(sub === undefined ? {} : await bearer(sub)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: 'JoinMode=0',
+			})
+		type Body = {
+			errorCode: number
+			roomInstance: { roomId: number; location: string; roomInstanceId: number } | null
+		}
+		const join = async (path: string, sub?: string) =>
+			(await (await matchmake(path, sub)).json()) as Body
+
+		// An invited player lands in an instance of the event's room (2)...
+		const invited = await join('/matchmake/event/8', '301')
+		expect(invited.errorCode).toBe(0)
+		expect(invited.roomInstance).toMatchObject({ roomId: 2, location: RECCENTER_SCENE })
+
+		// ...recorded as their presence, like any other matchmake.
+		const row = await env.DB.prepare('SELECT data FROM presence WHERE account_id = ?1')
+			.bind(301)
+			.first<{ data: string }>()
+		const presence = JSON.parse(row!.data) as { roomInstance: { roomInstanceId: number } }
+		expect(presence.roomInstance.roomInstanceId).toBe(invited.roomInstance!.roomInstanceId)
+
+		// The creator gets in, and so does someone who was invited and DECLINED — the row
+		// is the invite, whatever the answer.
+		expect((await join('/matchmake/event/8', '300')).errorCode).toBe(0)
+		expect((await join('/matchmake/event/8', '302')).errorCode).toBe(0)
+
+		// A stranger doesn't — and is told why (35 EventIsPrivate), not fobbed off with 20.
+		expect(await join('/matchmake/event/8', '399')).toEqual({
+			errorCode: 35,
+			roomInstance: null,
+		})
+
+		// Public and unlisted are open to anyone: unlisted only keeps an event out of the
+		// listings, it doesn't close it.
+		expect((await join('/matchmake/event/9', '399')).errorCode).toBe(0)
+		expect((await join('/matchmake/event/10', '399')).errorCode).toBe(0)
+
+		// An unknown event is the opaque NoSuchRoom, so ids can't be probed.
+		expect(await join('/matchmake/event/9999', '399')).toEqual({
+			errorCode: 20,
+			roomInstance: null,
+		})
+
+		// Signed out is a 401, not a matchmaking error.
+		expect((await matchmake('/matchmake/event/9')).status).toBe(401)
+	})
+
+	test('POST /matchmake/event/:eventId enters the subroom the event pins', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/matchmake/event/11`, {
+			method: 'POST',
+			headers: { ...(await bearer('301')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'JoinMode=0',
+		})
+		const body = (await res.json()) as {
+			errorCode: number
+			roomInstance: { roomId: number; subRoomId: number; location: string } | null
+		}
+		// Room 77's SECOND subroom (35), not its first — the event pins the scene.
+		expect(body.errorCode).toBe(0)
+		expect(body.roomInstance).toMatchObject({
+			roomId: 77,
+			subRoomId: 35,
+			location: SECOND_SUBROOM_SCENE,
+		})
 	})
 
 	test('POST /matchmake/room/:roomId returns NoSuchRoom for an unknown room', async () => {
@@ -1907,6 +2025,7 @@ describe('auth-gated endpoints', () => {
 			'POST /invite',
 			'POST /matchmake/club/{clubId}',
 			'POST /matchmake/dorm',
+			'POST /matchmake/event/{eventId}',
 			'POST /matchmake/instance/{instanceId}',
 			'POST /matchmake/player/{playerId}',
 			'POST /matchmake/room/{roomId}',
