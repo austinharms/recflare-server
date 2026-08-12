@@ -49,6 +49,13 @@ export const SCHEMA_DDL: string[] = [
 		PRIMARY KEY (event_id, player_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_event_attendee_player ON event_attendee (player_id)`,
+	`CREATE TABLE IF NOT EXISTS event_tag (
+		event_id INTEGER NOT NULL,
+		tag TEXT NOT NULL,
+		type INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (event_id, tag)
+	)`,
+	`CREATE INDEX IF NOT EXISTS idx_event_tag_tag ON event_tag (tag)`,
 ]
 
 /**
@@ -114,6 +121,19 @@ export function toEventResponse(row: EventAttendeeRow): PlayerEventResponse {
 		CreatedAt: row.responded_at,
 		Type: row.status,
 	}
+}
+
+/**
+ * One tag on an event — the categories the browse screen's filter chips name
+ * (`workshops`, `meetup`, …). `tag` is stored and matched lowercased; `type` is the
+ * client's tag-category int, echoed back as sent (its enum isn't reversed yet).
+ *
+ * Tags live in their own table, NOT on the event blob: the blob is the DTO every read
+ * serves verbatim, and tags surface only behind `includeDetails=True`.
+ */
+export interface EventTag {
+	tag: string
+	type: number
 }
 
 /**
@@ -237,10 +257,16 @@ function toTickPrecision(iso: string): string {
  * Project a stored event into its notification frame. `imageName` becomes an empty
  * string rather than null when the event has no banner: the frame carries `""`, and a
  * null wouldn't survive the trip anyway — the hub drops null values from `Msg`.
+ *
+ * `tags` are passed in rather than read from the event: they live in their own table,
+ * and the callers that have them already looked them up.
  */
-export function toEventNotification(event: PlayerEvent): PlayerEventNotification {
+export function toEventNotification(
+	event: PlayerEvent,
+	tags: EventTag[] = []
+): PlayerEventNotification {
 	return {
-		tags: [],
+		tags,
 		playerEventId: event.PlayerEventId,
 		creatorPlayerId: event.CreatorPlayerId,
 		roomId: event.RoomId,
@@ -270,6 +296,39 @@ function eventTime(ms: number): string {
 	return new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z')
 }
 
+/** An event's tags, alphabetical so a list read is stable. */
+export async function getEventTags(db: D1Database, eventId: number): Promise<EventTag[]> {
+	const { results } = await db
+		.prepare('SELECT tag, type FROM event_tag WHERE event_id = ?1 ORDER BY tag')
+		.bind(eventId)
+		.all<EventTag>()
+	return results
+}
+
+/**
+ * Replace an event's tags with the given set — the tag edit that rides along with a
+ * create or update. A replace, not a merge: the client posts the whole set it wants,
+ * so an untagging is a post with the tag left out.
+ */
+export async function setEventTags(
+	db: D1Database,
+	eventId: number,
+	tags: EventTag[]
+): Promise<void> {
+	const statements = [db.prepare('DELETE FROM event_tag WHERE event_id = ?1').bind(eventId)]
+	for (const { tag, type } of tags) {
+		statements.push(
+			db
+				.prepare(
+					`INSERT INTO event_tag (event_id, tag, type) VALUES (?1, ?2, ?3)
+					 ON CONFLICT (event_id, tag) DO UPDATE SET type = ?3`
+				)
+				.bind(eventId, tag, type)
+		)
+	}
+	await db.batch(statements)
+}
+
 /**
  * Fields a create or update supplies, camelCased. Every one is optional: create
  * defaults what's missing, and update leaves anything absent at its stored value —
@@ -277,6 +336,8 @@ function eventTime(ms: number): string {
  * posted `"ClubId": null` can genuinely clear a club.
  */
 export interface EventInput {
+	/** The whole tag set to store; absent leaves the event's tags alone. */
+	tags?: EventTag[]
 	imageName?: string | null
 	roomId?: number
 	subRoomId?: number | null
@@ -337,6 +398,33 @@ export function eventInputRejection(input: EventInput): string | null {
 	return null
 }
 
+/**
+ * Read the `Tags` a create/update body carries, or undefined when it carries none (an
+ * update that says nothing about tags leaves them alone; `[]` genuinely clears them).
+ *
+ * Both forms in circulation are accepted — a bare string (`"workshops"`) and the
+ * `{ tag, type }` object the notification frame carries — since the browse chips are
+ * plain names while the client's own event model pairs each with a category int. Tags
+ * are lowercased (the search matches them lowercased, and `#Workshops` and `#workshops`
+ * are the same chip), a leading `#` is stripped, and blanks/duplicates are dropped.
+ */
+function parseEventTags(raw: unknown): EventTag[] | undefined {
+	if (!Array.isArray(raw)) return undefined
+	const byTag = new Map<string, EventTag>()
+	for (const entry of raw) {
+		const source = (typeof entry === 'object' && entry !== null ? entry : {}) as Record<
+			string,
+			unknown
+		>
+		const name = typeof entry === 'string' ? entry : (source.tag ?? source.Tag)
+		if (typeof name !== 'string') continue
+		const tag = name.trim().replace(/^#/, '').toLowerCase()
+		if (tag === '') continue
+		byTag.set(tag, { tag, type: asInt(source.type ?? source.Type) ?? 0 })
+	}
+	return [...byTag.values()]
+}
+
 export function parseEventBody(body: unknown): EventInput {
 	const outer = (typeof body === 'object' && body !== null ? body : {}) as Record<string, unknown>
 	const nested = outer.PlayerEvent
@@ -372,6 +460,7 @@ export function parseEventBody(body: unknown): EventInput {
 	}
 
 	return {
+		tags: parseEventTags(obj.Tags ?? obj.tags),
 		imageName: nullableString('ImageName'),
 		roomId: asInt(obj.RoomId),
 		subRoomId: nullableInt('SubRoomId'),
@@ -443,6 +532,9 @@ export async function createEvent(
 			)
 			.bind(event.PlayerEventId, creatorPlayerId, EVENT_RESPONSE.going, eventTime(now)),
 	])
+	// Tags ride along with the write but live in their own table — they are not part of
+	// the stored blob, since that blob is the DTO every read serves verbatim.
+	if (input.tags !== undefined) await setEventTags(db, event.PlayerEventId, input.tags)
 	return event
 }
 
@@ -609,6 +701,9 @@ export async function updateEvent(
 			input.canRequestBroadcastPermissions ?? event.CanRequestBroadcastPermissions,
 	}
 	await writeEvent(db, updated)
+	// A body that says nothing about tags leaves them alone, like every other field
+	// here; an explicit `[]` clears them.
+	if (input.tags !== undefined) await setEventTags(db, eventId, input.tags)
 	return updated
 }
 
@@ -691,9 +786,19 @@ function bySoonest(a: PlayerEvent, b: PlayerEvent): number {
 }
 
 /**
- * Event search — the browse query on the player-events screen. `query` is matched
- * case-insensitively against the name and description, term by term; an empty query
- * browses everything upcoming. Paginated via skip/take, soonest first.
+ * Event search — the browse query on the player-events screen. Term by term, an empty
+ * query browsing everything upcoming; paginated via skip/take, soonest first.
+ *
+ * A term is matched one of two ways, and the `#` decides which:
+ *
+ * - `#workshops` is a TAG term — it matches only an event tagged `workshops`, and never
+ *   the word appearing in a name or description. That's what the browse screen's filter
+ *   chips send.
+ * - `workshops` is a TEXT term, matched case-insensitively against the name and the
+ *   description, as before.
+ *
+ * Every term has to match, and the two kinds combine: `#workshops trigonometry` is the
+ * workshops-tagged events whose text also mentions trigonometry.
  *
  * Events that have already finished are excluded: this backs a browse screen, where a
  * name match on something that ended last month is noise. The per-event history a
@@ -705,16 +810,31 @@ export async function searchEvents(
 	skip: number,
 	take: number
 ): Promise<PlayerEvent[]> {
+	const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
+	// A `#` prefix makes a term a tag; the rest are matched against the text. A bare `#`
+	// is dropped rather than treated as a tag nothing can carry.
+	const tags = terms.filter((t) => t.startsWith('#')).map((t) => t.slice(1))
+	const textTerms = terms.filter((t) => !t.startsWith('#'))
+
 	// end_time is a generated column of an ISO-8601 UTC string, so it compares
-	// lexicographically — the filter stays in SQL.
+	// lexicographically — that filter stays in SQL, and so does the tag one: an event
+	// has to carry EVERY tag asked for, which is the count of matching tag rows.
+	const wanted = tags.filter(Boolean)
+	const sql =
+		wanted.length === 0
+			? 'SELECT data FROM event WHERE end_time >= ?1'
+			: `SELECT data FROM event WHERE end_time >= ?1 AND (
+					SELECT COUNT(DISTINCT tag) FROM event_tag
+					WHERE event_tag.event_id = event.id
+					  AND tag IN (${wanted.map((_, i) => `?${i + 2}`).join(', ')})
+				) = ${wanted.length}`
 	const { results } = await db
-		.prepare('SELECT data FROM event WHERE end_time >= ?1')
-		.bind(eventTime(Date.now()))
+		.prepare(sql)
+		.bind(eventTime(Date.now()), ...wanted)
 		.all<EventRow>()
 	let events = results.map((r) => JSON.parse(r.data) as PlayerEvent)
 
-	const terms = query.trim().toLowerCase().split(/\s+/).filter(Boolean)
-	for (const term of terms) {
+	for (const term of textTerms) {
 		events = events.filter(
 			(e) => e.Name.toLowerCase().includes(term) || e.Description.toLowerCase().includes(term)
 		)

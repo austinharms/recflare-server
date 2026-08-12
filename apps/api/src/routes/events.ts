@@ -15,6 +15,7 @@ import {
 	getEventsByClubs,
 	getEventsByCreator,
 	getEventsByIds,
+	getEventTags,
 	getLiveEvents,
 	inviteToEvent,
 	isEventResponseType,
@@ -39,6 +40,7 @@ import {
 	PlayerEventDetailsDto,
 	PlayerEventDto,
 	PlayerEventListingDto,
+	PlayerEventReportRequest,
 	PlayerEventRequest,
 	PlayerEventRespondRequest,
 	PlayerEventResponseDto,
@@ -46,14 +48,16 @@ import {
 	PlayerEventsAll,
 	PlayerEventsPage,
 	stringQuery,
+	SuccessErrorEnvelope,
 	TagFilters,
 	UNAUTHORIZED_RESPONSE,
 } from '../openapi'
+import { createReport } from '../reports-db'
 
 import type { Context } from 'hono'
 import type { PlayerEventResponsePayload } from '../../../notify/src/notification-payloads'
 import type { App } from '../context'
-import type { EventAttendeeRow, PlayerEvent } from '../events-db'
+import type { EventAttendeeRow, EventTag, PlayerEvent } from '../events-db'
 
 /** The notifications hub is a single global DO instance (see the `notify` worker). */
 const HUB_INSTANCE = 'global'
@@ -66,12 +70,16 @@ const HUB_INSTANCE = 'global'
  * must not fail the create. Note the frame carries the camelCase
  * {@link toEventNotification} projection, not the PascalCase record the response does.
  */
-async function notifyEventCreated(c: Context<App>, event: PlayerEvent): Promise<void> {
+async function notifyEventCreated(
+	c: Context<App>,
+	event: PlayerEvent,
+	tags: EventTag[]
+): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			event.CreatorPlayerId,
 			NotificationType.PlayerEventCreated,
-			{ ...toEventNotification(event) }
+			{ ...toEventNotification(event, tags) }
 		)
 	} catch (err) {
 		logger.error('failed to push PlayerEventCreated notification', {
@@ -301,13 +309,23 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			tags: ['Events'],
 			summary: 'Search player events',
 			description:
-				'The browse query on the player-events screen. `query` is matched ' +
-				'case-insensitively against the event name and description, term by term; an empty ' +
-				'query browses everything upcoming. Events that have already finished are left ' +
-				'out — a name match on something that ended last month is noise on a browse ' +
-				'screen. Soonest first, paginated via skip/take. A bare array.',
+				'The browse query on the player-events screen, term by term; an empty query ' +
+				'browses everything upcoming. A `#` decides how a term is matched: `#workshops` is ' +
+				'a TAG term, matching only events tagged `workshops` and never the word in a name ' +
+				'or description, which is what the filter chips send; a bare `workshops` is TEXT, ' +
+				'matched case-insensitively against the name and description. Every term must ' +
+				'match and the two kinds combine, so `#workshops trigonometry` is the ' +
+				'workshops-tagged events whose text also mentions trigonometry.\n\n' +
+				'Events that have already finished are left out — a name match on something that ' +
+				'ended last month is noise on a browse screen. Soonest first, paginated via ' +
+				'skip/take. A bare array.',
 			parameters: [
-				stringQuery('query', 'Search text; every term must match the name or description'),
+				stringQuery('query', 'Search terms; `#tag` matches a tag, anything else the text'),
+				stringQuery(
+					'sort',
+					'Accepted and echoed by the client as `StartTime`, which is the only order ' +
+						'served (soonest first); any other value sorts the same way'
+				),
 				...pageParams(50),
 			],
 			responses: { 200: json(PlayerEventDto.array(), 'The matching events') },
@@ -382,6 +400,69 @@ export const eventRoutes = new Hono<App>({ strict: false })
 
 			const updated = await setEventResponse(c.env.DB, eventId, id, type)
 			return updated === null ? c.body(null, 404) : c.json(toEventResult(updated))
+		}
+	)
+
+	// Report an event. Stored in the `report` table the player reports use — same fields,
+	// same moderation life — with `event_id` set. See migrations/0011_report_event.sql.
+	.post(
+		'/api/playerevents/v1/report',
+		describeRoute({
+			tags: ['Events', 'Moderation'],
+			summary: 'Report a player event',
+			description:
+				'Files a report against an event. Stored as a row in the same `report` table a ' +
+				'player report goes to (`POST /api/PlayerReporting/v3/create`) — it is the same ' +
+				'submission with the same moderation life, and a moderator converts either into a ' +
+				'ban the same way. What marks it as an event report is `event_id`; the row’s ' +
+				'`reported_player_id` is the event’s CREATOR (who a moderator would act against) ' +
+				'and its `room_id` the room the event runs in, both read from the event rather ' +
+				'than sent by the client.\n\n' +
+				'The reporter is the caller (from the bearer token), never a body field. Note this ' +
+				'body is JSON, where the player report’s is form-encoded. `ReportCategory` is ' +
+				'stored verbatim — the enum is not mapped here. Nothing dedupes the rows: ' +
+				'reporting the same event twice files two reports.\n\n' +
+				'Answers the same `{ success, error }` envelope as the player report, `error` ' +
+				'being an empty string rather than null, on the rejected branches too so there is ' +
+				'only one shape to parse.',
+			security: AUTHED,
+			requestBody: jsonBody(PlayerEventReportRequest, 'The report'),
+			responses: {
+				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
+				400: json(SuccessErrorEnvelope, 'No usable `PlayerEventId` in the body'),
+				401: UNAUTHORIZED_RESPONSE,
+				404: json(SuccessErrorEnvelope, 'No such event'),
+			},
+		}),
+		async (c) => {
+			const reporterId = await authedId(c)
+			if (reporterId === null) return unauthorized(c)
+
+			const body = await c.req
+				.json<{ PlayerEventId?: unknown; ReportCategory?: unknown; Details?: unknown }>()
+				.catch(() => ({}) as Record<string, unknown>)
+			const eventId = Number(body.PlayerEventId)
+			if (!Number.isInteger(eventId)) {
+				return c.json({ success: false, error: 'PlayerEventId is required' }, 400)
+			}
+
+			// The event supplies the two columns the client doesn't send. An unknown event is
+			// refused rather than filed against nobody: the row's reported player has to be
+			// someone, and a report naming an event that never existed isn't actionable.
+			const event = await getEventById(c.env.DB, eventId)
+			if (event === null) return c.json({ success: false, error: 'No such event' }, 404)
+
+			const category = Number(body.ReportCategory)
+			await createReport(c.env.DB, {
+				reporterPlayerId: reporterId,
+				reportedPlayerId: event.CreatorPlayerId,
+				reportCategory: Number.isInteger(category) ? category : 0,
+				details: typeof body.Details === 'string' ? body.Details : null,
+				roomId: event.RoomId > 0 ? event.RoomId : null,
+				eventId,
+			})
+
+			return c.json({ success: true, error: '' })
 		}
 	)
 
@@ -491,7 +572,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			// description silently is worse than refusing it.
 			if (eventInputRejection(input) !== null) return c.body(null, 400)
 			const event = await createEvent(c.env.DB, id, input)
-			await notifyEventCreated(c, event)
+			await notifyEventCreated(c, event, input.tags ?? [])
 			return c.json(toEventResult(event))
 		}
 	)
@@ -586,10 +667,12 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			},
 		}),
 		async (c) => {
-			const event = await getEventById(c.env.DB, Number.parseInt(c.req.param('eventId'), 10))
+			const eventId = Number.parseInt(c.req.param('eventId'), 10)
+			const event = await getEventById(c.env.DB, eventId)
 			if (event === null) return c.body(null, 404)
 			// The client sends `True`; accepted case-insensitively, and `1` alongside it.
 			const details = /^(true|1)$/i.test(c.req.query('includeDetails') ?? '')
-			return c.json(details ? { ...event, tags: [] } : event)
+			if (!details) return c.json(event)
+			return c.json({ ...event, tags: await getEventTags(c.env.DB, eventId) })
 		}
 	)

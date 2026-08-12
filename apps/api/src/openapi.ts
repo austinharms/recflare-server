@@ -542,6 +542,20 @@ export const PlayerEventRespondRequest = z.object({
 	Type: z.int().describe('0 Going, 1 Interested, 2 Can’t go'),
 })
 
+/**
+ * `POST /api/playerevents/v1/report` JSON body — a report against an event. JSON, note,
+ * where the player report next to it is form-encoded. The reporter is NOT in the body:
+ * it's the bearer token's player.
+ */
+export const PlayerEventReportRequest = z.object({
+	PlayerEventId: z.int().describe('The event being reported'),
+	ReportCategory: z
+		.int()
+		.optional()
+		.describe('The reason picked in the report UI, e.g. `101`. Stored verbatim; unmapped'),
+	Details: z.string().optional().describe('The free-text description the reporter typed'),
+})
+
 /** `POST /api/playerevents/v1/bulkInvite` JSON body — who to invite to which event. */
 export const PlayerEventBulkInviteRequest = z.object({
 	PlayerEventId: z.int(),

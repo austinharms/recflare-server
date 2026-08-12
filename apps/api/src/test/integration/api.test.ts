@@ -3099,6 +3099,71 @@ describe('player events', () => {
 		expect(await (await get('/api/playerevents/v1?skip=1&take=1')).json()).toEqual([feed[1]])
 	})
 
+	test('GET /api/playerevents/v1/search matches `#tag` terms against tags, not text', async () => {
+		const search = async (qs: string): Promise<PlayerEvent[]> =>
+			(await (await get(`/api/playerevents/v1/search${qs}`)).json()) as PlayerEvent[]
+
+		// Two tagged events, one of which only MENTIONS the word in its description.
+		const tagged = await create({
+			RoomId: 3,
+			Name: 'Sawdust Session',
+			StartTime: at(HOUR),
+			// Both forms in circulation: a bare name and the `{ tag, type }` pair.
+			Tags: ['#Workshops', { tag: 'meetup', type: 2 }],
+		})
+		const textOnly = await create({
+			RoomId: 3,
+			Name: 'Talking About Workshops',
+			Description: 'we discuss workshops, untagged',
+			StartTime: at(HOUR),
+		})
+
+		// `#workshops` is the tag alone — the untagged event that says "workshops" twice
+		// doesn't match.
+		const byTag = await search('?query=%23workshops&sort=StartTime')
+		expect(byTag.map((e) => e.PlayerEventId)).toEqual([tagged.PlayerEventId])
+		// …and the bare word is the mirror image: a text search, which finds the event that
+		// says "workshops" and NOT the one merely tagged with it.
+		const byText = await search('?query=workshops')
+		expect(byText.map((e) => e.PlayerEventId)).toEqual([textOnly.PlayerEventId])
+
+		// Tag terms combine with text terms, and with each other (every one must match).
+		expect((await search('?query=%23workshops+sawdust')).map((e) => e.PlayerEventId)).toEqual([
+			tagged.PlayerEventId,
+		])
+		expect(await search('?query=%23workshops+%23meetup')).toHaveLength(1)
+		expect(await search('?query=%23workshops+%23celebration')).toEqual([])
+		expect(await search('?query=%23nosuchtag')).toEqual([])
+
+		// The tags are what `includeDetails` serves — lowercased, `#` stripped, and the
+		// type kept (defaulting to 0 for the bare-string form).
+		const details = (await (
+			await get(`/api/playerevents/v1/${tagged.PlayerEventId}?includeDetails=True`)
+		).json()) as { tags: Array<{ tag: string; type: number }> }
+		expect(details.tags).toEqual([
+			{ tag: 'meetup', type: 2 },
+			{ tag: 'workshops', type: 0 },
+		])
+		// …and they are NOT on the plain record, which every other read serves verbatim.
+		expect(
+			await (await get(`/api/playerevents/v1/${tagged.PlayerEventId}`)).json()
+		).not.toHaveProperty('tags')
+
+		// An update REPLACES the set; a body that says nothing about tags leaves it alone.
+		await post(`/api/playerevents/v2/${tagged.PlayerEventId}`, { Tags: ['celebration'] })
+		expect((await search('?query=%23celebration')).map((e) => e.PlayerEventId)).toEqual([
+			tagged.PlayerEventId,
+		])
+		expect(await search('?query=%23workshops')).toEqual([])
+		await post(`/api/playerevents/v2/${tagged.PlayerEventId}`, { Name: 'Sawdust Session II' })
+		expect((await search('?query=%23celebration')).map((e) => e.PlayerEventId)).toEqual([
+			tagged.PlayerEventId,
+		])
+		// An explicit empty list does clear them.
+		await post(`/api/playerevents/v2/${tagged.PlayerEventId}`, { Tags: [] })
+		expect(await search('?query=%23celebration')).toEqual([])
+	})
+
 	test('GET /api/playerevents/v1/searchlive serves what is running right now', async () => {
 		const res = await get('/api/playerevents/v1/searchlive')
 		expect(res.status).toBe(200)
@@ -3261,6 +3326,53 @@ describe('player events', () => {
 		expect(
 			(await post('/api/playerevents/v1/respond', { PlayerEventId: 999999, Type: 0 })).status
 		).toBe(404)
+	})
+
+	test('POST /api/playerevents/v1/report files a report row against the event', async () => {
+		const event = await create({ RoomId: 58, Name: 'Reportable', StartTime: at(HOUR) }, '43')
+
+		const res = await post(
+			'/api/playerevents/v1/report',
+			{ ReportCategory: 101, PlayerEventId: event.PlayerEventId, Details: 'bad event' },
+			'42'
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		// One row in the shared report table, marked as an event report by `event_id` —
+		// with the reported player and the room filled in FROM the event, not the body.
+		const row = await env.DB.prepare('SELECT * FROM report WHERE event_id = ?1')
+			.bind(event.PlayerEventId)
+			.first<Record<string, unknown>>()
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 43, // the event's creator
+			report_category: 101,
+			details: 'bad event',
+			room_id: 58,
+			event_id: event.PlayerEventId,
+			banned: 0, // filed unbanned, like any report
+		})
+
+		// A body with no usable event id, and one naming an event that doesn't exist —
+		// both answer the same envelope shape as the success branch.
+		expect(await (await post('/api/playerevents/v1/report', { Details: 'x' })).json()).toEqual({
+			success: false,
+			error: 'PlayerEventId is required',
+		})
+		const unknown = await post('/api/playerevents/v1/report', { PlayerEventId: 999999 })
+		expect(unknown.status).toBe(404)
+		expect(await unknown.json()).toEqual({ success: false, error: 'No such event' })
+
+		// Auth-gated: the reporter comes from the token, so there's no filing one signed out.
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/api/playerevents/v1/report`, {
+					method: 'POST',
+					body: JSON.stringify({ PlayerEventId: event.PlayerEventId }),
+				})
+			).status
+		).toBe(401)
 	})
 
 	test('POST /api/playerevents/v1/bulkInvite adds invitees as Going without overwriting answers', async () => {
@@ -3552,6 +3664,7 @@ describe('openapi', () => {
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
 			'POST /api/playerevents/v1/bulkInvite',
+			'POST /api/playerevents/v1/report',
 			'POST /api/playerevents/v1/respond',
 			'POST /api/playerevents/v2',
 			'POST /api/playerevents/v2/{eventId}',
