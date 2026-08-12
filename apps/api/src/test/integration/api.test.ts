@@ -940,6 +940,52 @@ describe('public endpoints', () => {
 		expect(await batch('')).toEqual([])
 	})
 
+	test('GET /api/inventions/v1/fulllineageowner answers for the whole set of ids', async () => {
+		const save = async (sub: string, name: string): Promise<SavedInvention> => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name, inventionDataFilename: 'a.inv' }),
+			})
+			expect(res.status).toBe(200)
+			return ((await res.json()) as InventionSaveResult).Invention
+		}
+		const owns = async (query: string, sub: string): Promise<unknown> => {
+			const res = await exports.default.fetch(
+				`${ORIGIN}/api/inventions/v1/fulllineageowner?${query}`,
+				{ headers: await bearer(sub) }
+			)
+			expect(res.status).toBe(200)
+			return await res.json()
+		}
+
+		// 7301 makes two; 7302 makes one and buys one of 7301's.
+		const own = await save('7301', 'Lineage Root')
+		const nested = await save('7301', 'Lineage Nested')
+		const others = await save('7302', 'Someone Elses')
+		await grantInvention(env.DB, 7302, nested.InventionId)
+
+		// The creator owns their own lineage; one invention that isn't theirs sinks it.
+		expect(await owns(`id=${own.InventionId}&id=${nested.InventionId}`, '7301')).toBe(true)
+		expect(
+			await owns(`id=${own.InventionId}&id=${nested.InventionId}&id=${others.InventionId}`, '7301')
+		).toBe(false)
+
+		// Bought counts as owned, and comma-separated ids parse like the batch endpoint.
+		expect(await owns(`id=${nested.InventionId},${others.InventionId}`, '7302')).toBe(true)
+		expect(await owns(`id=${own.InventionId}`, '7302')).toBe(false)
+
+		// An id with no invention behind it is not owned, whoever asks.
+		expect(await owns(`id=${own.InventionId}&id=999999`, '7301')).toBe(false)
+		// No ids at all: nothing in an empty lineage is unowned.
+		expect(await owns('', '7301')).toBe(true)
+	})
+
+	test('GET /api/inventions/v1/fulllineageowner 401s without a bearer token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fulllineageowner?id=1`)
+		expect(res.status).toBe(401)
+	})
+
 	test('GET /api/inventions/v1/room lists a room’s published inventions', async () => {
 		// Two inventions created in room 76, one of them still a draft.
 		const create = async (name: string, room: number): Promise<SavedInvention> => {
@@ -1149,6 +1195,42 @@ describe('public endpoints', () => {
 			`${ORIGIN}/api/inventions/v1/update?inventionId=${Invention.InventionId}&description=x`
 		)
 		expect(anon.status).toBe(401)
+	})
+
+	test('POST /api/inventions/v1/update takes the permission picker’s query params', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('3232')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Posted Lamp', inventionDataFilename: 'a.inv' }),
+		})
+		const { Invention } = (await save.json()) as InventionSaveResult
+		const post = async (query: string, sub = '3232'): Promise<Response> =>
+			exports.default.fetch(
+				`${ORIGIN}/api/inventions/v1/update?inventionId=${Invention.InventionId}&${query}`,
+				{ method: 'POST', headers: await bearer(sub) }
+			)
+
+		// The picker posts the permission by CamelCase name, with no body at all.
+		const permission = async (name: string): Promise<number> => {
+			const res = await post(`permission=${name}`)
+			expect(res.status).toBe(200)
+			return ((await res.json()) as InventionSaveResult).Invention.GeneralPermission
+		}
+		expect(await permission('UseOnly')).toBe(20)
+		expect(await permission('EditAndSave')).toBe(40)
+		expect(await permission('Publish')).toBe(60)
+
+		// Setting the permission is not publishing — that stays v3/publish's job.
+		const still = await post('permission=Publish')
+		expect(((await still.json()) as InventionSaveResult).Invention.IsPublished).toBe(false)
+
+		// Same gate as the GET: creator only, and a token is required.
+		expect((await post('permission=UseOnly', '9999')).status).toBe(403)
+		const anonPost = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/update?inventionId=${Invention.InventionId}&permission=Publish`,
+			{ method: 'POST' }
+		)
+		expect(anonPost.status).toBe(401)
 	})
 
 	test('GET /api/inventions/v3/publish publishes + prices; search then lists it', async () => {
@@ -3166,7 +3248,8 @@ describe('openapi', () => {
 		// Every route the worker serves is described. This is the drift guard: adding a
 		// route without a describeRoute() block fails here rather than silently shipping
 		// an incomplete spec. Hono's `:param` syntax becomes OpenAPI's `{param}`; the
-		// `.on(['GET','POST'], …)` relationship routes contribute both methods.
+		// `.on(['GET','POST'], …)` routes (the relationship mutations, invention update)
+		// contribute both methods.
 		const documented = new Set(
 			Object.entries(spec.paths).flatMap(([path, ops]) =>
 				Object.keys(ops).map((method) => `${method.toUpperCase()} ${path}`)
@@ -3203,6 +3286,7 @@ describe('openapi', () => {
 			'GET /api/inventions/v1',
 			'GET /api/inventions/v1/details',
 			'GET /api/inventions/v1/featured',
+			'GET /api/inventions/v1/fulllineageowner',
 			'GET /api/inventions/v1/personaldetails/{inventionId}',
 			'GET /api/inventions/v1/room',
 			'GET /api/inventions/v1/tagfilters',
@@ -3256,6 +3340,7 @@ describe('openapi', () => {
 			'POST /api/images/v1/cheer',
 			'POST /api/images/v4/uploadsaved',
 			'POST /api/inventions/v1/settags',
+			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
 			'POST /api/inventions/v6/save',
 			'POST /api/messages/v1/sendMultiple',
