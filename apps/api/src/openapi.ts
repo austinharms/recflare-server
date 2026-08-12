@@ -436,6 +436,15 @@ export const KeepsakeConfig = z.object({
 })
 
 /**
+ * `GET /api/keepsakes/categories` — the keepsake catalog, as a counted result set
+ * rather than the bare list the stubs around it serve. Empty until a catalog exists.
+ */
+export const KeepsakeCategories = z.object({
+	Results: JsonArray.describe('The categories — empty, as no keepsake catalog is stored'),
+	TotalResults: z.int().describe('How many results `Results` carries'),
+})
+
+/**
  * A scheduled player event (Rec Room's `PlayerEvent`) — the record every read endpoint
  * serves verbatim. The `State` / `Accessibility` / `*Permissions` ints are stored and
  * echoed as the client sends them; their enums aren't reversed yet.
@@ -460,6 +469,19 @@ export const PlayerEventDto = z.object({
 	CanRequestBroadcastPermissions: z.int(),
 })
 
+/**
+ * `GET /api/playerevents/v1` — the browse feed's listing. The same record minus
+ * `State`, plus a `BroadcastingRoomInstanceId` (always null — nothing broadcasts an
+ * event yet). That's the shape observed on this endpoint; the other reads serve the
+ * stored record verbatim, so don't unify the two.
+ */
+export const PlayerEventListingDto = PlayerEventDto.omit({ State: true }).extend({
+	BroadcastingRoomInstanceId: z
+		.int()
+		.nullable()
+		.describe('Always null — no event broadcasts to a room instance yet'),
+})
+
 /** The `{ Result, TagModifyResult, PlayerEvent }` envelope the event writes answer with. */
 export const PlayerEventResultDto = z.object({
 	Result: z.int().describe('0 = success'),
@@ -482,6 +504,23 @@ export const PlayerEventRequest = PlayerEventDto.partial().extend({
 		.unknown()
 		.optional()
 		.describe('The event’s fields, if nested rather than posted at the top level'),
+})
+
+/**
+ * `GET /api/playerevents/v1/:eventId/responses` — one player's RSVP to one event, as
+ * the guest list serves it.
+ */
+export const PlayerEventResponseDto = z.object({
+	PlayerEventResponseId: z.int().describe('Stable id of the RSVP row'),
+	PlayerEventId: z.int(),
+	PlayerId: z.int(),
+	CreatedAt: z
+		.string()
+		.describe(
+			'When the answer that stands was given — a changed answer updates the row, so this ' +
+				'moves with it rather than recording the player’s first response'
+		),
+	Type: z.int().describe('0 Going, 1 Interested, 2 Can’t go'),
 })
 
 /** `POST /api/playerevents/v1/respond` JSON body — how the caller is answering. */

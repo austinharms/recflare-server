@@ -73,12 +73,47 @@ export function isEventResponseType(value: number): boolean {
 	return EVENT_RESPONSE_VALUES.includes(value)
 }
 
-/** One player's answer to one event. */
+/**
+ * One player's answer to one event.
+ *
+ * `id` is the row's SQLite `rowid` — the table has a composite primary key, so it's a
+ * rowid table and the implicit id is free. It's what the RSVP list serves as
+ * `PlayerEventResponseId`, and it's stable: a changed answer is an UPDATE through the
+ * composite key (same rowid), and nothing ever deletes an RSVP row.
+ */
 export interface EventAttendeeRow {
+	id: number
 	event_id: number
 	player_id: number
 	status: number
 	responded_at: string
+}
+
+/**
+ * One RSVP as `GET /api/playerevents/v1/:eventId/responses` serves it — the PascalCase
+ * projection of an `event_attendee` row.
+ *
+ * `CreatedAt` is the stored `responded_at`, so it's the time of the answer CURRENTLY
+ * recorded, not of the player's first one: changing your mind updates the row in place
+ * (one row per player per event), and the client shows the answer that stands.
+ */
+export interface PlayerEventResponse {
+	PlayerEventResponseId: number
+	PlayerEventId: number
+	PlayerId: number
+	CreatedAt: string
+	Type: number
+}
+
+/** Project an RSVP row into the response the RSVP list serves. */
+export function toEventResponse(row: EventAttendeeRow): PlayerEventResponse {
+	return {
+		PlayerEventResponseId: row.id,
+		PlayerEventId: row.event_id,
+		PlayerId: row.player_id,
+		CreatedAt: row.responded_at,
+		Type: row.status,
+	}
 }
 
 /**
@@ -168,6 +203,27 @@ export interface PlayerEventNotification {
 	defaultBroadcastPermissions: number
 	canRequestBroadcastPermissions: number
 	broadcastingRoomInstanceId: number | null
+}
+
+/**
+ * The projection the browse feed (`GET /api/playerevents/v1`) serves. PascalCase like
+ * the stored record, but not identical to it — don't unify them:
+ *
+ * - it drops `State`, which the feed does not carry;
+ * - it carries `BroadcastingRoomInstanceId`, which the record has no field for (nothing
+ *   broadcasts an event yet, so it is always null).
+ *
+ * That's the shape observed on this endpoint; the by-id / bulk / search reads serve the
+ * stored record verbatim and keep `State`.
+ */
+export interface PlayerEventListing extends Omit<PlayerEvent, 'State'> {
+	BroadcastingRoomInstanceId: number | null
+}
+
+/** Project a stored event into the browse feed's listing. */
+export function toEventListing(event: PlayerEvent): PlayerEventListing {
+	const { State: _State, ...rest } = event
+	return { ...rest, BroadcastingRoomInstanceId: null }
 }
 
 /** Pad a stored timestamp out to .NET tick precision (seven fractional digits). */
@@ -438,18 +494,26 @@ export async function getEventResponse(
 	playerId: number
 ): Promise<EventAttendeeRow | null> {
 	return db
-		.prepare('SELECT * FROM event_attendee WHERE event_id = ?1 AND player_id = ?2')
+		.prepare('SELECT rowid AS id, * FROM event_attendee WHERE event_id = ?1 AND player_id = ?2')
 		.bind(eventId, playerId)
 		.first<EventAttendeeRow>()
 }
 
-/** Everyone who answered an event, in the order they responded. Backs a future guest list. */
+/**
+ * Everyone who answered an event, in the order they responded — the guest list behind
+ * `GET /api/playerevents/v1/:eventId/responses`. Ties on the timestamp (the creator's
+ * own Going row shares its second with a fast first RSVP) break on the player id, so
+ * the order is stable.
+ */
 export async function getEventAttendees(
 	db: D1Database,
 	eventId: number
 ): Promise<EventAttendeeRow[]> {
 	const { results } = await db
-		.prepare('SELECT * FROM event_attendee WHERE event_id = ?1 ORDER BY responded_at, player_id')
+		.prepare(
+			`SELECT rowid AS id, * FROM event_attendee
+			 WHERE event_id = ?1 ORDER BY responded_at, player_id`
+		)
 		.bind(eventId)
 		.all<EventAttendeeRow>()
 	return results

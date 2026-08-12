@@ -457,12 +457,14 @@ describe('public endpoints', () => {
 		expect(await res.json()).toMatchObject({ KeepsakeFeatureEnabled: true })
 	})
 
-	test('GET /api/keepsakes/rooms/:id returns 204; categories returns []', async () => {
+	test('GET /api/keepsakes/rooms/:id returns 204; categories returns an empty result set', async () => {
 		const room = await exports.default.fetch(`${ORIGIN}/api/keepsakes/rooms/1`)
 		expect(room.status).toBe(204)
+		// A result set, not a list: the client parses this one as an object and an array
+		// fails it outright ("expected '{', actual '['").
 		const cats = await exports.default.fetch(`${ORIGIN}/api/keepsakes/categories`)
 		expect(cats.status).toBe(200)
-		expect(await cats.json()).toEqual([])
+		expect(await cats.json()).toEqual({ Results: [], TotalResults: 0 })
 	})
 
 	test('GET /voice/config returns an object', async () => {
@@ -3056,6 +3058,30 @@ describe('player events', () => {
 		expect(await search('?skip=1&take=1')).toEqual([all[1]])
 	})
 
+	test('GET /api/playerevents/v1 serves the browse feed as listings', async () => {
+		const res = await get('/api/playerevents/v1')
+		expect(res.status).toBe(200)
+		const feed = (await res.json()) as Array<PlayerEvent & { BroadcastingRoomInstanceId: null }>
+
+		// Upcoming and live, soonest first; what has already ended is left out.
+		const ids = feed.map((e) => e.PlayerEventId)
+		expect(ids).toContain(upcoming.PlayerEventId)
+		expect(ids).toContain(liveEvent.PlayerEventId)
+		expect(ids).not.toContain(pastEvent.PlayerEventId)
+		const starts = feed.map((e) => e.StartTime)
+		expect([...starts].sort()).toEqual(starts)
+
+		// The listing projection — no `State`, and a null broadcasting instance — not the
+		// stored record the by-id read serves.
+		const entry = feed.find((e) => e.PlayerEventId === upcoming.PlayerEventId)!
+		expect(entry).toEqual({ ...upcoming, State: undefined, BroadcastingRoomInstanceId: null })
+		expect(Object.hasOwn(entry, 'State')).toBe(false)
+
+		// Paged like the other feeds.
+		expect(await (await get('/api/playerevents/v1?take=1')).json()).toEqual([feed[0]])
+		expect(await (await get('/api/playerevents/v1?skip=1&take=1')).json()).toEqual([feed[1]])
+	})
+
 	test('GET /api/playerevents/v1/searchlive serves what is running right now', async () => {
 		const res = await get('/api/playerevents/v1/searchlive')
 		expect(res.status).toBe(200)
@@ -3147,6 +3173,53 @@ describe('player events', () => {
 		// And the count sticks on the stored event, not just the response.
 		const fetched = (await (await get(`/api/playerevents/v1/${id}`)).json()) as PlayerEvent
 		expect(fetched.AttendeeCount).toBe(1)
+	})
+
+	test('GET /api/playerevents/v1/:eventId/responses lists every RSVP, one per player', async () => {
+		const event = await create({ RoomId: 3, Name: 'Guest List', StartTime: at(HOUR) })
+		const id = event.PlayerEventId
+		const responses = async (): Promise<
+			Array<{
+				PlayerEventResponseId: number
+				PlayerEventId: number
+				PlayerId: number
+				CreatedAt: string
+				Type: number
+			}>
+		> => (await (await get(`/api/playerevents/v1/${id}/responses`)).json()) as never
+
+		// The creator's own Going row, from create.
+		const initial = await responses()
+		expect(initial).toEqual([
+			{
+				PlayerEventResponseId: expect.any(Number),
+				PlayerEventId: id,
+				PlayerId: 42,
+				CreatedAt: expect.stringMatching(/^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/),
+				Type: 0,
+			},
+		])
+
+		// Declines and maybes are listed too — not just what AttendeeCount counts.
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 2 }, '43')
+		const withDecline = await responses()
+		expect(withDecline.map((r) => [r.PlayerId, r.Type])).toEqual([
+			[42, 0],
+			[43, 2],
+		])
+
+		// Changing an answer updates the row in place: same id, new Type — never a second
+		// entry for the player.
+		await post('/api/playerevents/v1/respond', { PlayerEventId: id, Type: 1 }, '43')
+		const changed = await responses()
+		expect(changed).toHaveLength(2)
+		expect(changed[1]!.PlayerEventResponseId).toBe(withDecline[1]!.PlayerEventResponseId)
+		expect(changed[1]!.Type).toBe(1)
+
+		// An unknown event is an empty list, not a 404 — like the other list reads.
+		const unknown = await get('/api/playerevents/v1/999999/responses')
+		expect(unknown.status).toBe(200)
+		expect(await unknown.json()).toEqual([])
 	})
 
 	test('POST /api/playerevents/v1/respond rejects a bad body, an unknown event and no token', async () => {
@@ -3304,6 +3377,7 @@ describe('openapi', () => {
 			'GET /api/messages/v2/get',
 			'GET /api/playerReputation/v1/{id}',
 			'GET /api/playerReputation/v2/bulk',
+			'GET /api/playerevents/v1',
 			'GET /api/playerevents/v1/all',
 			'GET /api/playerevents/v1/bulk',
 			'GET /api/playerevents/v1/club/{clubId}',
@@ -3312,6 +3386,7 @@ describe('openapi', () => {
 			'GET /api/playerevents/v1/searchlive',
 			'GET /api/playerevents/v1/tagfilters',
 			'GET /api/playerevents/v1/{eventId}',
+			'GET /api/playerevents/v1/{eventId}/responses',
 			'GET /api/players/v1/progression/{id}',
 			'GET /api/players/v2/progression/bulk',
 			'GET /api/quickPlay/v1/getandclear',

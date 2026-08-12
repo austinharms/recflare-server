@@ -8,6 +8,7 @@ import { logger } from '@repo/hono-helpers'
 import { NotificationType } from '../../../notify/src/notification-types'
 import {
 	createEvent,
+	getEventAttendees,
 	getEventById,
 	getEventsByClubs,
 	getEventsByCreator,
@@ -18,6 +19,8 @@ import {
 	parseEventBody,
 	searchEvents,
 	setEventResponse,
+	toEventListing,
+	toEventResponse,
 	toEventNotification,
 	toEventResult,
 	updateEvent,
@@ -31,8 +34,10 @@ import {
 	jsonBody,
 	pageParams,
 	PlayerEventDto,
+	PlayerEventListingDto,
 	PlayerEventRequest,
 	PlayerEventRespondRequest,
+	PlayerEventResponseDto,
 	PlayerEventResultDto,
 	PlayerEventsAll,
 	PlayerEventsPage,
@@ -83,6 +88,33 @@ async function notifyEventCreated(c: Context<App>, event: PlayerEvent): Promise<
  * if they're unified.
  */
 export const eventRoutes = new Hono<App>({ strict: false })
+	// The player-events browse feed — everything upcoming or running, soonest first. Same
+	// query `/search` runs with no text, but its own projection: this feed drops `State`
+	// and carries a `BroadcastingRoomInstanceId`, so it goes through `toEventListing`.
+	.get(
+		'/api/playerevents/v1',
+		describeRoute({
+			tags: ['Events'],
+			summary: 'The player-events browse feed',
+			description:
+				'The default feed on the player-events screen: every event that has not finished ' +
+				'yet — upcoming and running — soonest first, paginated via skip/take. A bare ' +
+				'array.\n\n' +
+				'Each entry is the browse LISTING, not the stored record the by-id, bulk and ' +
+				'search reads serve: it drops `State` and carries ' +
+				'`BroadcastingRoomInstanceId` (always null — nothing broadcasts an event yet). ' +
+				'That is the shape observed on this endpoint; keep the two projections apart.',
+			parameters: pageParams(50),
+			responses: { 200: json(PlayerEventListingDto.array(), 'The events that have not ended') },
+		}),
+		async (c) => {
+			const skip = Number.parseInt(c.req.query('skip') ?? '', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '', 10) || 50
+			const events = await searchEvents(c.env.DB, '', skip, take)
+			return c.json(events.map(toEventListing))
+		}
+	)
+
 	.get(
 		'/api/playerevents/v1/all',
 		describeRoute({
@@ -387,6 +419,29 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			const updated = await updateEvent(c.env.DB, eventId, input)
 			// updateEvent only returns null when the row vanished, which the read above rules out.
 			return c.json(toEventResult(updated!))
+		}
+	)
+
+	// An event's guest list — every RSVP row, whatever the answer.
+	.get(
+		'/api/playerevents/v1/:eventId{[0-9]+}/responses',
+		describeRoute({
+			tags: ['Events'],
+			summary: 'An event’s RSVPs',
+			description:
+				'Every answer given to an event, in the order they were given — declines and ' +
+				'maybes included, not just the Going rows `AttendeeCount` counts. One entry per ' +
+				'player: a player who changed their mind has one row carrying the answer that ' +
+				'stands, and `CreatedAt` moves with it.\n\n' +
+				'A bare array, and an unknown event is an empty one rather than a 404 — like the ' +
+				'other list reads here. An event always has at least its creator’s Going row.',
+			parameters: [idParam('eventId', 'Event id')],
+			responses: { 200: json(PlayerEventResponseDto.array(), 'The event’s RSVPs') },
+		}),
+		async (c) => {
+			const eventId = Number.parseInt(c.req.param('eventId'), 10)
+			const attendees = await getEventAttendees(c.env.DB, eventId)
+			return c.json(attendees.map(toEventResponse))
 		}
 	)
 

@@ -11,6 +11,7 @@ import {
 	JsonArray,
 	jsonBody,
 	JsonObject,
+	KeepsakeCategories,
 	KeepsakeConfig,
 	SanitizeRequest,
 	stringParam,
@@ -97,15 +98,25 @@ export const gameplayRoutes = new Hono<App>({ strict: false })
 		}),
 		(c) => c.body(null, 204)
 	)
+	// A counted result set, NOT the bare list the stubs around it serve: the client parses
+	// this one as an object and an array fails it outright — "expected:'{', actual:'[', at
+	// offset:0", logged as "Failed to get keepsake categories" — which takes the keepsake
+	// load down with it. `TotalResults` is the length of `Results`, not a total behind a
+	// page; the reference returns `results.Length`.
 	.get(
 		'/api/keepsakes/categories',
 		describeRoute({
 			tags: ['Gameplay'],
 			summary: 'Keepsake categories',
-			description: 'No keepsake catalog yet, so this is an empty list.',
-			responses: { 200: json(JsonArray, 'An empty list') },
+			description:
+				'No keepsake catalog yet, so the result set is empty — but it IS a result set ' +
+				'(`{ Results, TotalResults }`), not the empty list the stubs around it serve. ' +
+				'The client parses this one as an object and fails on an array ("expected \'{\', ' +
+				'actual \'[\'"), taking the keepsake load down with it. `TotalResults` counts ' +
+				'`Results` itself — there is no paging here.',
+			responses: { 200: json(KeepsakeCategories, 'An empty result set') },
 		}),
-		(c) => c.json([])
+		(c) => c.json({ Results: [], TotalResults: 0 })
 	)
 
 	// ---- Objectives / events / rewards ---------------------------------------
