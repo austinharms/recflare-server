@@ -47,6 +47,8 @@ import { banEvasionMatch, resolveBan } from '../../api/src/bans-db'
 import { NotificationType } from '../../notify/src/notification-types'
 import {
 	AUTHED,
+	AvoidJuniorsRequest,
+	AvoidJuniorsResponse,
 	EMPTY_OK,
 	ExclusiveLoginResponse,
 	form,
@@ -131,6 +133,113 @@ async function authedId(c: Context<App>): Promise<number | null> {
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
 	return c.body(null, 401)
+}
+
+/**
+ * The "avoid juniors" preference, normalized. The player's settings are a free-form
+ * `{ key: value }` bag written by the client through the `playersettings` worker, and the
+ * exact spelling it writes this key under is reverse-engineered — so the lookup is
+ * case- and separator-insensitive (`AvoidJuniors`, `avoidjuniors`, `AVOID_JUNIORS` all
+ * resolve to this one preference) rather than betting on one casing and silently reading
+ * false forever if it's wrong.
+ */
+const AVOID_JUNIORS_SETTING = 'avoidjuniors'
+
+/**
+ * The spelling a NEW setting is written under. Only used when the player's map doesn't
+ * already carry the key under some other spelling — the write overwrites whichever one is
+ * there, so a player never ends up with two keys for the one preference (which would make
+ * the read depend on their order in the map).
+ */
+const AVOID_JUNIORS_KEY = 'AvoidJuniors'
+
+/** Lowercase and drop separators, so keys compare on their letters alone. */
+function normalizeSettingKey(key: string): string {
+	return key.toLowerCase().replaceAll(/[^a-z0-9]/g, '')
+}
+
+/** The player's existing spelling of the setting key, if their map has one. */
+function findAvoidJuniorsKey(stored: Record<string, unknown>): string | undefined {
+	return Object.keys(stored).find((key) => normalizeSettingKey(key) === AVOID_JUNIORS_SETTING)
+}
+
+/**
+ * Settings values are strings, so a boolean arrives as `True`/`false`/`1`/`0` (the client
+ * isn't consistent about which). `undefined` for anything unrecognized, which the read and
+ * the write treat differently: a stored value that won't parse is a false preference, but a
+ * posted one that won't parse is a body worth ignoring rather than a write of `false`.
+ */
+function parseSettingBool(value: unknown): boolean | undefined {
+	if (typeof value === 'boolean') return value
+	switch (String(value).trim().toLowerCase()) {
+		case 'true':
+		case '1':
+		case 'yes':
+			return true
+		case 'false':
+		case '0':
+		case 'no':
+			return false
+		default:
+			return undefined
+	}
+}
+
+/** The player's settings map from the KV the `playersettings` worker owns. */
+async function getPlayerSettings(
+	env: Env,
+	accountId: number
+): Promise<Record<string, string> | null> {
+	return env.RECFLARE_PLAYER_SETTINGS.get<Record<string, string>>(
+		`player:${accountId}`,
+		'json'
+	).catch(() => null)
+}
+
+/**
+ * Read a player's "avoid juniors" preference. Absent settings, an absent key, and an
+ * unparseable value are all false: the client asks this before matchmaking, so a read that
+ * can't answer must not keep a player out of rooms.
+ */
+async function readAvoidJuniors(env: Env, accountId: number): Promise<boolean> {
+	const stored = await getPlayerSettings(env, accountId)
+	if (!stored) return false
+
+	const key = findAvoidJuniorsKey(stored)
+	return key === undefined ? false : (parseSettingBool(stored[key]) ?? false)
+}
+
+/**
+ * Write a player's "avoid juniors" preference back into their settings map.
+ *
+ * The write MERGES, exactly as the `playersettings` worker's own PUT does: the map holds
+ * every setting the player has (OOBE state, tutorial mask, …), so storing this one on its
+ * own would wipe the rest. Read-modify-write on KV isn't atomic, but the same is true of
+ * the settings worker, and two writers racing over one player's own settings means that
+ * player toggling two options in the same instant.
+ */
+async function writeAvoidJuniors(env: Env, accountId: number, value: boolean): Promise<void> {
+	const stored = (await getPlayerSettings(env, accountId)) ?? {}
+	const merged: Record<string, string> = { ...stored }
+	merged[findAvoidJuniorsKey(merged) ?? AVOID_JUNIORS_KEY] = value ? 'True' : 'False'
+	await env.RECFLARE_PLAYER_SETTINGS.put(`player:${accountId}`, JSON.stringify(merged))
+}
+
+/**
+ * The posted preference, out of a form (`avoidJuniors=True`, what the client sends) or a
+ * JSON body. The field name is matched the same loose way the stored key is, so the casing
+ * the client picks can't silently miss. `undefined` when the body carries no readable
+ * value — the caller leaves the setting alone rather than writing a guess.
+ */
+async function readAvoidJuniorsBody(c: Context<App>): Promise<boolean | undefined> {
+	const contentType = c.req.header('content-type') ?? ''
+	const body = contentType.includes('application/json')
+		? await c.req.json<unknown>().catch(() => null)
+		: await c.req.parseBody().catch(() => null)
+	if (body === null || typeof body !== 'object') return undefined
+
+	const key = findAvoidJuniorsKey(body as Record<string, unknown>)
+	return key === undefined ? undefined : parseSettingBool((body as Record<string, unknown>)[key])
 }
 
 /** A synthesized room instance (same shape for dorm and other rooms). */
@@ -1005,6 +1114,68 @@ const app = new Hono<App>()
 				}
 			}
 			return c.body(null, 200)
+		}
+	)
+
+	// The caller's "avoid juniors" preference. It's asked of this worker because it's a
+	// matchmaking question, but it isn't matchmaking state: the setting is written by the
+	// client through the `playersettings` worker, so this reads that worker's KV map
+	// directly (read-only) rather than keeping a second copy of the same toggle here.
+	.get(
+		'/player/avoidjuniors',
+		describeRoute({
+			tags: ['Player settings'],
+			summary: 'The player’s “avoid juniors” preference',
+			description: [
+				'Whether the authenticated player asked to be kept away from junior accounts, read',
+				'from their settings map in the `playersettings` KV. The body is a bare JSON boolean',
+				'(`true`/`false`), not an envelope. A player who never set it reads `false`.',
+			].join(' '),
+			security: AUTHED,
+			responses: {
+				200: json(AvoidJuniorsResponse, 'The preference; `false` when never set'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			return c.json(await readAvoidJuniors(c.env, id))
+		}
+	)
+
+	// Set the preference. Answers the RESULTING value rather than an empty ack, the way the
+	// GET does — the client has just changed a toggle it renders, and a body it can read
+	// back can't disagree with what was stored.
+	.put(
+		'/player/avoidjuniors',
+		describeRoute({
+			tags: ['Player settings'],
+			summary: 'Set the player’s “avoid juniors” preference',
+			description: [
+				'Stores the posted preference in the authenticated player’s settings map (the',
+				'`playersettings` KV) and answers the resulting value as a bare JSON boolean. The',
+				'write merges, so the player’s other settings are left alone. A body with no readable',
+				'`avoidJuniors` value leaves the setting as it was and answers the stored value — a',
+				'no-op 200, not a 400.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(AvoidJuniorsRequest, 'The preference to store'),
+			responses: {
+				200: json(AvoidJuniorsResponse, 'The preference now stored'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const posted = await readAvoidJuniorsBody(c)
+			if (posted === undefined) return c.json(await readAvoidJuniors(c.env, id))
+
+			await writeAvoidJuniors(c.env, id, posted)
+			return c.json(posted)
 		}
 	)
 

@@ -279,6 +279,145 @@ describe('public endpoints', () => {
 		expect(players[0]).toMatchObject({ playerId: 1, isOnline: true, appVersion: GAME_VERSION })
 	})
 
+	// The "avoid juniors" preference lives in the playersettings KV map, not in presence.
+	// The body is a BARE boolean — the client reads the whole body as the value.
+	describe('GET /player/avoidjuniors', () => {
+		const settings = async (playerId: number, map: Record<string, string>) =>
+			env.RECFLARE_PLAYER_SETTINGS.put(`player:${playerId}`, JSON.stringify(map))
+
+		const read = async (playerId: number) => {
+			const res = await exports.default.fetch(`${ORIGIN}/player/avoidjuniors`, {
+				headers: await bearer(String(playerId)),
+			})
+			expect(res.status).toBe(200)
+			return res.json()
+		}
+
+		test('reads the stored setting', async () => {
+			await settings(3100, { AvoidJuniors: 'True', 'Recroom.OOBE': '77' })
+			expect(await read(3100)).toBe(true)
+
+			await settings(3101, { AvoidJuniors: 'False' })
+			expect(await read(3101)).toBe(false)
+		})
+
+		test('the key match ignores casing and separators', async () => {
+			await settings(3102, { AVOID_JUNIORS: '1' })
+			expect(await read(3102)).toBe(true)
+
+			await settings(3103, { avoidjuniors: 'yes' })
+			expect(await read(3103)).toBe(true)
+		})
+
+		// A player who never touched the setting, and one whose value is junk, both read
+		// false — the read gates matchmaking, so it must not fail closed.
+		test('defaults to false when unset or unparseable', async () => {
+			expect(await read(3104)).toBe(false)
+
+			await settings(3105, { 'Recroom.OOBE': '77' })
+			expect(await read(3105)).toBe(false)
+
+			await settings(3106, { AvoidJuniors: 'maybe' })
+			expect(await read(3106)).toBe(false)
+		})
+
+		test('is auth-gated', async () => {
+			const res = await exports.default.fetch(`${ORIGIN}/player/avoidjuniors`)
+			expect(res.status).toBe(401)
+		})
+	})
+
+	describe('PUT /player/avoidjuniors', () => {
+		const stored = async (playerId: number) =>
+			env.RECFLARE_PLAYER_SETTINGS.get<Record<string, string>>(`player:${playerId}`, 'json')
+
+		const write = async (playerId: number, body: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/player/avoidjuniors`, {
+				method: 'PUT',
+				headers: {
+					...(await bearer(String(playerId))),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body,
+			})
+			expect(res.status).toBe(200)
+			return res.json()
+		}
+
+		const read = async (playerId: number) => {
+			const res = await exports.default.fetch(`${ORIGIN}/player/avoidjuniors`, {
+				headers: await bearer(String(playerId)),
+			})
+			return res.json()
+		}
+
+		// The body the client posts. The response is the resulting value, and the GET agrees.
+		test('stores the posted preference and answers it', async () => {
+			expect(await write(3200, 'avoidJuniors=True')).toBe(true)
+			expect(await read(3200)).toBe(true)
+
+			expect(await write(3200, 'avoidJuniors=False')).toBe(false)
+			expect(await read(3200)).toBe(false)
+		})
+
+		// The map holds every setting the player has, so the write must not replace it.
+		test('merges into the player’s other settings', async () => {
+			await env.RECFLARE_PLAYER_SETTINGS.put(
+				'player:3201',
+				JSON.stringify({ 'Recroom.OOBE': '77', TUTORIAL_COMPLETE_MASK: '11' })
+			)
+			await write(3201, 'avoidJuniors=True')
+			expect(await stored(3201)).toEqual({
+				'Recroom.OOBE': '77',
+				TUTORIAL_COMPLETE_MASK: '11',
+				AvoidJuniors: 'True',
+			})
+		})
+
+		// Whichever spelling the player's map already carries is the one overwritten —
+		// two keys for one preference would make the read depend on their order.
+		test('overwrites an existing key rather than adding a second one', async () => {
+			await env.RECFLARE_PLAYER_SETTINGS.put(
+				'player:3202',
+				JSON.stringify({ AVOID_JUNIORS: 'True' })
+			)
+			expect(await write(3202, 'avoidJuniors=False')).toBe(false)
+			expect(await stored(3202)).toEqual({ AVOID_JUNIORS: 'False' })
+		})
+
+		test('accepts a JSON body', async () => {
+			const res = await exports.default.fetch(`${ORIGIN}/player/avoidjuniors`, {
+				method: 'PUT',
+				headers: {
+					...(await bearer('3203')),
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({ avoidJuniors: true }),
+			})
+			expect(res.status).toBe(200)
+			expect(await res.json()).toBe(true)
+			expect(await read(3203)).toBe(true)
+		})
+
+		// An unreadable body leaves the stored setting alone and answers it — a no-op 200,
+		// not a 400 and not a write of `false`.
+		test('a body with no readable value is a no-op', async () => {
+			await write(3204, 'avoidJuniors=True')
+			expect(await write(3204, 'avoidJuniors=maybe')).toBe(true)
+			expect(await write(3204, '')).toBe(true)
+			expect(await stored(3204)).toEqual({ AvoidJuniors: 'True' })
+		})
+
+		test('is auth-gated', async () => {
+			const res = await exports.default.fetch(`${ORIGIN}/player/avoidjuniors`, {
+				method: 'PUT',
+				headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: 'avoidJuniors=True',
+			})
+			expect(res.status).toBe(401)
+		})
+	})
+
 	test('POST /matchmake/room/:roomId resolves the room scene from D1', async () => {
 		const headers = await bearer('88')
 		const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
@@ -1761,6 +1900,7 @@ describe('auth-gated endpoints', () => {
 		)
 		expect([...documented].sort()).toEqual([
 			'GET /player',
+			'GET /player/avoidjuniors',
 			'GET /room/{roomId}/instances',
 			'GET /rooms/requiring/developer',
 			'GET /rooms/requiring/rrplus',
@@ -1778,6 +1918,7 @@ describe('auth-gated endpoints', () => {
 			'POST /player/notifydisconnect',
 			'POST /roominstance/{id}/markprivate',
 			'POST /roominstance/{id}/reportjoinresult',
+			'PUT /player/avoidjuniors',
 			'PUT /player/gameserverregionpings',
 			'PUT /player/photonregionpings',
 			'PUT /player/statusvisibility',
