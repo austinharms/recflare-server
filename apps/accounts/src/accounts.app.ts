@@ -119,13 +119,17 @@ function toAccountDto(account: Account) {
 /**
  * Project a stored account into the private self DTO (the /account/me shape) —
  * the public DTO plus owner-only fields. `juniorState`/`parentAccountId` are
- * OMITTED when null (emitting `null` makes the client's enum parser throw);
- * `email`/`birthday` are kept as null (not enums, so null is fine).
+ * OMITTED when null (emitting `null` makes the client's enum parser throw).
+ *
+ * An unset `email` is `""`, never null — same as `bio`. Two reasons: the client reads
+ * it as a string, and this DTO also rides the `SelfAccountUpdate` hub frame, where the
+ * hub DROPS null values from `Msg` — so a null email doesn't arrive as null, it
+ * vanishes from the frame entirely.
  */
 function toSelfAccountDto(account: Account) {
 	return {
 		...toAccountDto(account),
-		email: account.email ?? null,
+		email: account.email ?? '',
 		// @todo he game client needs this to be set. I forget how birthdays were set, so for now
 		// everyone can be old.
 		birthday: '1904-01-01T00:00:00.000Z',
