@@ -136,22 +136,18 @@ function unauthorized(c: Context<App>) {
 }
 
 /**
- * The "avoid juniors" preference, normalized. The player's settings are a free-form
- * `{ key: value }` bag written by the client through the `playersettings` worker, and the
- * exact spelling it writes this key under is reverse-engineered — so the lookup is
- * case- and separator-insensitive (`AvoidJuniors`, `avoidjuniors`, `AVOID_JUNIORS` all
- * resolve to this one preference) rather than betting on one casing and silently reading
- * false forever if it's wrong.
+ * The "avoid juniors" preference, spelled the way the client posts it — the key a NEW
+ * setting is written under, and the one every stored spelling is matched against.
+ *
+ * The player's settings are a free-form `{ key: value }` bag written by the client through
+ * the `playersettings` worker, and the exact spelling it writes this key under is
+ * reverse-engineered, so the lookup is case- and separator-insensitive (`avoidJuniors`,
+ * `AvoidJuniors`, `AVOID_JUNIORS` all resolve to this one preference) rather than betting on
+ * one casing and silently reading false forever if it's wrong. The write then overwrites
+ * whichever spelling is already there, so a player never ends up with two keys for the one
+ * preference — which would make the read depend on their order in the map.
  */
-const AVOID_JUNIORS_SETTING = 'avoidjuniors'
-
-/**
- * The spelling a NEW setting is written under. Only used when the player's map doesn't
- * already carry the key under some other spelling — the write overwrites whichever one is
- * there, so a player never ends up with two keys for the one preference (which would make
- * the read depend on their order in the map).
- */
-const AVOID_JUNIORS_KEY = 'AvoidJuniors'
+const AVOID_JUNIORS_KEY = 'avoidJuniors'
 
 /** Lowercase and drop separators, so keys compare on their letters alone. */
 function normalizeSettingKey(key: string): string {
@@ -160,7 +156,8 @@ function normalizeSettingKey(key: string): string {
 
 /** The player's existing spelling of the setting key, if their map has one. */
 function findAvoidJuniorsKey(stored: Record<string, unknown>): string | undefined {
-	return Object.keys(stored).find((key) => normalizeSettingKey(key) === AVOID_JUNIORS_SETTING)
+	const wanted = normalizeSettingKey(AVOID_JUNIORS_KEY)
+	return Object.keys(stored).find((key) => normalizeSettingKey(key) === wanted)
 }
 
 /**

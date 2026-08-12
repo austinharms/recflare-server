@@ -294,10 +294,10 @@ describe('public endpoints', () => {
 		}
 
 		test('reads the stored setting', async () => {
-			await settings(3100, { AvoidJuniors: 'True', 'Recroom.OOBE': '77' })
+			await settings(3100, { avoidJuniors: 'True', 'Recroom.OOBE': '77' })
 			expect(await read(3100)).toBe(true)
 
-			await settings(3101, { AvoidJuniors: 'False' })
+			await settings(3101, { avoidJuniors: 'False' })
 			expect(await read(3101)).toBe(false)
 		})
 
@@ -317,7 +317,7 @@ describe('public endpoints', () => {
 			await settings(3105, { 'Recroom.OOBE': '77' })
 			expect(await read(3105)).toBe(false)
 
-			await settings(3106, { AvoidJuniors: 'maybe' })
+			await settings(3106, { avoidJuniors: 'maybe' })
 			expect(await read(3106)).toBe(false)
 		})
 
@@ -370,7 +370,7 @@ describe('public endpoints', () => {
 			expect(await stored(3201)).toEqual({
 				'Recroom.OOBE': '77',
 				TUTORIAL_COMPLETE_MASK: '11',
-				AvoidJuniors: 'True',
+				avoidJuniors: 'True',
 			})
 		})
 
@@ -405,7 +405,7 @@ describe('public endpoints', () => {
 			await write(3204, 'avoidJuniors=True')
 			expect(await write(3204, 'avoidJuniors=maybe')).toBe(true)
 			expect(await write(3204, '')).toBe(true)
-			expect(await stored(3204)).toEqual({ AvoidJuniors: 'True' })
+			expect(await stored(3204)).toEqual({ avoidJuniors: 'True' })
 		})
 
 		test('is auth-gated', async () => {
