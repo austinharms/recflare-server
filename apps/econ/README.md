@@ -325,18 +325,25 @@ rewardType=PostGameActivity&Message=Activity%20completed%21&giftContext=Soccer
 ```
 
 Since the client asks rather than the server offering, whether a reward is actually **owed**
-is decided here, from `reward_status` — one row per (account, reward type) holding the last
-claim and a count. One claim per type per hour (`REWARD_COOLDOWN_MS`), flat for every type
-despite what a name like `FirstActivityOfDay` suggests; per-type windows would be a map
-keyed by type.
+is decided here, from `reward_status` — one row per (account, reward type, gift context)
+holding the last claim and a count. One claim per type per activity per hour
+(`REWARD_COOLDOWN_MS`), flat for every type despite what a name like `FirstActivityOfDay`
+suggests; per-type windows would be a map keyed by type.
 
 - **The claim is one SQL statement** (`ON CONFLICT … DO UPDATE … WHERE`). The client fires
   these off right after a match, so two can land together; a read-then-write would let both
   see the same stale `granted_at` and pay out twice.
 - **A rejected claim leaves `granted_at` alone.** If an on-cooldown ask pushed the timestamp
   forward, a client that retries in a loop would never become eligible.
-- **`giftContext` (the activity, e.g. `Soccer`) is accepted and ignored** — the cooldown is
-  per type, shared across activities, so it is not part of the key.
+- **`giftContext` (the activity, e.g. `Soccer`) is part of the key** — the "first activity of
+  the day" is per activity, so a player who moves from Soccer to Paintball is owed another
+  reward while a second Soccer match inside the hour is not.
+- **A contextless ask keys on `''`, not NULL.** SQLite allows — and does not dedupe — NULLs
+  in a non-INTEGER primary key, so a NULL context would insert a fresh row on every ask
+  instead of hitting the conflict, and the cooldown would never apply. Migration
+  `0013_reward_status_gift_context.sql` rebuilds the table (SQLite can't add a column to a
+  primary key) and lands the pre-existing rows on that same `''` bucket, so cooldowns from
+  before it keep counting.
 
 **What a claim pays: 5 XP, in a gift box.** The XP (`GAME_REWARD_XP`) is banked in
 `progression` and the box is the wrapper the client shows for it — no item, every item field

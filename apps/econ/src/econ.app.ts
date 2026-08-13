@@ -2258,7 +2258,7 @@ const app = new Hono<App>({ strict: false })
 	// posting the type and the message to show for it (`rewardType=FirstActivityOfDay&
 	// Message=First Game of the Day`, or `rewardType=PostGameActivity&Message=Activity
 	// completed!&giftContext=Soccer`) — so whether a reward is actually OWED is decided
-	// here, from `reward_status`: one claim per type per hour, atomically.
+	// here, from `reward_status`: one claim per type per activity per hour, atomically.
 	//
 	// A claim pays GAME_REWARD_XP into `progression` and hands over a gift box carrying that
 	// XP, announced with the same GiftPackageReceivedImmediate frame the weekly gift uses —
@@ -2270,17 +2270,21 @@ const app = new Hono<App>({ strict: false })
 	// reference answers its own (different, selection-based) flow with a success envelope,
 	// not a list of rewards.
 	//
-	// `giftContext` (the activity, e.g. `Soccer`) is accepted and ignored: the cooldown is
-	// per reward type, shared across activities.
+	// `giftContext` (the activity, e.g. `Soccer`) is part of the cooldown key: the first
+	// activity of the day is per ACTIVITY, so a player who moves from Soccer to Paintball is
+	// owed another reward while a second Soccer match inside the hour is not. An ask that
+	// sends no context keys on `''`.
 	.post(
 		'/api/gamerewards/v1/request',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Request a game reward',
 			description: [
-				'Claims one reward of `rewardType` per hour per player, recorded in `reward_status`.',
-				'The reward payload is still a stub — a claim grants nothing and both a claim and a',
-				'rejected (on-cooldown) ask answer `[]`. `giftContext` is accepted and ignored.',
+				'Claims one reward of `rewardType` in `giftContext` per hour per player, recorded in',
+				'`reward_status`. The cooldown is per (type, activity), so a different activity is',
+				'owed another reward while the same one is not; an ask with no `giftContext` keys on',
+				'the empty context. The reward rides in a gift box, so a claim and a rejected',
+				'(on-cooldown) ask both answer `[]`.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(GameRewardRequest, 'The reward type and its display message'),
@@ -2296,7 +2300,8 @@ const app = new Hono<App>({ strict: false })
 			const rewardType = typeof body.rewardType === 'string' ? body.rewardType : ''
 			// No type, nothing to gate: don't write a row keyed on an empty string.
 			if (rewardType === '') return c.json([])
-			const claimed = await claimReward(c.env.DB, id, rewardType)
+			const giftContext = typeof body.giftContext === 'string' ? body.giftContext : ''
+			const claimed = await claimReward(c.env.DB, id, rewardType, giftContext)
 			// On cooldown: nothing was claimed, so nothing is paid and nothing is announced.
 			if (claimed === null) return c.json([])
 			const message =
@@ -2315,6 +2320,7 @@ const app = new Hono<App>({ strict: false })
 			logger.info('game reward claimed', {
 				accountId: id,
 				rewardType,
+				giftContext,
 				grantCount: claimed,
 				message,
 				xp: GAME_REWARD_XP,

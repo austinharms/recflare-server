@@ -1726,7 +1726,7 @@ describe('econ endpoints', () => {
 		expect(boxes[0]?.AvatarItemDesc).toBe(entry?.AvatarItemDesc)
 	})
 
-	test('POST /api/gamerewards/v1/request claims once an hour per reward type', async () => {
+	test('POST /api/gamerewards/v1/request claims once an hour per reward type and activity', async () => {
 		const headers = {
 			...(await bearer('80')),
 			'Content-Type': 'application/x-www-form-urlencoded',
@@ -1737,11 +1737,12 @@ describe('econ endpoints', () => {
 				headers,
 				body,
 			})
-		const statusOf = (rewardType: string) =>
+		const statusOf = (rewardType: string, giftContext = '') =>
 			env.DB.prepare(
-				'SELECT granted_at, grant_count FROM reward_status WHERE account_id = 80 AND reward_type = ?1'
+				`SELECT granted_at, grant_count FROM reward_status
+				 WHERE account_id = 80 AND reward_type = ?1 AND gift_context = ?2`
 			)
-				.bind(rewardType)
+				.bind(rewardType, giftContext)
 				.first<{ granted_at: string; grant_count: number }>()
 
 		// A claim answers the empty list the client accepts — the reward rides in a gift box.
@@ -1758,7 +1759,8 @@ describe('econ endpoints', () => {
 		expect((await request('rewardType=FirstActivityOfDay&Message=again')).status).toBe(200)
 		expect(await statusOf('FirstActivityOfDay')).toEqual(claimed)
 
-		// A different type has its own cooldown; `giftContext` doesn't split it.
+		// A different type has its own cooldown — and so does each `giftContext` within a type:
+		// Soccer and Paintball are separate rows that each claim once.
 		expect(
 			(
 				await request(
@@ -1766,7 +1768,7 @@ describe('econ endpoints', () => {
 				)
 			).status
 		).toBe(200)
-		expect((await statusOf('PostGameActivity'))?.grant_count).toBe(1)
+		expect((await statusOf('PostGameActivity', 'Soccer'))?.grant_count).toBe(1)
 		expect(
 			(
 				await request(
@@ -1774,6 +1776,17 @@ describe('econ endpoints', () => {
 				)
 			).status
 		).toBe(200)
+		expect((await statusOf('PostGameActivity', 'Paintball'))?.grant_count).toBe(1)
+
+		// …but the same activity again inside the hour claims nothing.
+		const soccer = await statusOf('PostGameActivity', 'Soccer')
+		expect((await request('rewardType=PostGameActivity&giftContext=Soccer')).status).toBe(200)
+		expect(await statusOf('PostGameActivity', 'Soccer')).toEqual(soccer)
+
+		// A contextless ask is its own bucket (`''`), not a wildcard over the two above.
+		expect((await request('rewardType=PostGameActivity&Message=no%20context')).status).toBe(200)
+		expect((await statusOf('PostGameActivity'))?.grant_count).toBe(1)
+		expect((await request('rewardType=PostGameActivity&Message=again')).status).toBe(200)
 		expect((await statusOf('PostGameActivity'))?.grant_count).toBe(1)
 
 		// Once the hour has passed, the same type claims again.

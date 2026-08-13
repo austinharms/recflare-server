@@ -268,7 +268,7 @@ export const GameRewardRequest = z.object({
 	giftContext: z
 		.string()
 		.optional()
-		.describe('The activity it came from, e.g. `Soccer` — accepted and ignored'),
+		.describe('The activity it came from, e.g. `Soccer` — part of the cooldown key'),
 })
 
 /**
