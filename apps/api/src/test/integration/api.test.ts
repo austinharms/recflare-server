@@ -48,7 +48,7 @@ import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../war
 
 import type { SavedImage } from '@repo/domain'
 import type { Env } from '../../context'
-import type { PlayerEvent, PlayerEventEnvelope, PlayerEventResult } from '../../events-db'
+import type { EventTag, PlayerEvent, PlayerEventEnvelope, PlayerEventResult } from '../../events-db'
 import type { InventionSaveResult, SavedInvention } from '../../inventions-db'
 
 declare module 'cloudflare:test' {
@@ -3486,6 +3486,8 @@ describe('mutual friends', () => {
 
 describe('player events', () => {
 	const HOUR = 60 * 60 * 1000
+	/** The longest window a write may store — an event lasts at most a day. */
+	const DAY = 24 * HOUR
 	/**
 	 * Seconds precision, no milliseconds — the form the client sends and reads back.
 	 *
@@ -3683,6 +3685,66 @@ describe('player events', () => {
 		expect(tooLong.status).toBe(400)
 		const after = await get(`/api/playerevents/v1/${event.PlayerEventId}`)
 		expect(((await after.json()) as PlayerEvent).Name).toBe('EditMe')
+	})
+
+	test('the event writes cap the window at 24 hours', async () => {
+		const window = (StartTime: string, EndTime: string) =>
+			post('/api/playerevents/v2', { Name: 'Windowed', RoomId: 3, StartTime, EndTime })
+
+		// A day exactly is allowed — "at most one day", not "under one day".
+		expect((await window(at(0), at(DAY))).status).toBe(200)
+		// A second past it is not.
+		expect((await window(at(0), at(DAY + 1000))).status).toBe(400)
+		expect((await window(at(0), at(30 * DAY))).status).toBe(400)
+
+		// A missing end defaults to an hour after the start, so it can never fail…
+		expect(
+			(await post('/api/playerevents/v2', { Name: 'Open ended', RoomId: 3, StartTime: at(DAY) }))
+				.status
+		).toBe(200)
+		// …but an end alone is measured from now, which can.
+		expect(
+			(await post('/api/playerevents/v2', { Name: 'Far end', RoomId: 3, EndTime: at(2 * DAY) }))
+				.status
+		).toBe(400)
+		expect(
+			(await post('/api/playerevents/v2', { Name: 'Near end', RoomId: 3, EndTime: at(HOUR) }))
+				.status
+		).toBe(200)
+		// A body naming neither is defaulted, as before.
+		expect((await post('/api/playerevents/v2', { Name: 'Untimed', RoomId: 3 })).status).toBe(200)
+
+		// A backwards window is refused too — `end - start` on one running a month
+		// backwards is negative, which would sail past a "no longer than a day" check.
+		expect((await window(at(3 * HOUR), at(HOUR))).status).toBe(400)
+	})
+
+	test('the 24-hour cap is checked on the window a write RESOLVES to', async () => {
+		const event = await create({
+			RoomId: 3,
+			Name: 'Movable',
+			StartTime: at(5 * HOUR),
+			EndTime: at(6 * HOUR),
+		})
+		const path = `/api/playerevents/v2/${event.PlayerEventId}`
+
+		// Moving one bound is measured against the STORED other one, not against a default:
+		// a start dragged two days back leaves a window far longer than a day.
+		expect((await post(path, { StartTime: at(-2 * DAY) })).status).toBe(400)
+		expect((await post(path, { EndTime: at(2 * DAY) })).status).toBe(400)
+		// Both bounds moved together stay inside the cap, so this is fine.
+		expect((await post(path, { StartTime: at(2 * DAY), EndTime: at(2 * DAY + HOUR) })).status).toBe(
+			200
+		)
+		// An edit that says nothing about the times is unaffected.
+		expect((await post(path, { Name: 'Still Movable' })).status).toBe(200)
+
+		// …and a refusal left the event where it was.
+		const stored = (await (
+			await get(`/api/playerevents/v1/${event.PlayerEventId}`)
+		).json()) as PlayerEvent
+		expect(stored.StartTime).toBe(at(2 * DAY))
+		expect(stored.EndTime).toBe(at(2 * DAY + HOUR))
 	})
 
 	test('POST /api/playerevents/v2 answers the write envelope, not the bare event', async () => {
@@ -4416,6 +4478,204 @@ describe('player events', () => {
 		expect(updated.CreatorPlayerId).toBe(42)
 		expect(updated.AttendeeCount).toBe(1)
 	})
+
+	// ---- Single-field edits (PUT …/v2/:eventId/:field) -----------------------
+
+	/** A form-encoded single-field edit — the encoding the client sends on these. */
+	const putForm = async (
+		path: string,
+		fields: Record<string, string>,
+		sub: string | null = '42'
+	): Promise<Response> =>
+		exports.default.fetch(`${ORIGIN}${path}`, {
+			method: 'PUT',
+			headers: {
+				...(sub === null ? {} : await bearer(sub)),
+				'content-type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams(fields).toString(),
+		})
+
+	const putJson = async (path: string, body: unknown, sub = '42'): Promise<Response> =>
+		exports.default.fetch(`${ORIGIN}${path}`, {
+			method: 'PUT',
+			headers: { ...(await bearer(sub)), 'content-type': 'application/json' },
+			body: JSON.stringify(body),
+		})
+
+	/** The envelope's event out of a 200 from one of the edits. */
+	const edited = async (res: Response): Promise<PlayerEventEnvelope> => {
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as PlayerEventResult
+		expect(body.Result).toBe(0)
+		return body.PlayerEvent
+	}
+
+	test('PUT /api/playerevents/v2/:eventId/time moves either bound independently', async () => {
+		const event = await create({
+			RoomId: 5,
+			Name: 'Reschedulable',
+			StartTime: at(5 * HOUR),
+			EndTime: at(6 * HOUR),
+		})
+		const path = `/api/playerevents/v2/${event.PlayerEventId}/time`
+
+		// The client sends .NET tick precision; it is stored trimmed to seconds.
+		const moved = await edited(
+			await putForm(path, {
+				startTime: at(7 * HOUR).replace('Z', '.0000000Z'),
+				endTime: at(9 * HOUR).replace('Z', '.0000000Z'),
+			})
+		)
+		expect(moved).toEqual({ ...event, StartTime: at(7 * HOUR), EndTime: at(9 * HOUR) })
+
+		// One bound alone keeps the other.
+		const nudged = await edited(await putForm(path, { endTime: at(10 * HOUR) }))
+		expect(nudged.StartTime).toBe(at(7 * HOUR))
+		expect(nudged.EndTime).toBe(at(10 * HOUR))
+
+		// A day exactly is allowed — the cap is "at most a day", not "under a day".
+		const full = await edited(await putForm(path, { endTime: at(7 * HOUR + DAY) }))
+		expect(full.EndTime).toBe(at(7 * HOUR + DAY))
+	})
+
+	test('PUT /api/playerevents/v2/:eventId/time refuses rubbish and a backwards window', async () => {
+		const event = await create({
+			RoomId: 5,
+			Name: 'Fixed Window',
+			StartTime: at(5 * HOUR),
+			EndTime: at(6 * HOUR),
+		})
+		const path = `/api/playerevents/v2/${event.PlayerEventId}/time`
+
+		// Present but unparseable is refused rather than dropped: a reschedule that
+		// silently did nothing is worse than a refusal.
+		expect((await putForm(path, { startTime: 'tomorrowish' })).status).toBe(400)
+		// An end before the start, checked against the STORED bound when only one is sent.
+		expect((await putForm(path, { endTime: at(4 * HOUR) })).status).toBe(400)
+		expect((await putForm(path, { startTime: at(9 * HOUR), endTime: at(8 * HOUR) })).status).toBe(
+			400
+		)
+		// And a window longer than a day, resolved the same way.
+		expect((await putForm(path, { endTime: at(5 * HOUR + DAY + 1000) })).status).toBe(400)
+		expect((await putForm(path, { startTime: at(-DAY) })).status).toBe(400)
+		expect(
+			(await putForm(path, { startTime: at(2 * DAY), endTime: at(2 * DAY + DAY + 1000) })).status
+		).toBe(400)
+		// An empty body changes nothing, and is not an error.
+		expect((await edited(await putForm(path, {}))).StartTime).toBe(at(5 * HOUR))
+		// …and nothing stuck.
+		const stored = (await (
+			await get(`/api/playerevents/v1/${event.PlayerEventId}`)
+		).json()) as PlayerEvent
+		expect(stored.EndTime).toBe(at(6 * HOUR))
+	})
+
+	test('PUT /api/playerevents/v2/:eventId/accessibility takes the enum name', async () => {
+		const event = await create({ RoomId: 5, Name: 'Visible', Accessibility: 1 })
+		const path = `/api/playerevents/v2/${event.PlayerEventId}/accessibility`
+
+		// The NAME is what the client sends here.
+		expect((await edited(await putForm(path, { accessibility: 'Unlisted' }))).Accessibility).toBe(2)
+		// Case-insensitively…
+		expect((await edited(await putForm(path, { accessibility: 'private' }))).Accessibility).toBe(0)
+		// …and the ordinal works too.
+		expect((await edited(await putForm(path, { accessibility: '4' }))).Accessibility).toBe(4)
+
+		// Anything else is refused rather than stored verbatim — guessing a visibility
+		// wrong is what shows a private event to everyone.
+		expect((await putForm(path, { accessibility: 'Secret' })).status).toBe(400)
+		expect((await putForm(path, { accessibility: '9' })).status).toBe(400)
+		expect((await putForm(path, {})).status).toBe(400)
+		expect(
+			((await (await get(`/api/playerevents/v1/${event.PlayerEventId}`)).json()) as PlayerEvent)
+				.Accessibility
+		).toBe(4)
+	})
+
+	test('PUT /api/playerevents/v2/:eventId/tags replaces the whole set from a bare array', async () => {
+		const event = await create({ RoomId: 5, Name: 'Taggable', Tags: ['meetup'] })
+		const path = `/api/playerevents/v2/${event.PlayerEventId}/tags`
+
+		// A bare JSON array, not an object — and a replace, not a merge, so `meetup` goes.
+		const tagged = await edited(await putJson(path, ['tag1', '#Class']))
+		expect(tagged.Tags).toEqual(['class', 'tag1'])
+		// The envelope's TagModifyResult reports the same set the client redraws chips from.
+		const body = (await (await putJson(path, ['workshops'])).json()) as PlayerEventResult
+		expect(body.TagModifyResult).toEqual({ Result: 0, Tags: ['workshops'] })
+
+		// `[]` clears them; a non-array body is refused.
+		expect((await edited(await putJson(path, []))).Tags).toEqual([])
+		expect((await putJson(path, { Tags: ['nope'] })).status).toBe(400)
+		expect(
+			(
+				(await (
+					await get(`/api/playerevents/v1/${event.PlayerEventId}?includeDetails=True`)
+				).json()) as PlayerEvent & { tags: EventTag[] }
+			).tags
+		).toEqual([])
+	})
+
+	test('PUT /api/playerevents/v2/:eventId/description rewrites the blurb; absent clears it', async () => {
+		const event = await create({ RoomId: 5, Name: 'Described', Description: 'The old blurb' })
+		const path = `/api/playerevents/v2/${event.PlayerEventId}/description`
+
+		const written = await edited(
+			await putForm(path, { description: 'fthe description of said event' })
+		)
+		expect(written).toEqual({ ...event, Description: 'fthe description of said event' })
+
+		// An emptied text box sends no field at all, which clears it.
+		expect((await edited(await putForm(path, {}))).Description).toBe('')
+
+		// Capped at the stored length, and refused rather than truncated.
+		expect((await putForm(path, { description: 'd'.repeat(513) })).status).toBe(400)
+		expect((await putForm(path, { description: 'd'.repeat(512) })).status).toBe(200)
+	})
+
+	test('PUT /api/playerevents/v2/:eventId/name retitles, refusing a blank or overlong one', async () => {
+		const event = await create({ RoomId: 5, Name: 'Before' })
+		const path = `/api/playerevents/v2/${event.PlayerEventId}/name`
+
+		const renamed = await edited(
+			await putForm(path, { name: 'an event in the future I should be able to editx' })
+		)
+		expect(renamed).toEqual({
+			...event,
+			Name: 'an event in the future I should be able to editx',
+		})
+		// Stored trimmed.
+		expect((await edited(await putForm(path, { name: '  Padded  ' }))).Name).toBe('Padded')
+
+		// A blank name renders as a blank row, and the whole-event update reads one as
+		// "leave it alone" — so it is refused outright here.
+		expect((await putForm(path, { name: '   ' })).status).toBe(400)
+		expect((await putForm(path, {})).status).toBe(400)
+		expect((await putForm(path, { name: 'n'.repeat(65) })).status).toBe(400)
+		expect((await putForm(path, { name: 'n'.repeat(64) })).status).toBe(200)
+	})
+
+	test('the single-field edits are creator-only, like the whole-event update', async () => {
+		const event = await create({ RoomId: 5, Name: 'Guarded' })
+		const id = event.PlayerEventId
+		for (const [field, fields] of [
+			['time', { startTime: at(8 * HOUR) }],
+			['accessibility', { accessibility: 'Public' }],
+			['description', { description: 'nope' }],
+			['name', { name: 'Hijacked' }],
+		] as Array<[string, Record<string, string>]>) {
+			expect((await putForm(`/api/playerevents/v2/${id}/${field}`, fields, null)).status).toBe(401)
+			// 43 didn't create it.
+			expect((await putForm(`/api/playerevents/v2/${id}/${field}`, fields, '43')).status).toBe(403)
+			expect((await putForm(`/api/playerevents/v2/999999/${field}`, fields)).status).toBe(404)
+		}
+		// The tags edit takes JSON rather than a form, but is gated the same way.
+		expect((await putJson(`/api/playerevents/v2/${id}/tags`, ['nope'], '43')).status).toBe(403)
+		expect((await putJson('/api/playerevents/v2/999999/tags', ['nope'])).status).toBe(404)
+
+		// Nothing moved.
+		expect(await (await get(`/api/playerevents/v1/${id}`)).json()).toEqual(asRecord(event, null))
+	})
 })
 
 describe('openapi', () => {
@@ -4577,6 +4837,11 @@ describe('openapi', () => {
 			'POST /api/sanitize/v1/isPure',
 			'POST /api/v1/progression/bulk',
 			'POST /statsigUserProperties',
+			'PUT /api/playerevents/v2/{eventId}/accessibility',
+			'PUT /api/playerevents/v2/{eventId}/description',
+			'PUT /api/playerevents/v2/{eventId}/name',
+			'PUT /api/playerevents/v2/{eventId}/tags',
+			'PUT /api/playerevents/v2/{eventId}/time',
 			'PUT /api/players/v1/playerPhotoTaggingSetting',
 			'PUT /outfits/me',
 		])

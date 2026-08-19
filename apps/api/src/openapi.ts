@@ -610,7 +610,9 @@ export const PlayerEventDto = z.object({
 	Name: z.string(),
 	Description: z.string(),
 	StartTime: z.string().describe('ISO 8601 UTC, seconds precision (`2020-11-29T22:00:00Z`)'),
-	EndTime: z.string().describe('ISO 8601 UTC, seconds precision'),
+	EndTime: z
+		.string()
+		.describe('ISO 8601 UTC, seconds precision; at most 24 hours after `StartTime`'),
 	AttendeeCount: z.int().describe('Starts at 1 — the creator attends their own event'),
 	State: z.int().describe('0 = scheduled'),
 	Accessibility: z.int(),
@@ -690,6 +692,50 @@ export const PlayerEventRequest = PlayerEventDto.partial().extend({
 		.optional()
 		.describe('The event’s fields, if nested rather than posted at the top level'),
 })
+
+/**
+ * `PUT /api/playerevents/v2/{eventId}/time` form body — the event's window, moved. Both
+ * bounds are optional; an absent one keeps its stored value, so the start can be nudged
+ * without restating the end. The RESOLVED window must end after it starts and run no
+ * longer than 24 hours.
+ */
+export const PlayerEventTimeRequest = z.object({
+	startTime: z
+		.string()
+		.optional()
+		.describe('New start, any parseable ISO 8601 — the client sends .NET tick precision'),
+	endTime: z.string().optional().describe('New end, same form'),
+})
+
+/**
+ * `PUT /api/playerevents/v2/{eventId}/accessibility` form body. The client sends the
+ * `RoomAccessibility` NAME, as it does on the subroom route in `rooms`; the ordinal is
+ * accepted too.
+ */
+export const PlayerEventAccessibilityRequest = z.object({
+	accessibility: z
+		.string()
+		.describe(
+			'`Private`, `Public`, `Unlisted`, `Dev_only` or `Dev_Unlisted` (case-insensitive) — ' +
+				'or its ordinal 0–4'
+		),
+})
+
+/** `PUT /api/playerevents/v2/{eventId}/name` form body. */
+export const PlayerEventNameRequest = z.object({
+	name: z.string().describe('The new title; blank is refused — an event always has a name'),
+})
+
+/** `PUT /api/playerevents/v2/{eventId}/description` form body. */
+export const PlayerEventDescriptionRequest = z.object({
+	description: z.string().optional().describe('The new blurb; absent clears it'),
+})
+
+/**
+ * `PUT /api/playerevents/v2/{eventId}/tags` body — a BARE JSON ARRAY of tag names
+ * (`["tag1","class"]`), not an object. The whole set the event should carry.
+ */
+export const PlayerEventTagsRequest = z.array(z.string()).describe('The event’s whole tag set')
 
 /**
  * `GET /api/playerevents/v1/:eventId/responses` — one player's RSVP to one event, as
