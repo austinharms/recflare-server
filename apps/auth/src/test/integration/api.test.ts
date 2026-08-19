@@ -27,7 +27,7 @@ import {
 	PLATFORM_BACKFILL_SQL,
 	PLATFORM_SCHEMA_DDL,
 } from '../../platform-db'
-import { REFRESH_SCHEMA_DDL } from '../../refresh-db'
+import { consumeRefreshToken, issueRefreshToken, REFRESH_SCHEMA_DDL } from '../../refresh-db'
 
 import type { Env } from '../../context'
 
@@ -1081,6 +1081,44 @@ describe('auth worker routes', () => {
 		)
 		expect(reuse.status).toBe(400)
 		expect(reuse.json.error).toBe('invalid_grant')
+	})
+
+	/**
+	 * A D1 that throws the storage-side `internal error` on its first `n` reads and then
+	 * behaves. Only what `consumeRefreshToken` touches is wrapped — prepare/bind/first.
+	 */
+	const flakyDb = (failures: number): D1Database => {
+		let remaining = failures
+		const wrap = (stmt: D1PreparedStatement): D1PreparedStatement =>
+			({
+				bind: (...values: unknown[]) => wrap(stmt.bind(...values)),
+				first: async <T>() => {
+					if (remaining > 0) {
+						remaining--
+						throw new Error('D1_ERROR: internal error; reference = testref0000')
+					}
+					return stmt.first<T>()
+				},
+			}) as unknown as D1PreparedStatement
+		return { prepare: (sql: string) => wrap(env.DB.prepare(sql)) } as unknown as D1Database
+	}
+
+	test('consumeRefreshToken rides out a transient D1 error rather than logging the player out', async () => {
+		const token = await issueRefreshToken(env.DB, 77)
+		// Two hiccups, then the real thing — the redemption still succeeds, so the player
+		// keeps their session instead of being bounced to the login screen by a 500.
+		expect(await consumeRefreshToken(flakyDb(2), token)).toBe(77)
+		// And it was genuinely consumed: the retry didn't leave the row behind.
+		expect(await consumeRefreshToken(env.DB, token)).toBeNull()
+	})
+
+	test('consumeRefreshToken rethrows once the retries are spent, never a silent null', async () => {
+		const token = await issueRefreshToken(env.DB, 77)
+		// A real D1 outage has to surface as a 500. Answering null would tell the player
+		// their token was bad and make them log in again over something that isn't theirs.
+		await expect(consumeRefreshToken(flakyDb(99), token)).rejects.toThrow('internal error')
+		// The token survived, so a later attempt still works.
+		expect(await consumeRefreshToken(env.DB, token)).toBe(77)
 	})
 
 	test('POST /connect/token 400s on an unknown refresh_token', async () => {
