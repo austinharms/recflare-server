@@ -62,8 +62,9 @@ export const NOT_A_MEMBER_RESPONSE = {
 
 /**
  * A chat message as stored and served (see message-db.ts). `contents` is the client's own
- * envelope (`{"Type":0,"Version":1,"Data":"hello"}`) — stored verbatim and served back
- * untouched, so new message types need no schema change. A `senderPlayerId` of -5 is the
+ * envelope (`{"Type":0,"Version":1,"Data":"hello"}`) — served back exactly as it was
+ * stored, and stored as it was sent but for the profanity mask over `Data`, so new
+ * message types need no schema change. A `senderPlayerId` of -5 is the
  * system pseudo-player the "started a chat" / "left" notices are posted as.
  */
 export const ChatMessageDto = z.object({
@@ -214,8 +215,8 @@ export const CreateThreadRequest = z.object({
 		.optional()
 		.describe(
 			[
-				'The client envelope, stored verbatim and unparsed. Blank/absent opens the thread',
-				'without posting a message and reports chatResult 1',
+				'The client envelope, stored as sent but for the profanity mask over its `Data`.',
+				'Blank/absent opens the thread without posting a message and reports chatResult 1',
 			].join(' ')
 		),
 })
@@ -238,7 +239,8 @@ export const SendMessageRequest = z.object({
 		.string()
 		.describe(
 			[
-				'The client envelope (Type/Version/Data), stored verbatim. Blank or missing stores',
+				'The client envelope (Type/Version/Data). Stored as sent except for `Data`, which',
+				'comes back with any profanity masked one `*` per character. Blank or missing stores',
 				'nothing and reports chatResult 1, still with the thread attached',
 			].join(' ')
 		),

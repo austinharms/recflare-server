@@ -793,6 +793,25 @@ describe('POST /thread', () => {
 		expect(await getThreadMessages(env.DB, body.chatThread.chatThreadId)).toHaveLength(2)
 	})
 
+	// The first message goes through the same profanity filter every later one does.
+	it('masks profanity in the first message', async () => {
+		const caller = 884010
+		const contents = '{"Type":0,"Version":1,"Data":"fuck this"}'
+		const res = await createViaPost(
+			caller,
+			`ids=884011&messageContents=${encodeURIComponent(contents)}`
+		)
+
+		const body = (await res.json()) as {
+			chatThread: { chatThreadId: number; latestMessage: { contents: string } | null }
+			chatResult: number
+		}
+		expect(body.chatResult).toBe(0)
+		expect(body.chatThread.latestMessage?.contents).toBe(
+			'{"Type":0,"Version":1,"Data":"**** this"}'
+		)
+	})
+
 	// Sending to people you already have a thread with appends to it, rather than
 	// stranding the message in a second conversation.
 	it('appends to the existing thread with the same members', async () => {
@@ -1224,6 +1243,54 @@ describe('POST /thread/:id', () => {
 		// The thread still comes back — only the opening notice is in it.
 		expect(body.chatThread.messages).toHaveLength(1)
 		expect(await getThreadMessages(env.DB, chatThreadId)).toHaveLength(1)
+	})
+
+	// The same filter api's POST /api/sanitize/v1 runs — the client isn't obliged to have
+	// called it, so a message posted straight here must not reach the thread unfiltered.
+	it('masks profanity in the envelope’s Data and leaves the rest of it alone', async () => {
+		const caller = 889012
+		const chatThreadId = await createThread(env.DB, [caller, 889013], null, caller)
+
+		const res = await send(
+			caller,
+			`/thread/${chatThreadId}`,
+			'{"Type":0,"Version":2,"Data":"<=>what the fuck man","Blocks":[]}'
+		)
+		const body = (await res.json()) as {
+			chatResult: number
+			chatThread: { messages: ChatMessage[] }
+		}
+		expect(body.chatResult).toBe(0)
+
+		// One `*` per character, so the word keeps its length; Type/Version/Blocks and the
+		// Version 2 `<=>` marker come through untouched.
+		expect(body.chatThread.messages[0]!.contents).toBe(
+			'{"Type":0,"Version":2,"Data":"<=>what the **** man","Blocks":[]}'
+		)
+		// Masked in the row too, not just in the response.
+		expect((await getThreadMessages(env.DB, chatThreadId))[0]!.contents).toBe(
+			body.chatThread.messages[0]!.contents
+		)
+	})
+
+	// Nothing to object to must come back as the very bytes that were sent — the envelope
+	// is only rebuilt when something was actually masked.
+	it('stores a clean envelope byte-for-byte', async () => {
+		const caller = 889014
+		const chatThreadId = await createThread(env.DB, [caller, 889015], null, caller)
+
+		const contents = '{"Type":0,"Version":2,"Data":"Grape Escape","Blocks":[{"Id":"x"}]}'
+		await send(caller, `/thread/${chatThreadId}`, contents)
+		expect((await getThreadMessages(env.DB, chatThreadId))[0]!.contents).toBe(contents)
+	})
+
+	// Contents that aren't an envelope are plain text with nothing in them to preserve.
+	it('censors contents that aren’t a JSON envelope whole', async () => {
+		const caller = 889016
+		const chatThreadId = await createThread(env.DB, [caller, 889017], null, caller)
+
+		await send(caller, `/thread/${chatThreadId}`, 'fuck off')
+		expect((await getThreadMessages(env.DB, chatThreadId))[0]!.contents).toBe('**** off')
 	})
 
 	it('is gated on membership and auth', async () => {

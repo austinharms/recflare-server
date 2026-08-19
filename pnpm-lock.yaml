@@ -341,6 +341,9 @@ importers:
 
   apps/chat:
     dependencies:
+      '@2toad/profanity':
+        specifier: 3.3.0
+        version: 3.3.0
       '@repo/hono-helpers':
         specifier: workspace:*
         version: link:../../packages/hono-helpers

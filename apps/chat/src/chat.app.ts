@@ -5,6 +5,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import { logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
+import { censorSwears } from '../../api/src/sanitize'
 import { NotificationType } from '../../notify/src/notification-types'
 import { getThreadMessages } from './message-db'
 import {
@@ -239,6 +240,49 @@ async function pushChatMessage(c: Context<App>, message: ChatMessage): Promise<v
 }
 
 /**
+ * The message envelope with the player's own words masked, as it will be stored.
+ *
+ * The same filter `api`'s `POST /api/sanitize/v1` runs, applied again here because
+ * nothing obliges the client to have called it: a message posted straight to this
+ * endpoint would otherwise reach every member of the thread unfiltered.
+ *
+ * Only `Data` — the text the player typed — is censored. `Type`, `Version`, the `Blocks`
+ * array and whatever else the client packs alongside are copied through untouched: the
+ * rest of the envelope is the client's own business and this server doesn't know what
+ * most of it means. The
+ * mask is one character per character, so lengths (and therefore the envelope) survive
+ * intact, and a Version 2 `Data` keeps its `<=>` prefix — the marker isn't a word, so
+ * whole-word matching never reaches it.
+ *
+ * Contents that aren't a JSON object, or whose `Data` isn't a string, are censored
+ * whole: a hand-written `messageContents=hi` is plain text with nothing in it to
+ * preserve. Text with nothing to object to comes back as the very bytes that were sent,
+ * which is the common case — the envelope is only rebuilt when something was masked.
+ *
+ * Blocked characters are deliberately NOT stripped the way `PreRemoveBlockedCharacters`
+ * strips them: chat carries emoji, and the format characters that rule removes include
+ * the zero-width joiners holding a multi-person emoji together.
+ */
+function censorContents(contents: string): string {
+	let envelope: unknown
+	try {
+		envelope = JSON.parse(contents)
+	} catch {
+		return censorSwears(contents)
+	}
+	if (typeof envelope !== 'object' || envelope === null || Array.isArray(envelope)) {
+		return censorSwears(contents)
+	}
+
+	const fields = envelope as Record<string, unknown>
+	const data = fields.Data
+	if (typeof data !== 'string') return contents
+
+	const censored = censorSwears(data)
+	return censored === data ? contents : JSON.stringify({ ...fields, Data: censored })
+}
+
+/**
  * Send a message to a thread that already exists — every message after the one that
  * opened the conversation. `/thread/18` is what the client posts; `/thread/18/message` is
  * the same call under the reference's other spelling, so both routes land here.
@@ -255,14 +299,19 @@ async function sendToThread(c: Context<App>) {
 	const chatThreadId = Number.parseInt(c.req.param('id') ?? '', 10)
 	if (!(await isThreadMember(c.env.DB, chatThreadId, id))) return c.notFound()
 
-	// Stored exactly as sent: the envelope carries its own Type/Version and may hold
-	// fields we know nothing about (the client sends Version 2 with a `<=>` prefix in
-	// Data, and a `Blocks` array alongside it), so nothing here parses or rewrites it.
+	// Stored as sent but for the profanity mask: the envelope carries its own Type/Version
+	// and may hold fields we know nothing about (the client sends Version 2 with a `<=>`
+	// prefix in Data, and a `Blocks` array alongside it), so `censorContents` rewrites the
+	// player's `Data` and nothing else.
 	const contents = (await formField(c, 'messageContents'))?.trim()
 	const posted =
 		contents === undefined || contents === ''
 			? null
-			: await postMessage(c.env.DB, { chatThreadId, senderPlayerId: id, contents })
+			: await postMessage(c.env.DB, {
+					chatThreadId,
+					senderPlayerId: id,
+					contents: censorContents(contents),
+				})
 	if (posted !== null) {
 		await pushChatMessage(c, posted)
 		// Sending is reading: the reference answers with `lastReadMessageId` already at the
@@ -402,7 +451,9 @@ function sendToThreadRoute(spelling: string) {
 		description: [
 			'Every message after the one that opened the conversation. Answers',
 			'`{ chatResult, chatThread }` — the WHOLE thread with its messages, not just the message',
-			'that was sent, so the client re-renders the conversation from one response. Blank or',
+			'that was sent, so the client re-renders the conversation from one response. The envelope’s',
+			'`Data` goes through the same profanity filter `api`’s `POST /api/sanitize/v1` runs, masked',
+			'one `*` per character; every other field is stored as sent. Blank or',
 			'missing `messageContents` stores nothing and reports invalid-arguments (1), still with',
 			'the thread attached, rather than an error status. Sending is reading: the sender’s own',
 			'`lastReadMessageId` comes back already at the message just posted. Pushes',
@@ -481,9 +532,11 @@ const app = new Hono<App>()
 	// players already share rather than opening a second one.
 	//
 	// `messageContents` is the same envelope a message carries
-	// (`{"Type":0,"Version":1,"Data":"…"}`) and is stored verbatim, unparsed. The client
-	// also sends it blank, right after /thread/withmembers: that opens the thread without
-	// posting an empty message, and reports invalid-arguments the way the reference does.
+	// (`{"Type":0,"Version":1,"Data":"…"}`), stored as sent but for the profanity mask
+	// `censorContents` puts over `Data` — the same filter the later messages go through,
+	// since the first one is no different. The client also sends it blank, right after
+	// /thread/withmembers: that opens the thread without posting an empty message, and
+	// reports invalid-arguments the way the reference does.
 	.post(
 		'/thread',
 		describeRoute({
@@ -523,7 +576,11 @@ const app = new Hono<App>()
 			const posted =
 				contents === undefined || contents === ''
 					? null
-					: await postMessage(c.env.DB, { chatThreadId, senderPlayerId: id, contents })
+					: await postMessage(c.env.DB, {
+							chatThreadId,
+							senderPlayerId: id,
+							contents: censorContents(contents),
+						})
 			if (posted !== null) {
 				await pushChatMessage(c, posted)
 				await markThreadRead(c.env.DB, chatThreadId, id, posted.chatMessageId)
