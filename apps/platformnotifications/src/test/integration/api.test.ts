@@ -112,3 +112,19 @@ it('401s the preferences read without a bearer token', async () => {
 	expect(res.status).toBe(401)
 	expect(await res.text()).toBe('')
 })
+
+it('serves the caller’s CRM config', async () => {
+	const res = await SELF.fetch(`${ORIGIN}/crm/me/config/v3`, { headers: await bearer('205') })
+	expect(res.status).toBe(200)
+	expect(res.headers.get('content-type')).toContain('application/json')
+	// Empty rather than invented: there is no CRM behind this, and made-up keys would switch
+	// on client messaging paths with nothing to serve them.
+	expect(await res.json()).toEqual({})
+})
+
+it('401s the CRM config read without a bearer token', async () => {
+	// `me`-scoped, so it needs a token even though the answer is the same for everyone.
+	const res = await SELF.fetch(`${ORIGIN}/crm/me/config/v3`)
+	expect(res.status).toBe(401)
+	expect(await res.text()).toBe('')
+})

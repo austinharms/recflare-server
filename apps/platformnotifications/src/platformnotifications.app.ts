@@ -87,6 +87,24 @@ const app = new Hono<App>()
 		return c.json(NOTIFICATION_CATEGORIES)
 	})
 
+	// The caller's CRM configuration — the campaign/messaging settings the client fetches on
+	// startup before it will ask about anything else here. An object, not an envelope.
+	//
+	// STUB: there is no CRM behind this, so the config is EMPTY rather than invented. An
+	// empty object is the honest answer and the client reads it as "nothing configured";
+	// made-up keys would switch on messaging paths that have nothing to serve them. Unlike
+	// `/config/categories` there is no visible text to mark as a stub — nothing here is
+	// rendered — so the marker stays in this comment.
+	//
+	// Auth-gated because the route is `me`-scoped, like `/preferences` below: the config
+	// belongs to the caller even while the answer is the same for everyone.
+	.get('/crm/me/config/v3', async (c) => {
+		const accountId = await authedId(c)
+		if (accountId === null) return unauthorized(c)
+
+		return c.json({})
+	})
+
 	// The caller's own notification preferences — which categories they have muted, by
 	// CategoryId (the ids `/config/categories` above hands out).
 	//
