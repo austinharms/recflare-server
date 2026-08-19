@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
+import charadesAprilWords from '../../static/charades-april.json'
 import charadesWords from '../../static/charades.json'
 import communityBoard from '../../static/community-board.json'
 import { authedId, unauthorized } from '../http'
@@ -69,6 +70,24 @@ async function sanitizeRequest(
 	}
 }
 
+/**
+ * The Charades word bank for a given moment: the April Fools list on April 1st, the
+ * ordinary list every other day.
+ *
+ * A REPLACEMENT, not an addition — the joke list stands alone for the day, which is why
+ * its ids (1258+) start past the end of the ordinary one rather than overlapping it. The
+ * client fetches the bank when the activity starts, so a game already running keeps
+ * whichever list it drew.
+ *
+ * The date is read in UTC, so the swap runs 00:00-23:59 UTC on April 1 for everyone
+ * rather than rolling around the world with local midnight. `now` is injectable so tests
+ * can pick a day.
+ */
+export function charadesWordsFor(now: Date = new Date()) {
+	const isAprilFools = now.getUTCMonth() === 3 && now.getUTCDate() === 1
+	return isAprilFools ? charadesAprilWords : charadesWords
+}
+
 // Text sanitization, keepsakes, objectives/events/rewards, and the misc analytics
 // sinks the client hits during load.
 export const gameplayRoutes = new Hono<App>({ strict: false })
@@ -128,6 +147,7 @@ export const gameplayRoutes = new Hono<App>({ strict: false })
 	// ---- Activities -----------------------------------------------------------
 	// Word bank for the Charades activity. The client requests the list by
 	// activity name (`.../words/Charades`); other activities have no data yet.
+	// On April 1st (UTC) the joke list replaces it — see `charadesWordsFor`.
 	.get(
 		'/api/activities/charades/v1/words/:activity',
 		describeRoute({
@@ -136,11 +156,12 @@ export const gameplayRoutes = new Hono<App>({ strict: false })
 			description:
 				'The words the Charades activity draws from. The client asks by activity name ' +
 				'(`.../words/Charades`); the name is not matched on, so every activity gets the ' +
-				'charades list — no other activity has data yet.',
+				'charades list — no other activity has data yet. On April 1st (UTC) the April ' +
+				'Fools word list is served in place of the ordinary one.',
 			parameters: [stringParam('activity', 'Activity name, e.g. `Charades`. Not matched on.')],
 			responses: { 200: json(JsonArray, 'The word list') },
 		}),
-		(c) => c.json(charadesWords)
+		(c) => c.json(charadesWordsFor())
 	)
 
 	// Keepsakes (room mementos). Stubbed empty.

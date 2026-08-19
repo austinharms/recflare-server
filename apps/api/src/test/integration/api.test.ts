@@ -44,6 +44,7 @@ import {
 	isPlayerBanned,
 	SCHEMA_DDL as REPORTS_SCHEMA_DDL,
 } from '../../reports-db'
+import { charadesWordsFor } from '../../routes/gameplay'
 import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
 import type { SavedImage } from '@repo/domain'
@@ -324,7 +325,32 @@ describe('public endpoints', () => {
 		const words = (await res.json()) as Array<{ Id: number; Difficulty: number; EN_US: string }>
 		expect(Array.isArray(words)).toBe(true)
 		expect(words.length).toBeGreaterThan(0)
-		expect(words[0]).toEqual({ Id: 1, Difficulty: 0, EN_US: 'David Bowie' })
+		// Which bank that is depends on the day — the April Fools list replaces the ordinary
+		// one on April 1st — so compare against the same selector the route uses rather than
+		// hard-coding a word here. The two banks' contents are pinned below.
+		expect(words).toEqual(charadesWordsFor())
+	})
+
+	test('serves the April Fools charades words on April 1st and the ordinary list otherwise', () => {
+		// A replacement, not an addition: the joke list stands alone for the day, and its ids
+		// start past the end of the ordinary one rather than overlapping it.
+		const april = charadesWordsFor(new Date('2026-04-01T12:00:00Z'))
+		expect(april[0]).toEqual({ Id: 1258, Difficulty: 10, EN_US: 'Nothing' })
+
+		const ordinary = charadesWordsFor(new Date('2026-04-02T12:00:00Z'))
+		expect(ordinary[0]).toEqual({ Id: 1, Difficulty: 0, EN_US: 'David Bowie' })
+		expect(ordinary.some((w) => w.Id === april[0].Id)).toBe(false)
+
+		// Every other day gets the ordinary list, including the edges of April 1 UTC and the
+		// first of other months.
+		expect(charadesWordsFor(new Date('2026-03-31T23:59:59Z'))).toBe(ordinary)
+		expect(charadesWordsFor(new Date('2026-04-02T00:00:00Z'))).toBe(ordinary)
+		expect(charadesWordsFor(new Date('2026-05-01T12:00:00Z'))).toBe(ordinary)
+		expect(charadesWordsFor(new Date('2026-01-01T12:00:00Z'))).toBe(ordinary)
+
+		// The window is the whole of April 1 in UTC, not local time.
+		expect(charadesWordsFor(new Date('2026-04-01T00:00:00Z'))).toBe(april)
+		expect(charadesWordsFor(new Date('2026-04-01T23:59:59Z'))).toBe(april)
 	})
 
 	// The client POSTs this with no body, despite it being a pure read; the route answers
