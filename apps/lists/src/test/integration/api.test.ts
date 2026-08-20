@@ -418,6 +418,65 @@ it.each(['recentlyupdated', 'new'])(
 	}
 )
 
+/** Stamp a visit, the way the `match` heartbeat's interaction write would. */
+async function recordVisit(playerId: number, roomId: number, at: string): Promise<void> {
+	await env.DB.prepare(
+		'INSERT OR REPLACE INTO interaction (player_id, room_id, last_visited_at) VALUES (?1, ?2, ?3)'
+	)
+		.bind(playerId, roomId, at)
+		.run()
+}
+
+/** The row ids `list` serves to the caller `headers` authenticate as. */
+async function personalRowIds(list: string, headers: Record<string, string>): Promise<string[]> {
+	const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/${list}?type=1`, { headers })
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as {
+		Type: number
+		Entities: Array<{ Id: string; Context: null }>
+	}
+	expect(body.Type).toBe(1)
+	expect(body.Entities.every((e) => e.Context === null)).toBe(true)
+	return body.Entities.map((e) => e.Id)
+}
+
+it('orders /algorithmiclists/recentlyvisited by the caller’s last visit, newest first', async () => {
+	// Player 42 (what `bearer()` mints by default) has been in three rooms; the timestamps
+	// are deliberately unrelated to creation and publish order, so this row can't pass on
+	// either of the orderings `new` and `recentlyupdated` assert.
+	await recordVisit(42, 3, '2026-07-01T00:00:00Z')
+	await recordVisit(42, 8, '2026-07-03T00:00:00Z')
+	await recordVisit(42, 4, '2026-07-02T00:00:00Z')
+
+	expect(await personalRowIds('recentlyvisited', await bearer('42'))).toEqual(['8', '4', '3'])
+})
+
+it('keeps one player’s recentlyvisited row out of another’s', async () => {
+	// Player 43 has been somewhere else entirely. The slug is the same for everyone, so the
+	// row has to be resolved from the TOKEN rather than from the row key.
+	await recordVisit(43, 7, '2026-07-04T00:00:00Z')
+	expect(await personalRowIds('recentlyvisited', await bearer('43'))).toEqual(['7'])
+})
+
+it('serves recentlyvisited a room the caller can still get back to, private or stock', async () => {
+	// Room 5 is private and room 2 is the Coach's — both are dropped from the RANKED rows,
+	// and both belong here: this is where the caller has actually been, not a recommendation.
+	await recordVisit(44, 5, '2026-07-05T00:00:00Z')
+	await recordVisit(44, 2, '2026-07-06T00:00:00Z')
+	expect(await personalRowIds('recentlyvisited', await bearer('44'))).toEqual(['2', '5'])
+})
+
+it('answers recentlyvisited empty for a caller with no history and no token', async () => {
+	// A brand-new account has been nowhere, and an untokened caller is nobody — both get an
+	// EMPTY row rather than the canned entities, which would claim visits that never happened,
+	// and rather than a 401, which the client renders as a row that failed to load.
+	expect(await personalRowIds('recentlyvisited', await bearer('999'))).toEqual([])
+
+	const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/RecentlyVisited?type=1`)
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ Type: 1, Entities: [] })
+})
+
 it('serves the rooms tagged `quest` for /algorithmiclists/quests_algoendpoint', async () => {
 	const ids = await rowIds('quests_algoendpoint')
 	// Ordering is the hot feed's (live players, then engagement), so assert membership.

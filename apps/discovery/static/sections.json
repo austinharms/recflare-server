@@ -16,6 +16,14 @@
 		"displayMetadata": "{\"DisplayTitle\":\"I'm Feeling Lucky\",\"unsupportedPlatforms\":[\"Switch\",\"Pico\",\"Oculus\"], \"unsupportedInteractionCategories\":[\"VR\"]}"
 	},
 	{
+		"id": "Rooms_ContinuePlaying_PlayLibrary",
+		"sectionType": 0,
+		"sectionSubType": "Rooms_ContinuePlaying",
+		"source": "Recent",
+		"sourceMetadata": null,
+		"displayMetadata": "{\"DisplayTitle\":\"Continue Playing\",\"supportsDedupe\":\"false\",\"numRows\":\"1\",\"sizePerPlatform\":\"\",\"backgroundColor\":\"\",\"horizontalScrollEnabled\":\"false\"}"
+	},
+	{
 		"id": "Rooms_RecentlyUpdated_TabsTest_Explore",
 		"sectionType": 0,
 		"sectionSubType": "Rooms_RecentlyUpdated",
@@ -78,14 +86,6 @@
 		"source": "CarouselEndpoint",
 		"sourceMetadata": "explore_algoendpoint",
 		"displayMetadata": "{\"DisplayTitle\":\"Explore\",\"supportsDedupe\":\"true\",\"numRows\":\"1\",\"sizePerPlatform\":\"\",\"backgroundColor\":\"\",\"horizontalScrollEnabled\":\"false\"}"
-	},
-	{
-		"id": "Rooms_ContinuePlaying_PlayLibrary",
-		"sectionType": 0,
-		"sectionSubType": "Rooms_ContinuePlaying",
-		"source": "Recent",
-		"sourceMetadata": null,
-		"displayMetadata": "{\"DisplayTitle\":\"Continue Playing\",\"supportsDedupe\":\"false\",\"numRows\":\"1\",\"sizePerPlatform\":\"\",\"backgroundColor\":\"\",\"horizontalScrollEnabled\":\"false\"}"
 	},
 	{
 		"id": "Rooms_SavedForLater_PlayHighlight",

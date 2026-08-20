@@ -1,7 +1,7 @@
 import { Hono } from 'hono'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { getHotRooms, getNewRooms, getRecentlyUpdatedRooms } from '@repo/domain'
+import { getHotRooms, getNewRooms, getRecentlyUpdatedRooms, getVisitedRooms } from '@repo/domain'
 import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
@@ -73,6 +73,15 @@ const ALGORITHMIC_LIST_ENTITIES: Array<{ Id: string; Context: string | null }> =
 const LIST_SIZE = 20
 
 /**
+ * A row's rooms as the entities the client reads back. Only the ids travel — it resolves
+ * each room against the `rooms` worker itself — so `Id` is the room id as a STRING and
+ * `Context` (the ranking attribution) is null, exactly as in `ALGORITHMIC_LIST_ENTITIES`.
+ */
+function toEntities(rooms: Room[]): Array<{ Id: string; Context: string | null }> {
+	return rooms.map((room) => ({ Id: String(room.RoomId), Context: null }))
+}
+
+/**
  * The feed the Hot row is drawn from: `community`, which is the hot ranking with the rooms
  * the Coach account (id 1) created dropped. Those are this server's stock/seeded rooms, and
  * a "Hot" row that is mostly Rec Center is a row about the server rather than about what
@@ -80,6 +89,19 @@ const LIST_SIZE = 20
  * definition of "community" stays in one place.
  */
 const HOT_LIST_FEED = 'community'
+
+/** What fills one row: the rooms it serves, in the order it serves them. */
+type RowFeed = (db: D1Database) => Promise<Room[]>
+
+/**
+ * The browse feeds answer a `{ Results, TotalResults }` PAGE; a row serves a bare list, and
+ * the total is meaningless here — a carousel shows what it shows. This unwraps one so the
+ * table below reads as a list of rankings rather than of destructurings.
+ */
+const ranked =
+	(feed: (db: D1Database) => Promise<{ Results: Room[] }>): RowFeed =>
+	async (db) =>
+		(await feed(db)).Results
 
 /**
  * A CATEGORY row: the public, listable rooms carrying one tag, ordered the way the hot feed
@@ -90,10 +112,7 @@ const HOT_LIST_FEED = 'community'
  * Only the `new`/`community` pseudo-tags get special treatment in there, so a category row
  * must never be given one of those names.
  */
-const tagRow =
-	(tag: string) =>
-	(db: D1Database): Promise<{ Results: Room[] }> =>
-		getHotRooms(db, tag, 0, LIST_SIZE)
+const tagRow = (tag: string): RowFeed => ranked((db) => getHotRooms(db, tag, 0, LIST_SIZE))
 
 /**
  * The rows that serve a LIVE ranking, keyed by the row slug, each answering the rooms that
@@ -117,18 +136,18 @@ const tagRow =
  *
  * The definitions live in `@repo/domain` next to the browse feeds they are cousins of.
  */
-const ROW_FEEDS: Record<string, (db: D1Database) => Promise<{ Results: Room[] }>> = {
+const ROW_FEEDS: Record<string, RowFeed> = {
 	// The same ranking the rooms worker's `/rooms/hot` serves — live player count first,
 	// then engagement — so the Hot row shows the rooms people are actually in.
-	hotlist: (db) => getHotRooms(db, HOT_LIST_FEED, 0, LIST_SIZE),
+	hotlist: ranked((db) => getHotRooms(db, HOT_LIST_FEED, 0, LIST_SIZE)),
 
 	// Ordered by when each room's live scene was last PUBLISHED. A staged save doesn't
 	// count: nothing anyone else can load has changed, so it must not float the room.
-	recentlyupdated: (db) => getRecentlyUpdatedRooms(db, 0, LIST_SIZE),
+	recentlyupdated: ranked((db) => getRecentlyUpdatedRooms(db, 0, LIST_SIZE)),
 
 	// Newest player-made rooms by creation time. Distinct from the browse screen's `tag=new`
 	// chip, which selects on the RRO flag instead — see `getNewRooms`.
-	new: (db) => getNewRooms(db, 0, LIST_SIZE),
+	new: ranked((db) => getNewRooms(db, 0, LIST_SIZE)),
 
 	// The category rows. Each names its tag OUTRIGHT rather than deriving one from the slug,
 	// because the mapping is not mechanical — `quests_algoendpoint` is plural and its tag
@@ -141,6 +160,25 @@ const ROW_FEEDS: Record<string, (db: D1Database) => Promise<{ Results: Room[] }>
 	hangout_algoendpoint: tagRow('hangout'),
 	casual_algoendpoint: tagRow('casual'),
 	explore_algoendpoint: tagRow('explore'),
+}
+
+/**
+ * Rows whose contents are a PROPERTY OF THE CALLER rather than a ranking — the same slug
+ * answers a different list for every player, so these are looked up separately and only
+ * these ever read the token. A row here is answered from the caller's own account id; there
+ * is nothing sensible to serve a caller who has no token (see the handler).
+ *
+ * Deliberately NOT filtered to public/listable/player-made the way the `ROW_FEEDS` rankings
+ * are. This is the player's own history: a room they visited that has since gone private is
+ * still a room they can get back to, and hiding it here while
+ * `rooms` `GET /rooms/visitedby/me` still lists it would have the same history read two ways.
+ */
+const PERSONAL_ROW_FEEDS: Record<string, (db: D1Database, accountId: number) => Promise<Room[]>> = {
+	// Rooms the caller has been in, most recently visited first — the "Continue Playing"
+	// carousel as an algorithmic row. Backed by the `interaction` table's `last_visited_at`,
+	// which the `match` heartbeat stamps, and served straight from `getVisitedRooms` so this
+	// row and `rooms` `GET /rooms/visitedby/me` can never disagree about where someone has been.
+	recentlyvisited: (db, accountId) => getVisitedRooms(db, accountId, 0, LIST_SIZE),
 }
 
 /**
@@ -224,12 +262,12 @@ const app = new Hono<App>()
 	// `Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore`), and the answer is the
 	// ranked entities that fill it, which the client then resolves by id itself.
 	//
-	// `HotList`, `recentlyupdated` and `new` are ranked for real (see `ROW_FEEDS`). Every
-	// other row still serves the canned entities, and an unknown row key gets them too rather
-	// than a 404, which the client renders as a row that failed to load. `Type` is echoed
-	// back from the query: it tells the client what the `Id`s ARE (rooms, players, …), so
-	// answering with a type the caller didn't ask for would have it resolve the ids against
-	// the wrong service.
+	// `HotList`, `recentlyupdated` and `new` are ranked for real (see `ROW_FEEDS`), and
+	// `recentlyvisited` is per-caller (see `PERSONAL_ROW_FEEDS`). Every other row still serves
+	// the canned entities, and an unknown row key gets them too rather than a 404, which the
+	// client renders as a row that failed to load. `Type` is echoed back from the query: it
+	// tells the client what the `Id`s ARE (rooms, players, …), so answering with a type the
+	// caller didn't ask for would have it resolve the ids against the wrong service.
 	.get('/algorithmiclists/:list', async (c) => {
 		// Echoed, but only when it fits the byte the client reads it back into — anything
 		// outside 0–255 can't round-trip, so a nonsense `?type=` gets the default instead of a
@@ -237,16 +275,26 @@ const app = new Hono<App>()
 		const type = Number.parseInt(c.req.query('type') ?? '', 10)
 		const echoed = type >= 0 && type <= MAX_LIST_ENTITY_TYPE ? type : DEFAULT_ALGORITHMIC_LIST_TYPE
 
+		const key = c.req.param('list').toLowerCase()
+
+		// A per-caller row needs to know who is asking, so it is the one kind of row that
+		// reads the token. No token — or one that doesn't resolve — answers an EMPTY row
+		// rather than 401ing or falling through to the canned entities: this is a row about
+		// what the caller has done, and canned rooms would claim they visited rooms they
+		// never did. An empty carousel is also what a brand-new account legitimately has.
+		const personal = PERSONAL_ROW_FEEDS[key]
+		if (personal !== undefined) {
+			const accountId = await authedId(c)
+			const rooms = accountId === null ? [] : await personal(c.env.DB, accountId)
+			return c.json({ Type: echoed, Entities: toEntities(rooms) })
+		}
+
 		// A row with a live feed behind it serves that; everything else gets the canned
 		// entities. Only the ids travel — the client resolves each room itself — so the
 		// ranking is read for its order and the room blobs are thrown away.
-		const feed = ROW_FEEDS[c.req.param('list').toLowerCase()]
+		const feed = ROW_FEEDS[key]
 		if (feed !== undefined) {
-			const { Results } = await feed(c.env.DB)
-			return c.json({
-				Type: echoed,
-				Entities: Results.map((room) => ({ Id: String(room.RoomId), Context: null })),
-			})
+			return c.json({ Type: echoed, Entities: toEntities(await feed(c.env.DB)) })
 		}
 
 		return c.json({ Type: echoed, Entities: ALGORITHMIC_LIST_ENTITIES })
