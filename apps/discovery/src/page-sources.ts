@@ -35,3 +35,38 @@ export async function fetchPageSource(c: Context<App>, type: string): Promise<Re
 	const res = await c.env.ASSETS.fetch(new Request(new URL(`/${type}.json`, c.req.url), c.req.raw))
 	return res.ok || res.status === 304 ? res : null
 }
+
+/**
+ * The file holding every section the client can ask for by id — the union of the rows the
+ * page sources draw from, which `/sections/bulk` filters. It is a plain file in `static/`
+ * like the page layouts, but it is NOT a page source: nothing draws it as a page, so it is
+ * deliberately not reachable through `/sections/pagesource/:type` (`SAFE_NAME` would let it
+ * through; the route simply isn't what asks for it).
+ */
+export const SECTIONS_CATALOGUE = 'sections'
+
+/**
+ * One row of a section file, as it is stored. Read as a bare record rather than a typed
+ * section because the rows are served back UNCHANGED — only `id` is ever looked at, and a
+ * field this worker doesn't model has to survive the round trip rather than be dropped by
+ * a projection.
+ */
+export type SectionRow = Record<string, unknown>
+
+/**
+ * Read and parse `static/<name>.json`. `null` when no such file is published.
+ *
+ * Unlike `fetchPageSource` this does NOT forward the caller's request. The body is needed
+ * here to filter, and forwarding would let a caller whose `If-None-Match` happens to match
+ * the FILE's etag get a bodiless 304 — wrong for a response that is a subset of the file
+ * rather than the file itself.
+ */
+export async function readSections(c: Context<App>, name: string): Promise<SectionRow[] | null> {
+	if (!SAFE_NAME.test(name)) return null
+
+	const res = await c.env.ASSETS.fetch(new URL(`/${name}.json`, c.req.url))
+	if (!res.ok) return null
+
+	const rows: unknown = await res.json()
+	return Array.isArray(rows) ? (rows as SectionRow[]) : null
+}

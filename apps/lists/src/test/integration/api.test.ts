@@ -103,99 +103,118 @@ it('serves the canned curated-list bulk lookup', async () => {
 	])
 })
 
-it('serves the canned discovery page from /curatedlists', async () => {
+it('serves one curated list object, not a collection', async () => {
+	// The client reads a single list off this endpoint — a bare object, not an array.
 	const res = await SELF.fetch(
-		`${ORIGIN}/curatedlists?creatorAccountId=1&type=5&name=RoomGenreTags`
+		`${ORIGIN}/curatedlists?creatorAccountId=1&type=7&name=Discovery.PageSource.PlayExplore`
 	)
 	expect(res.status).toBe(200)
 	expect(res.headers.get('content-type')).toContain('application/json')
 
-	const text = await res.text()
-	expect(JSON.parse(text)).toMatchObject([
-		{
-			ListId: 1,
-			CreatorAccountId: 1,
-			Name: 'Discovery.PageSource.PlayExplore',
-			Description: null,
-			ImageName: 'DefaultRoomImage.jpg',
-			Type: 7,
-			Accessibility: 1,
-			CreatedAt: '2025-04-23T18:27:03.2643786Z',
-			ItemIds: [
-				'Rooms_New_PlayHighlight_TabsTest_Explore',
-				'RoomCategories_MoodPlaylists_FeelingLucky',
-				'Rooms_RecentlyUpdated_TabsTest_Explore',
-				'Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-				'Rooms_Quests_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-				'Rooms_Roleplay_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-				'Rooms_Horror_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-				'Rooms_Hangout_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-				'Rooms_Casual_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-				'Rooms_Explore_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-			],
-		},
-	])
+	const body = await res.text()
+	// The reference's list ids are 64-bit: they must reach the client as an unquoted number
+	// with every digit intact, which parsing them here would round away (…307326 → …307300).
+	expect(body).toContain('"ListId":624765592684307326')
+
+	// Compared without the id: a literal here would round the same way the parse does, so
+	// the digits are checked on the raw body above and everything else on the object.
+	const { ListId: _id, ...rest } = JSON.parse(body) as Record<string, unknown>
+	expect(rest).toEqual({
+		CreatorAccountId: 1,
+		Name: 'Discovery.PageSource.PlayExplore',
+		Description: null,
+		ImageName: 'DefaultRoomImage.jpg',
+		Type: 7,
+		ItemIds: [
+			'Rooms_New_PlayHighlight_TabsTest_Explore',
+			'RoomCategories_MoodPlaylists_FeelingLucky',
+			'Rooms_RecentlyUpdated_TabsTest_Explore',
+			'Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Quests_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Roleplay_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Horror_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Hangout_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Casual_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Explore_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+		],
+		Accessibility: 1,
+		CreatedAt: '2025-04-23T18:27:03.2643786Z',
+	})
 })
 
-it('serves the PlayLibrary page when the query names it', async () => {
-	const res = await SELF.fetch(
-		`${ORIGIN}/curatedlists?creatorAccountId=1&type=5&name=Discovery.PageSource.PlayLibrary`
-	)
-	expect(res.status).toBe(200)
-
-	const text = await res.text()
-	expect(JSON.parse(text)).toMatchObject([
-		{
-			ListId: 2,
-			CreatorAccountId: 1,
-			Name: 'Discovery.PageSource.PlayLibrary',
-			Description: null,
-			ImageName: 'DefaultRoomImage.jpg',
-			Type: 7,
-			Accessibility: 1,
-			CreatedAt: '2025-04-23T18:25:31.5308539Z',
-			ItemIds: [
-				'Rooms_ContinuePlaying_PlayLibrary',
-				'Rooms_SavedForLater_PlayHighlight',
-				'Rooms_Favorites_PlayLibrary',
-				'Rooms_MyRooms_Play',
-			],
-		},
-	])
-
-	// The name is matched case-insensitively, and `type` is not filtered on — the request
-	// above asks for type 5 and gets the type 7 list, as the reference does.
-	const lower = await SELF.fetch(`${ORIGIN}/curatedlists?name=discovery.pagesource.playlibrary`)
-	expect(await lower.text()).toBe(text)
-})
-
-it('gives each curated page a distinct, JS-safe ListId', async () => {
-	// The client caches a list against its ListId, so two pages must never share one — and
-	// an id past Number.MAX_SAFE_INTEGER would round on the way through JSON, which is why
-	// these are small numbers of our own rather than the reference's 64-bit ones.
-	const pages = ['Discovery.PageSource.PlayExplore', 'Discovery.PageSource.PlayLibrary']
-	const ids: number[] = []
-	for (const name of pages) {
-		const [list] = (await (
-			await SELF.fetch(`${ORIGIN}/curatedlists?name=${name}`)
-		).json()) as Array<{ ListId: number }>
-		expect(Number.isSafeInteger(list.ListId)).toBe(true)
-		ids.push(list.ListId)
+it('serves every capture in static/curated-lists.json by name', async () => {
+	// One array holds every list, and each entry must be reachable by the keys the client
+	// asks with. `ImageName` must be a string even when empty — the client parses it into
+	// one — while `Description` may be null. The ids the client caches against have to be
+	// unique and reach it with their digits intact.
+	const names = [
+		'Discovery.PageSource.PlayExplore',
+		'Discovery.PageSource.PlayLibrary',
+		'RoomCategories.MoodPlaylists.AlgoEndpoint.FeelingLucky',
+	]
+	const seen = new Set<string>()
+	for (const name of names) {
+		const res = await SELF.fetch(`${ORIGIN}/curatedlists?creatorAccountId=1&type=7&name=${name}`)
+		expect(res.status).toBe(200)
+		const body = await res.text()
+		// Never a quoted id: the client's field is a number.
+		expect(body).toMatch(/"ListId":\d+,/)
+		const list = JSON.parse(body) as {
+			ListId: number
+			Type: number
+			Name: string
+			ItemIds: string[]
+			Description: string | null
+			ImageName: string
+		}
+		expect(list.Name).toBe(name)
+		expect(list.Type).toBe(7)
+		expect(list.ItemIds.length).toBeGreaterThan(0)
+		expect(typeof list.ImageName).toBe('string')
+		const id = /"ListId":(\d+),/.exec(body)?.[1]
+		expect(seen.has(id!)).toBe(false)
+		seen.add(id!)
 	}
-	expect(new Set(ids).size).toBe(ids.length)
 })
 
-it('falls back to the Explore page for a name it has nothing for', async () => {
-	// An empty array renders as an empty Play page, so an unknown page source answers
-	// SOMETHING — which is also what the reference was observed doing for RoomGenreTags.
+it('matches the name case-insensitively and prefers it over the type', async () => {
+	const canonical = await (
+		await SELF.fetch(
+			`${ORIGIN}/curatedlists?creatorAccountId=1&type=7&name=Discovery.PageSource.PlayLibrary`
+		)
+	).text()
+	expect(canonical).toContain('"ListId":5321092632685904804')
+	expect(JSON.parse(canonical)).toMatchObject({ Name: 'Discovery.PageSource.PlayLibrary', Type: 7 })
+
+	// Casing reaching us is the client's, not ours.
+	const lower = await SELF.fetch(`${ORIGIN}/curatedlists?name=discovery.pagesource.playlibrary`)
+	expect(await lower.text()).toBe(canonical)
+
+	// Every capture shares type 7, so the name is what tells them apart — a request naming
+	// Library must never come back with Explore's rows, and the type alone answers with the
+	// page default (the first list in the array).
+	const explore = await SELF.fetch(`${ORIGIN}/curatedlists?type=7`)
+	expect(((await explore.json()) as { Name: string }).Name).toBe('Discovery.PageSource.PlayExplore')
+})
+
+it('falls back to the default list for a name it has nothing under', async () => {
+	// The store's Featured page asks for its rows by the reference's numeric list id rather
+	// than by a name — nothing here is called that, and nothing is captured under its type
+	// either, so the default list answers. An empty body or a 404 would render as a blank
+	// page rather than an error.
 	const explore = await (
 		await SELF.fetch(`${ORIGIN}/curatedlists?name=Discovery.PageSource.PlayExplore`)
 	).text()
 
-	for (const query of ['?type=99&name=Nope', '?creatorAccountId=1&type=5&name=RoomGenreTags', '']) {
-		const res = await SELF.fetch(`${ORIGIN}/curatedlists${query}`)
-		expect(res.status).toBe(200)
-		expect(await res.text()).toBe(explore)
+	for (const query of [
+		'?creatorAccountId=1&type=4&name=17859340',
+		'?type=99&name=Nope',
+		'?creatorAccountId=7&type=&name=',
+		'',
+	]) {
+		const bare = await SELF.fetch(`${ORIGIN}/curatedlists${query}`)
+		expect(bare.status).toBe(200)
+		expect(await bare.text()).toBe(explore)
 	}
 })
 

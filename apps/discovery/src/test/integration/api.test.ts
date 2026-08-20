@@ -12,7 +12,6 @@ const PAGE_SOURCES = [
 	'StoreFeatured',
 	'StoreClothing',
 	'StoreConsumables',
-	'bulk',
 ]
 
 interface Section {
@@ -152,12 +151,121 @@ describe('GET /sections/pagesource/:type', () => {
 	})
 })
 
+describe('GET /sections/bulk', () => {
+	/** Fetch a set of section ids and return the parsed rows. */
+	async function bulk(ids: string[]) {
+		const query = ids.map((id) => `id=${encodeURIComponent(id)}`).join('&')
+		const res = await SELF.fetch(`https://discovery.example.com/sections/bulk?${query}`)
+		expect(res.status).toBe(200)
+		expect(res.headers.get('content-type')).toContain('application/json')
+		return (await res.json()) as Section[]
+	}
+
+	// The ids arrive as a REPEATED parameter, not a delimited one. Reading only the first
+	// would drop every row but one and leave the page nearly empty.
+	it('serves every id the query repeats', async () => {
+		const ids = [
+			'Rooms_New_PlayHighlight_TabsTest_Explore',
+			'RoomCategories_MoodPlaylists_FeelingLucky',
+			'Rooms_RecentlyUpdated_TabsTest_Explore',
+			'Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Quests_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Roleplay_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Horror_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Hangout_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Casual_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+			'Rooms_Explore_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
+		]
+		const sections = await bulk(ids)
+		expect(sections.map((s) => s.id)).toEqual(ids)
+	})
+
+	it('serves the catalogue rows verbatim', async () => {
+		const sections = await bulk(['RoomCategories_MoodPlaylists_FeelingLucky'])
+		expect(sections).toEqual([
+			{
+				id: 'RoomCategories_MoodPlaylists_FeelingLucky',
+				// RoomCategoryListSection.
+				sectionType: 12,
+				sectionSubType: 'RoomCategories',
+				source: 'CuratedList',
+				sourceMetadata: 'RoomCategories.MoodPlaylists.AlgoEndpoint.FeelingLucky',
+				displayMetadata: expect.stringContaining('"DisplayTitle":"I\'m Feeling Lucky"'),
+			},
+		])
+	})
+
+	// The answer is the catalogue filtered, so it is ordered by the FILE and not by the
+	// query, and an id can only ever come back once however many times it is asked for.
+	it('answers in catalogue order regardless of the query order', async () => {
+		const sections = await bulk([
+			'Rooms_RecentlyUpdated_TabsTest_Explore',
+			'Rooms_New_PlayHighlight_TabsTest_Explore',
+		])
+		expect(sections.map((s) => s.id)).toEqual([
+			'Rooms_New_PlayHighlight_TabsTest_Explore',
+			'Rooms_RecentlyUpdated_TabsTest_Explore',
+		])
+	})
+
+	it('yields a repeated id once', async () => {
+		const sections = await bulk([
+			'Rooms_New_PlayHighlight_TabsTest_Explore',
+			'Rooms_New_PlayHighlight_TabsTest_Explore',
+		])
+		expect(sections.map((s) => s.id)).toEqual(['Rooms_New_PlayHighlight_TabsTest_Explore'])
+	})
+
+	// An unknown id is left out rather than erroring: one stale id in a page's list must not
+	// take the rest of the page down with it.
+	it('skips ids that match nothing', async () => {
+		const sections = await bulk(['nope', 'Rooms_MyRooms_Play', 'also-nope'])
+		expect(sections.map((s) => s.id)).toEqual(['Rooms_MyRooms_Play'])
+	})
+
+	it('answers an empty array when no id matches', async () => {
+		expect(await bulk(['nope'])).toEqual([])
+	})
+
+	// No ids asked for means nothing wanted — NOT the whole catalogue.
+	it('answers an empty array when the query names no ids', async () => {
+		const res = await SELF.fetch('https://discovery.example.com/sections/bulk')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([])
+	})
+
+	// The catalogue is a file in `static/` like the layouts, so the page-source route reaches
+	// it too — `{type}` is the filename and nothing indexes which files are pages. Harmless
+	// and asserted so the overlap is a known fact rather than a surprise; the client asks for
+	// the catalogue through this route's `?id=` filter, never as a page.
+	it('is also reachable through the page-source route, unfiltered', async () => {
+		const res = await SELF.fetch('https://discovery.example.com/sections/pagesource/sections')
+		expect(res.status).toBe(200)
+		expect((await res.json()) as Section[]).toHaveLength(14)
+	})
+
+	// The response is a SUBSET of the file, so it must never be answered with the file's
+	// etag — a client that cached the file would otherwise be told its copy is still good.
+	it('ignores a conditional request matching the catalogue file', async () => {
+		const sections = await bulk(['Rooms_MyRooms_Play'])
+		expect(sections).toHaveLength(1)
+
+		const res = await SELF.fetch(
+			'https://discovery.example.com/sections/bulk?id=Rooms_MyRooms_Play',
+			{ headers: { 'if-none-match': '"anything"' } }
+		)
+		expect(res.status).toBe(200)
+		expect((await res.json()) as Section[]).toHaveLength(1)
+	})
+})
+
 describe('GET /openapi.json', () => {
 	it('generates a spec with no dangling $refs', async () => {
 		const res = await SELF.fetch('https://discovery.example.com/openapi.json')
 		expect(res.status).toBe(200)
 		const spec = (await res.json()) as { paths: Record<string, unknown> }
 		expect(Object.keys(spec.paths)).toContain('/sections/pagesource/{type}')
+		expect(Object.keys(spec.paths)).toContain('/sections/bulk')
 		expect(JSON.stringify(spec).match(/\$ref/g)).toBeNull()
 	})
 })

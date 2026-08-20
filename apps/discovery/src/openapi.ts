@@ -30,13 +30,40 @@ export const PAGE_SOURCE_PARAM: OpenAPIV3_1.ParameterObject = {
 	description: [
 		'The page source — `WatchHome`, `PlayHighlight`, `CommunityBoard`, `PlayMenuTabs`,',
 		'`PlayCategories`, `StoreCategories`, `StoreFeatured`, `StoreClothing`,',
-		'`StoreConsumables`, `bulk` at the time of writing. It names a file in `static/`',
+		'`StoreConsumables` at the time of writing. It names a file in `static/`',
 		'(`<type>.json`) and is matched exactly, case included, so the set is whatever is',
 		'published rather than anything this worker enumerates.',
+		'',
+		'`sections` is a file in `static/` too but is not one of these: it is the id-keyed',
+		'catalogue `/sections/bulk` filters, not a page anything draws.',
 	].join(' '),
 	// Deliberately not an `enum`: the accepted values are the published files, and a spec
 	// that froze today's list would be wrong the moment one is added.
 	schema: { type: 'string', example: 'WatchHome' },
+}
+
+/**
+ * The repeated `?id=` query the bulk lookup selects on. Repetition, not a delimiter: the
+ * client sends `?id=A&id=B&id=C`, so this is `explode: true` form style rather than a
+ * single comma-joined value.
+ */
+export const SECTION_IDS_PARAM: OpenAPIV3_1.ParameterObject = {
+	name: 'id',
+	in: 'query',
+	required: false,
+	description: [
+		'A section id to look up, repeated once per section wanted. Ids that match nothing are',
+		'skipped rather than erroring, and repeating one still yields it once — the answer is',
+		'the catalogue filtered, so it can only ever be a subset of it. Omitting the parameter',
+		'entirely answers `[]`.',
+	].join(' '),
+	style: 'form',
+	explode: true,
+	schema: { type: 'array', items: { type: 'string' } },
+	example: [
+		'Rooms_New_PlayHighlight_TabsTest_Explore',
+		'RoomCategories_MoodPlaylists_FeelingLucky',
+	],
 }
 
 // ---- Response schemas ------------------------------------------------------
@@ -82,7 +109,8 @@ export const DiscoverySection = z.object({
 })
 
 /**
- * `GET /sections/pagesource/{type}` — a page's sections, in the order they are drawn.
+ * A list of sections — `GET /sections/pagesource/{type}` in the order a page draws them,
+ * or `GET /sections/bulk` in the catalogue's order.
  *
  * The DTO accepts anything (its validator is a no-op), but the STORE page builder is much
  * stricter and drops a section it doesn't like SILENTLY — no error reaches the client, the

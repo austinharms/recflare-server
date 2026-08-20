@@ -5,6 +5,8 @@ import { getHotRooms } from '@repo/domain'
 import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
+import { resolveCuratedList, serializeCuratedList } from './curated-lists'
+
 import type { Context } from 'hono'
 import type { App } from './context'
 
@@ -22,8 +24,10 @@ function unauthorized(c: Context<App>) {
 }
 
 /**
- * What the ids in a list ARE. One enum shared by the curated lists' `Type` and the
- * algorithmic lists' — a BYTE on the client, so only 0–255 round-trips.
+ * What the ids in an ALGORITHMIC list are — a BYTE on the client, so only 0–255
+ * round-trips. Not the curated lists' `Type`, which names the page a list belongs to
+ * (see `CuratedListType` in `curated-lists.ts`); the two are different enums that happen to
+ * share a field name.
  *
  * It is what tells the client which service to resolve the ids against, which is why the
  * algorithmic route echoes back the type it was asked for rather than asserting one of its
@@ -44,64 +48,6 @@ const ListEntityType = {
 
 /** The largest value the client's byte-wide `Type` can carry back. */
 const MAX_LIST_ENTITY_TYPE = 255
-
-/**
- * The canned discovery pages served by `GET /curatedlists`, keyed by the `Name` the client
- * asks for. `ItemIds` are discovery row keys (strings), `Description` is null but
- * `ImageName` must be a string, and `CreatedAt` keeps its 7-digit fractional seconds — all
- * as the client's parser expects them.
- *
- * `ListId` is ours to choose and is deliberately SMALL. The reference's ids are 64-bit
- * (`624765592684307326`), past what a JS number holds exactly, so serving them verbatim
- * meant carrying them as bigints and hand-writing the JSON to keep the digits — machinery
- * for an id nothing on this server looks up. What the id has to be is stable and unique
- * per page: the client caches a list against it, so two pages sharing one id would serve
- * each other's rows from cache, and changing a page's id would drop its cache. Renumber
- * only when the page's contents are meant to be re-fetched.
- */
-const CURATED_LISTS = [
-	{
-		ListId: 1,
-		CreatorAccountId: 1,
-		Name: 'Discovery.PageSource.PlayExplore',
-		Description: null,
-		ImageName: 'DefaultRoomImage.jpg',
-		Type: ListEntityType.DiscoverySection,
-		ItemIds: [
-			'Rooms_New_PlayHighlight_TabsTest_Explore',
-			'RoomCategories_MoodPlaylists_FeelingLucky',
-			'Rooms_RecentlyUpdated_TabsTest_Explore',
-			'Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-			'Rooms_Quests_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-			'Rooms_Roleplay_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-			'Rooms_Horror_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-			'Rooms_Hangout_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-			'Rooms_Casual_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-			'Rooms_Explore_AlgoEndpoint_PlayHighlight_TabsTest_Explore',
-		],
-		Accessibility: 1,
-		CreatedAt: '2025-04-23T18:27:03.2643786Z',
-	},
-	{
-		ListId: 2,
-		CreatorAccountId: 1,
-		Name: 'Discovery.PageSource.PlayLibrary',
-		Description: null,
-		ImageName: 'DefaultRoomImage.jpg',
-		Type: ListEntityType.DiscoverySection,
-		// The library page: what you were playing, saved, favorited and made. Note the
-		// second row is a `PlayHighlight` key rather than a `PlayLibrary` one — that is the
-		// reference's own naming, not a typo to tidy.
-		ItemIds: [
-			'Rooms_ContinuePlaying_PlayLibrary',
-			'Rooms_SavedForLater_PlayHighlight',
-			'Rooms_Favorites_PlayLibrary',
-			'Rooms_MyRooms_Play',
-		],
-		Accessibility: 1,
-		CreatedAt: '2025-04-23T18:25:31.5308539Z',
-	},
-]
 
 /**
  * The entities an algorithmic list hands back (`GET /algorithmiclists/:list`) — ROOMS, which
@@ -149,21 +95,6 @@ const HOT_LIST_FEED = 'community'
  */
 const DEFAULT_ALGORITHMIC_LIST_TYPE = ListEntityType.Rooms
 
-/**
- * Each page keyed by its lowercased `Name` — the only thing a request decides is which one
- * it gets. Each entry is an ARRAY of one list: the endpoint answers a collection, and the
- * client reads it as such however many entries come back.
- */
-const CURATED_LIST_PAGES = new Map(CURATED_LISTS.map((list) => [list.Name.toLowerCase(), [list]]))
-
-/**
- * What a request that names no page — or names one nothing is captured for — gets: the
- * Explore page. A 404 or an empty array renders as an empty Play page, so answering with
- * SOMETHING is the better failure, and it is also what the reference was observed doing
- * for a `name` this server has no list under.
- */
-const DEFAULT_CURATED_LIST_PAGE = CURATED_LIST_PAGES.get('discovery.pagesource.playexplore')!
-
 const app = new Hono<App>()
 	.use(
 		'*',
@@ -202,22 +133,35 @@ const app = new Hono<App>()
 		])
 	})
 
-	// The curated lists behind a discovery page (`GET /curatedlists`). The client asks with
-	// `?creatorAccountId=&type=&name=`, and `name` is the page it wants
-	// (`Discovery.PageSource.PlayExplore`, `…PlayLibrary`): it picks which canned page comes
-	// back, matched case-insensitively. Nothing curates lists here, so the pages are static
-	// captures — the same stand-in posture as `/curatedlists/bulk` above.
+	// The curated list behind a discovery page (`GET /curatedlists`). The client asks with
+	// `?creatorAccountId=&type=&name=` and reads back ONE list object — not a collection.
+	// `type` is the page asking (`CuratedListType`: the Watch home, the store's Featured tab,
+	// …) and dictates the name it asks under, so the two normally agree.
 	//
-	// `creatorAccountId` and `type` are accepted and IGNORED, deliberately: the reference was
-	// observed answering a `type=5` request with a `Type` 7 list, so filtering on them would
-	// answer nothing where it answers a page. An unknown `name` falls back to Explore rather
-	// than an empty array, which renders as an empty Play page.
+	// Nothing curates lists here, so every list is a static capture in
+	// `static/curated-lists.json`. `resolveCuratedList` matches most-specific first and
+	// always answers something: a name this server has nothing under falls back to the page's
+	// default list rather than 404ing or answering empty, either of which renders as a blank
+	// page. That fallback is load-bearing — the store's Featured page asks for its rows by the
+	// reference's numeric list id (`name=17859340`), which is nothing's name here.
 	//
-	// `ItemIds` are the discovery ROWS the page is built from (algorithm/section keys), not
-	// room ids — the client resolves each one itself.
+	// `ItemIds` are the discovery ROWS the page is built from (the section keys the `discovery`
+	// worker serves), not room or item ids — the client resolves each one itself.
 	.get('/curatedlists', async (c) => {
-		const name = c.req.query('name') ?? ''
-		return c.json(CURATED_LIST_PAGES.get(name.toLowerCase()) ?? DEFAULT_CURATED_LIST_PAGE)
+		// Serialized by hand rather than through `c.json`: the reference's `ListId`s are
+		// 64-bit and are carried as strings so their digits survive being parsed — see
+		// `serializeCuratedList`, which puts them back on the wire as numbers.
+		return c.body(
+			serializeCuratedList(
+				resolveCuratedList(
+					c.req.query('creatorAccountId'),
+					c.req.query('type'),
+					c.req.query('name')
+				)
+			),
+			200,
+			{ 'content-type': 'application/json' }
+		)
 	})
 
 	// One discovery ROW's contents (`GET /algorithmiclists/:list?type=1`). `:list` is the row
