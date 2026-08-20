@@ -219,6 +219,17 @@ describe('rooms endpoints', () => {
 		expect(body.map((r) => r.Name).sort()).toEqual(['DormRoom', 'RecCenter'])
 	})
 
+	it('GET /rooms/bulk takes repeated id params, like the POST form', async () => {
+		// The client spells the GET's id list the same way it spells the POST body's — one
+		// `id` per room. Reading only the first left it rendering a single room.
+		const res = await SELF.fetch(
+			`${ORIGIN}/rooms/bulk?id=1&id=2&id=999999&excludePrivateRooms=False`
+		)
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as Array<{ Name: string }>
+		expect(body.map((r) => r.Name).sort()).toEqual(['DormRoom', 'RecCenter'])
+	})
+
 	it('GET /rooms/bulk?name=RecCenter returns [RecCenter]', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/rooms/bulk?name=RecCenter`)
 		const body = (await res.json()) as Array<{ Name: string }>

@@ -167,6 +167,14 @@ function tooManyIds(c: Context<App>) {
 	return c.json(`At most ${MAX_BULK_ROOM_IDS} room ids may be looked up at once`, 400)
 }
 
+/**
+ * Whether a bulk lookup asked for the public-only filter. The client sends the C# spelling
+ * (`True`/`False`) and absent means False, so anything but a case-insensitive `true` is off.
+ */
+function excludePrivateRooms(value: string | undefined): boolean {
+	return (value ?? '').toLowerCase() === 'true'
+}
+
 function allIds(idParam: string): number[] {
 	return idParam
 		.split(',')
@@ -939,13 +947,15 @@ const app = new Hono<App>()
 			tags: ['Rooms'],
 			summary: 'Look up several rooms at once',
 			description: [
-				'Rooms by a comma-separated `id` list, or a single `name`. Ids that aren’t in D1 are',
-				'simply absent from the result rather than an error — the client reads an empty result',
-				'as NoSuchRoom.',
+				'Rooms by `id` — repeated `id` params, a comma-separated list, or both — or a single',
+				'`name`. Ids that aren’t in D1 are simply absent from the result rather than an error —',
+				'the client reads an empty result as NoSuchRoom. `excludePrivateRooms=True` drops rooms',
+				'that are not publicly visible, as on the POST.',
 			].join(' '),
 			parameters: [
-				stringQuery('id', 'Comma-separated room ids'),
+				stringQuery('id', 'Room ids — repeated `id` fields, comma-separated, or both'),
 				stringQuery('name', 'A single room name. Ignored when `id` is given'),
+				stringQuery('excludePrivateRooms', 'True drops rooms that are not publicly visible'),
 			],
 			responses: {
 				200: json(RoomDto.array(), 'The rooms that matched (missing ids are omitted)'),
@@ -956,15 +966,22 @@ const app = new Hono<App>()
 			},
 		}),
 		async (c) => {
-			const idParam = c.req.query('id')
+			// `id` repeats (`?id=641&id=657`) as often as it is comma-separated, and the client
+			// spells it both ways — read every occurrence, then split each on commas.
+			const idParams = c.req.queries('id') ?? []
 			const nameParam = c.req.query('name')
-			if (!idParam && !nameParam) {
+			if (idParams.length === 0 && !nameParam) {
 				return c.json("Either 'id' or 'name' query parameter is required", 400)
 			}
-			if (idParam) {
-				const ids = allIds(idParam)
+			if (idParams.length > 0) {
+				const ids = idParams.flatMap(allIds)
 				if (ids.length > MAX_BULK_ROOM_IDS) return tooManyIds(c)
-				return c.json(await getRoomsByIds(c.env.DB, ids))
+				const rooms = await getRoomsByIds(c.env.DB, ids)
+				return c.json(
+					excludePrivateRooms(c.req.query('excludePrivateRooms'))
+						? rooms.filter((r) => r.Accessibility === 1)
+						: rooms
+				)
 			}
 			const room = await getRoomByName(c.env.DB, nameParam ?? '')
 			return c.json(room ? [room] : [])
@@ -1018,7 +1035,7 @@ const app = new Hono<App>()
 			if (ids.length > MAX_BULK_ROOM_IDS) return tooManyIds(c)
 			const rooms = await getRoomsByIds(c.env.DB, ids)
 
-			const excludePrivate = (field('excludePrivateRooms')[0] ?? '').toLowerCase() === 'true'
+			const excludePrivate = excludePrivateRooms(field('excludePrivateRooms')[0])
 			return c.json(excludePrivate ? rooms.filter((r) => r.Accessibility === 1) : rooms)
 		}
 	)
