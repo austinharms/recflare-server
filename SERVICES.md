@@ -48,7 +48,7 @@ apex/`ns` host and isn't listed within it. Each implemented worker has its own
 | Notifications         | `notify`                | `notify`                | Real-time notifications over SignalR/WebSockets (Durable Object)      |
 | PlatformNotifications | `platformnotifications` | `platformnotifications` | Stub — deploys and answers, no notification endpoints yet             |
 | PlayerSettings        | `playersettings`        | `playersettings`        | Per-player settings (KV)                                              |
-| RoomComments          | `roomcomments`          | —                       | Not yet implemented                                                   |
+| RoomComments          | `roomcomments`          | `roomcomments`          | Stub — deploys and answers, no comment endpoints yet                  |
 | RoomieIntegrations    | `roomieintegrations`    | —                       | Not yet implemented                                                   |
 | Rooms                 | `rooms`                 | `rooms`                 | Room storage & queries; seeds the Dorm & Orientation rooms (D1)       |
 | Storage               | `storage`               | —                       | Room uploader                                                         |
