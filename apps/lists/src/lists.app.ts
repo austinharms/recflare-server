@@ -1,14 +1,22 @@
 import { Hono } from 'hono'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { getHotRooms, getNewRooms, getRecentlyUpdatedRooms, getVisitedRooms } from '@repo/domain'
+import {
+	Accessibility,
+	addPlayerListItem,
+	getHotRooms,
+	getNewRooms,
+	getPlayerList,
+	getRecentlyUpdatedRooms,
+	getVisitedRooms,
+} from '@repo/domain'
 import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
 import { resolveCuratedList, serializeCuratedList } from './curated-lists'
 
 import type { Context } from 'hono'
-import type { Room } from '@repo/domain'
+import type { CuratedList, Room } from '@repo/domain'
 import type { App } from './context'
 
 /**
@@ -61,13 +69,7 @@ const MAX_LIST_ENTITY_TYPE = 255
  * so it is null on every one rather than a made-up context the client would carry into
  * telemetry.
  */
-const ALGORITHMIC_LIST_ENTITIES: Array<{ Id: string; Context: string | null }> = [
-	'2',
-	'3',
-	'4',
-	'5',
-	'6',
-].map((Id) => ({ Id, Context: null }))
+const ALGORITHMIC_LIST_ENTITIES: Array<{ Id: string; Context: string | null }> = [].map((Id) => ({ Id, Context: null }))
 
 /** How many rooms a row carries. A discovery carousel shows a page, not the world. */
 const LIST_SIZE = 20
@@ -188,6 +190,56 @@ const PERSONAL_ROW_FEEDS: Record<string, (db: D1Database, accountId: number) => 
  */
 const DEFAULT_ALGORITHMIC_LIST_TYPE = ListEntityType.Rooms
 
+/**
+ * The stored list the query names, if a player owns one. Undefined when any of the three
+ * keys is missing or unparseable — a player list is owned by an account and typed, so a
+ * query that names neither cannot be asking for one, and there is no read to make.
+ *
+ * Not auth-gated: the client asks for its own lists by passing its account id rather than by
+ * being logged in, `Accessibility` is a property of the list rather than of the reader, and
+ * the endpoint has never taken a token. A list read here is only ever ids the client then
+ * resolves itself.
+ */
+async function ownedList(
+	c: Context<App>,
+	creatorAccountId: string | undefined,
+	type: string | undefined,
+	name: string | undefined
+): Promise<CuratedList | undefined> {
+	const accountId = Number.parseInt(creatorAccountId ?? '', 10)
+	const listType = Number.parseInt(type ?? '', 10)
+	if (!Number.isInteger(accountId) || !Number.isInteger(listType) || !name) return undefined
+
+	return getPlayerList(c.env.DB, accountId, listType, name)
+}
+
+/**
+ * One field of a form-urlencoded body, matched case-insensitively and falling back to the
+ * query string. The client puts this call's parameters in the BODY (`accessibility=0&type=1`),
+ * but the same parameters ride the query string everywhere else on this worker, and a PUT
+ * whose body failed to parse would otherwise silently create a list with the wrong type.
+ */
+function bodyField(
+	body: Record<string, unknown>,
+	c: Context<App>,
+	name: string
+): string | undefined {
+	const key = Object.keys(body).find((k) => k.toLowerCase() === name.toLowerCase())
+	const value = key === undefined ? undefined : body[key]
+	return typeof value === 'string' ? value : c.req.query(name)
+}
+
+/** An integer field, or `fallback` when it is absent or not one. */
+function intField(
+	body: Record<string, unknown>,
+	c: Context<App>,
+	name: string,
+	fallback: number
+): number {
+	const parsed = Number.parseInt(bodyField(body, c, name) ?? '', 10)
+	return Number.isInteger(parsed) ? parsed : fallback
+}
+
 const app = new Hono<App>()
 	.use(
 		'*',
@@ -226,35 +278,79 @@ const app = new Hono<App>()
 		])
 	})
 
-	// The curated list behind a discovery page (`GET /curatedlists`). The client asks with
-	// `?creatorAccountId=&type=&name=` and reads back ONE list object — not a collection.
-	// `type` is the page asking (`CuratedListType`: the Watch home, the store's Featured tab,
-	// …) and dictates the name it asks under, so the two normally agree.
+	// One curated list (`GET /curatedlists?creatorAccountId=&type=&name=`). The client reads
+	// back ONE list object — not a collection — and asks for two different things through the
+	// same three parameters:
 	//
-	// Nothing curates lists here, so every list is a static capture in
-	// `static/curated-lists.json`. `resolveCuratedList` matches most-specific first and
-	// always answers something: a name this server has nothing under falls back to the page's
-	// default list rather than 404ing or answering empty, either of which renders as a blank
-	// page. That fallback is load-bearing — the store's Featured page asks for its rows by the
-	// reference's numeric list id (`name=17859340`), which is nothing's name here.
+	//  - A discovery PAGE's row set, which is a static capture in `static/curated-lists.json`
+	//    (`ItemIds` are the discovery section keys the page is built from, not room ids).
+	//  - A PLAYER's own playlist, which lives in D1 — the `list` / `list_item` tables this
+	//    worker owns. `__SavedForLater_Rooms` is the one the client creates for itself: the
+	//    Play menu's "Saved for Later" row is `MyPlaylistByName` pointed at that name, and it
+	//    is asked for with the player's own id and `type=1` (Rooms), so its `ItemIds` are
+	//    room ids.
 	//
-	// `ItemIds` are the discovery ROWS the page is built from (the section keys the `discovery`
-	// worker serves), not room or item ids — the client resolves each one itself.
+	// D1 is asked FIRST, so a player's own list wins over a capture that happens to share its
+	// name — the captures are this server's fixtures and a player's list is their data.
+	// Nothing else distinguishes the two requests: both are the same three parameters, and a
+	// name nobody owns still has to answer something (see `resolveCuratedList`).
 	.get('/curatedlists', async (c) => {
+		const creatorAccountId = c.req.query('creatorAccountId')
+		const type = c.req.query('type')
+		const name = c.req.query('name')
+
+		const list =
+			(await ownedList(c, creatorAccountId, type, name)) ??
+			resolveCuratedList(creatorAccountId, type, name)
+
 		// Serialized by hand rather than through `c.json`: the reference's `ListId`s are
 		// 64-bit and are carried as strings so their digits survive being parsed — see
 		// `serializeCuratedList`, which puts them back on the wire as numbers.
-		return c.body(
-			serializeCuratedList(
-				resolveCuratedList(
-					c.req.query('creatorAccountId'),
-					c.req.query('type'),
-					c.req.query('name')
-				)
-			),
-			200,
-			{ 'content-type': 'application/json' }
+		return c.body(serializeCuratedList(list), 200, { 'content-type': 'application/json' })
+	})
+
+	// Save an item into one of the caller's own lists, creating the list if they don't have
+	// it yet (`PUT /curatedlists/:name/items/:itemId/createlistifneeded`) — what the client
+	// calls when someone saves a room for later. The path names the list and the item
+	// (`/curatedlists/__SavedForLater_Rooms/items/953/createlistifneeded`), and the form body
+	// carries `accessibility` and `type`.
+	//
+	// AUTH-GATED, and the owner is the TOKEN's account: unlike the read, this call names no
+	// `creatorAccountId`, so the only account it could mean is the caller's — and a route
+	// that took an owner from the client would let anyone write into anyone's list.
+	//
+	// Answers the list as it now stands rather than an acknowledgement, so the row the client
+	// re-renders is the one this call just changed.
+	.put('/curatedlists/:name/items/:itemId/createlistifneeded', async (c) => {
+		const accountId = await authedId(c)
+		if (accountId === null) return unauthorized(c)
+
+		const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+		const list = await addPlayerListItem(
+			c.env.DB,
+			{
+				creatorAccountId: accountId,
+				name: c.req.param('name'),
+				// The `ListEntityType`, saying what the item ids in this list ARE. Rooms when the
+				// body names none: every list the client creates this way is a room list, and the
+				// type is part of the list's identity, so guessing another would strand the list
+				// where the client's own read (`?type=1`) can't find it.
+				type: intField(body, c, 'type', ListEntityType.Rooms),
+				// PRIVATE by default. A list a player builds for themselves is theirs to see;
+				// the client sends `accessibility=0` and this only applies on creation anyway.
+				accessibility: intField(body, c, 'accessibility', Accessibility.Private),
+			},
+			c.req.param('itemId')
 		)
+
+		// The SAVE's projection of a list drops `Accessibility`; the read's keeps it. That is a
+		// real difference in what the client is sent, not an oversight — don't unify them.
+		// Every other key, and their order, is the read's.
+		const { Accessibility: _accessibility, ...saved } = list
+
+		// Serialized by hand for the same reason the read is: the 64-bit `ListId` has to reach
+		// the client unquoted with every digit intact.
+		return c.body(serializeCuratedList(saved), 200, { 'content-type': 'application/json' })
 	})
 
 	// One discovery ROW's contents (`GET /algorithmiclists/:list?type=1`). `:list` is the row

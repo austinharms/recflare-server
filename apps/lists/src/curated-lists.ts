@@ -1,10 +1,15 @@
+import { DEFAULT_LIST_IMAGE } from '@repo/domain'
+
 import curatedLists from '../static/curated-lists.json'
 
+import type { CuratedList } from '@repo/domain'
+
+export type { CuratedList }
+
 /**
- * Which PAGE a curated list belongs to — the `Type` on the list and the `?type=` the client
- * asks with. Not to be confused with the entity-type enum the algorithmic lists echo: this
- * one names a page source (the Watch home, the store's Featured tab, …), and the list it
- * keys is that page's row set.
+ * The PAGE-SOURCE enum, kept for reference. NOT what a list's `Type` is — see the note on
+ * `resolveCuratedList`: the captures and the client's own queries both put the
+ * `ListEntityType` there (what the `ItemIds` ARE), not the page. Nothing reads this.
  *
  * `None` is the client's unset sentinel; it never reaches the wire, and nothing is captured
  * under it.
@@ -29,26 +34,6 @@ export const CuratedListType = {
 	RecCenterCommunityContent: 16,
 	None: 999,
 } as const
-
-/**
- * One curated list as the client parses it. `Description` may be null but `ImageName` must
- * be a STRING — the client reads it straight into a string field — and `ItemIds` are
- * strings even where they stand for numeric ids.
- *
- * `ListId` is a string HERE ONLY, and never reaches the client as one: see
- * `serializeCuratedList`. `Accessibility` rides along from the captures untouched.
- */
-export interface CuratedList {
-	ListId: string
-	CreatorAccountId: number
-	Name: string
-	Description: string | null
-	ImageName: string
-	Type: number
-	ItemIds: string[]
-	Accessibility?: number
-	CreatedAt: string
-}
 
 /**
  * Every list this server serves, all of them in `static/curated-lists.json` — drop a
@@ -121,9 +106,56 @@ const DEFAULT_CURATED_LIST =
 	BY_NAME.get(nameKey('Discovery.PageSource.PlayExplore')) ?? CURATED_LISTS[0]
 
 /**
- * The list behind `GET /curatedlists?creatorAccountId=&type=&name=`, resolved most-specific
- * first and never empty. `type` is the page asking (see `CuratedListType`) and dictates the
- * name, so the two normally agree; when they don't, the page's default list still answers.
+ * The prefix the reference gives a list the CLIENT owns and creates for itself, rather than
+ * one a person named — `__SavedForLater_Rooms` is the one in play. It matters because these
+ * are the only names that must be allowed to come back EMPTY: see `resolveCuratedList`.
+ */
+const RESERVED_LIST_PREFIX = '__'
+
+/** Whether a name is one of the client's own reserved playlists rather than a curated page. */
+export function isReservedListName(name: string | undefined): boolean {
+	return (name ?? '').startsWith(RESERVED_LIST_PREFIX)
+}
+
+/**
+ * The list a reserved name answers when nobody owns one yet — the name asked for, with no
+ * items. A player who has saved nothing has an empty Saved for Later, not somebody else's
+ * list; `CreatorAccountId` is echoed from the query so the client still sees the list it
+ * asked for. `ListId` is 0: nothing was stored, so there is no id to hand back, and the
+ * client's field is a non-nullable number.
+ */
+function emptyReservedList(creatorAccountId: string | undefined, type: number, name: string) {
+	return {
+		ListId: '0',
+		CreatorAccountId: Number.parseInt(creatorAccountId ?? '', 10) || 0,
+		Name: name,
+		Description: null,
+		ImageName: DEFAULT_LIST_IMAGE,
+		Type: type,
+		ItemIds: [],
+		Accessibility: 1,
+		CreatedAt: new Date(0).toISOString(),
+	} satisfies CuratedList
+}
+
+/**
+ * The list behind `GET /curatedlists?creatorAccountId=&type=&name=` once D1 has been asked
+ * and had nothing — the static captures, resolved most-specific first and never empty.
+ *
+ * `type` is the `ListEntityType`: what the `ItemIds` ARE. (The client asks for
+ * `__SavedForLater_Rooms` with `type=1`, Rooms, and every capture here is `type=7`,
+ * DiscoverySection — which is exactly what their ItemIds hold. It is NOT the page-source
+ * enum, whose 7 is PlayCategories and would make two of the three captures wrong.)
+ *
+ * The fallback chain ends at a real list because an empty body or a 404 renders as a blank
+ * page, and the store's Featured tab depends on it: it asks for its rows by the reference's
+ * numeric list id (`name=17859340`), which is nothing's name here.
+ *
+ * A RESERVED name is the exception, and stops before that fallback. `__SavedForLater_Rooms`
+ * is a name this server is meant to have nothing under until the player saves something, so
+ * falling through would answer their empty Saved for Later row with the Play/Explore rows —
+ * the default list, under someone else's heading. An empty list hides the row instead, which
+ * is what its `minItemsToShowSection` asks for.
  */
 export function resolveCuratedList(
 	creatorAccountId: string | undefined,
@@ -138,6 +170,9 @@ export function resolveCuratedList(
 		(hasType ? BY_CREATOR_TYPE_NAME.get(`${creatorAccountId}/${parsedType}/${key}`) : undefined) ??
 		(hasType ? BY_TYPE_NAME.get(`${parsedType}/${key}`) : undefined) ??
 		BY_NAME.get(key) ??
+		(isReservedListName(name)
+			? emptyReservedList(creatorAccountId, hasType ? parsedType : 0, name ?? '')
+			: undefined) ??
 		(hasType ? BY_TYPE.get(parsedType) : undefined) ??
 		DEFAULT_CURATED_LIST
 	)

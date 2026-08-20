@@ -2,6 +2,7 @@ import { adminSecretsStore, env, SELF } from 'cloudflare:test'
 import { beforeAll, expect, it } from 'vitest'
 
 import {
+	CURATED_LIST_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
@@ -25,6 +26,8 @@ beforeAll(async () => {
 	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// The player-owned curated lists, which this worker owns.
+	for (const stmt of CURATED_LIST_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Creation order and publish order are deliberately near-REVERSES of each other, so the
 	// `new` row and the `recentlyupdated` row can't both be passing on the same ordering.
@@ -310,6 +313,298 @@ it('falls back to the default list for a name it has nothing under', async () =>
 		expect(bare.status).toBe(200)
 		expect(await bare.text()).toBe(explore)
 	}
+})
+
+/**
+ * Store a player's own list and its items, the way the (not yet written) save-for-later
+ * mutation would. Returns the id it was stored under.
+ */
+async function seedPlayerList(
+	list: {
+		creatorAccountId: number
+		type: number
+		name: string
+		description?: string | null
+		imageName?: string
+		accessibility?: number
+		createdAt?: string
+	},
+	itemIds: string[]
+): Promise<number> {
+	const row = await env.DB.prepare(
+		`INSERT INTO list (creator_account_id, list_type, list_name, list_description,
+		                   image_name, accessibility, created_at)
+		 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+		 RETURNING list_id`
+	)
+		.bind(
+			list.creatorAccountId,
+			list.type,
+			list.name,
+			list.description ?? null,
+			list.imageName ?? 'DefaultRoomImage.jpg',
+			list.accessibility ?? 1,
+			list.createdAt ?? '2025-04-23T18:27:03.2643786Z'
+		)
+		.first<{ list_id: number }>()
+	const listId = row!.list_id
+	for (const itemId of itemIds) {
+		await env.DB.prepare('INSERT INTO list_item (list_id, item_id) VALUES (?1, ?2)')
+			.bind(listId, itemId)
+			.run()
+	}
+	return listId
+}
+
+it('serves a player’s own __SavedForLater_Rooms list out of D1', async () => {
+	const listId = await seedPlayerList(
+		{
+			creatorAccountId: 205,
+			type: 1,
+			name: '__SavedForLater_Rooms',
+			description: 'Something',
+		},
+		['3', '4', '8']
+	)
+
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=205&type=1&name=__SavedForLater_Rooms`
+	)
+	expect(res.status).toBe(200)
+	const body = await res.text()
+	// A stored id reaches the client the same way a captured one does: unquoted.
+	expect(body).toContain(`"ListId":${listId},`)
+
+	const { ListId: _id, ...rest } = JSON.parse(body) as Record<string, unknown>
+	expect(rest).toEqual({
+		CreatorAccountId: 205,
+		Name: '__SavedForLater_Rooms',
+		Description: 'Something',
+		ImageName: 'DefaultRoomImage.jpg',
+		// The ListEntityType: 1 = Rooms, so the ItemIds are room ids the client resolves
+		// against the rooms worker. ItemIds are STRINGS even here, as in every capture.
+		Type: 1,
+		ItemIds: ['3', '4', '8'],
+		Accessibility: 1,
+		CreatedAt: '2025-04-23T18:27:03.2643786Z',
+	})
+})
+
+it('serves a player list in the order its items were added', async () => {
+	await seedPlayerList({ creatorAccountId: 206, type: 1, name: '__SavedForLater_Rooms' }, [
+		'8',
+		'2',
+		'7',
+	])
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=206&type=1&name=__SavedForLater_Rooms`
+	)
+	// Insertion order, not sorted and not the row order D1 happens to return: the ItemIds
+	// array IS the display order of the carousel.
+	expect(((await res.json()) as { ItemIds: string[] }).ItemIds).toEqual(['8', '2', '7'])
+})
+
+it('keeps one player’s list out of another’s, and one list type out of another', async () => {
+	await seedPlayerList({ creatorAccountId: 207, type: 1, name: '__SavedForLater_Rooms' }, ['3'])
+
+	// The same name for a different player is a different list — and player 208 has none, so
+	// theirs comes back EMPTY rather than 207's.
+	const other = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=208&type=1&name=__SavedForLater_Rooms`
+	)
+	expect((await other.json()) as unknown).toMatchObject({
+		CreatorAccountId: 208,
+		Name: '__SavedForLater_Rooms',
+		ItemIds: [],
+	})
+
+	// Same owner and name, different entity type: also a different list. The type says what
+	// the ids ARE, so serving room ids to a request for items would resolve them against the
+	// wrong service.
+	const wrongType = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=207&type=4&name=__SavedForLater_Rooms`
+	)
+	expect(((await wrongType.json()) as { ItemIds: string[] }).ItemIds).toEqual([])
+})
+
+it('matches a player list’s name case-insensitively', async () => {
+	await seedPlayerList({ creatorAccountId: 209, type: 1, name: '__SavedForLater_Rooms' }, ['4'])
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=209&type=1&name=__savedforlater_rooms`
+	)
+	expect(((await res.json()) as { ItemIds: string[] }).ItemIds).toEqual(['4'])
+})
+
+it('answers an unowned reserved list EMPTY rather than with the default page', async () => {
+	// The bug this replaces: nothing is captured under `__SavedForLater_Rooms` and nothing
+	// is captured under type 1 either, so the fallback chain used to end at the default list
+	// — and a player who had saved nothing got the Play/Explore rows under a "Saved for
+	// Later" heading. A reserved name stops before that fallback.
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=999&type=1&name=__SavedForLater_Rooms`
+	)
+	expect(res.status).toBe(200)
+	const list = (await res.json()) as { Name: string; ItemIds: string[]; ImageName: string }
+	expect(list.Name).toBe('__SavedForLater_Rooms')
+	expect(list.ItemIds).toEqual([])
+	// Still a well-formed list: the client parses ImageName into a non-nullable string.
+	expect(typeof list.ImageName).toBe('string')
+})
+
+it('still falls back to the default page for a NON-reserved unknown name', async () => {
+	// The reserved-name carve-out must not swallow the store's Featured lookup, which asks
+	// by numeric list id and depends on the default answering.
+	const explore = await (
+		await SELF.fetch(`${ORIGIN}/curatedlists?name=Discovery.PageSource.PlayExplore`)
+	).text()
+	const featured = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=1&type=4&name=17859340`
+	)
+	expect(await featured.text()).toBe(explore)
+})
+
+it('prefers a player’s stored list over a capture of the same name', async () => {
+	// The captures are this server's fixtures; a stored list is a player's own data, so D1
+	// is asked first.
+	await seedPlayerList(
+		{ creatorAccountId: 210, type: 7, name: 'Discovery.PageSource.PlayExplore' },
+		['Rooms_MostPopular']
+	)
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=210&type=7&name=Discovery.PageSource.PlayExplore`
+	)
+	expect(((await res.json()) as { ItemIds: string[] }).ItemIds).toEqual(['Rooms_MostPopular'])
+
+	// …and the capture still answers for the account that owns it.
+	const captured = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=1&type=7&name=Discovery.PageSource.PlayExplore`
+	)
+	expect(((await captured.json()) as { ItemIds: string[] }).ItemIds.length).toBe(10)
+})
+
+/** The client's save-for-later call: PUT the item into the named list, body-encoded. */
+async function saveForLater(
+	name: string,
+	itemId: string,
+	headers: Record<string, string>,
+	body = 'accessibility=0&type=1'
+) {
+	return SELF.fetch(`${ORIGIN}/curatedlists/${name}/items/${itemId}/createlistifneeded`, {
+		method: 'PUT',
+		headers: { ...headers, 'Content-Type': 'application/x-www-form-urlencoded' },
+		body,
+	})
+}
+
+/** Read a player's list back the way the client does. */
+async function readList(accountId: number, type = 1, name = '__SavedForLater_Rooms') {
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=${accountId}&type=${type}&name=${name}`
+	)
+	expect(res.status).toBe(200)
+	return (await res.json()) as {
+		CreatorAccountId: number
+		Name: string
+		Type: number
+		ItemIds: string[]
+		Accessibility: number
+		ImageName: string
+	}
+}
+
+it('creates the list and adds the item on PUT …/createlistifneeded', async () => {
+	const res = await saveForLater('__SavedForLater_Rooms', '953', await bearer('300'))
+	expect(res.status).toBe(200)
+
+	// Answers the list as it now stands — the row the client re-renders is the one this call
+	// changed — with the id unquoted, as every read of a list serves it.
+	const body = await res.text()
+	expect(body).toMatch(/"ListId":\d+,/)
+	// The SAVE's projection: every key the read serves EXCEPT `Accessibility`, in the read's
+	// order. Compared exactly, not loosely, because the missing key is the point.
+	const { ListId: _id, ...rest } = JSON.parse(body) as Record<string, unknown>
+	expect(rest).toEqual({
+		CreatorAccountId: 300,
+		Name: '__SavedForLater_Rooms',
+		Description: null,
+		ImageName: 'DefaultRoomImage.jpg',
+		Type: 1,
+		ItemIds: ['953'],
+		CreatedAt: expect.any(String),
+	})
+	expect(Object.keys(rest)).not.toContain('Accessibility')
+
+	// …and the client's own read finds it under the same three keys — and DOES carry the
+	// accessibility the save stored but did not echo.
+	expect(await readList(300)).toMatchObject({ ItemIds: ['953'], Accessibility: 0 })
+})
+
+it('appends to the list it already created rather than making a second one', async () => {
+	const headers = await bearer('301')
+	const first = await (await saveForLater('__SavedForLater_Rooms', '953', headers)).text()
+	const second = await (await saveForLater('__SavedForLater_Rooms', '641', headers)).text()
+
+	// Same list id both times: the name is the list's identity, so the second save must find
+	// the first list rather than create a rival the read can never resolve.
+	const idOf = (b: string) => /"ListId":(\d+),/.exec(b)?.[1]
+	expect(idOf(second)).toBe(idOf(first))
+	expect(await readList(301)).toMatchObject({ ItemIds: ['953', '641'] })
+})
+
+it('is idempotent — saving the same room twice shows it once', async () => {
+	const headers = await bearer('302')
+	await saveForLater('__SavedForLater_Rooms', '953', headers)
+	await saveForLater('__SavedForLater_Rooms', '641', headers)
+	const again = await saveForLater('__SavedForLater_Rooms', '953', headers)
+	expect(again.status).toBe(200)
+
+	// Kept in the position it was FIRST saved into, not moved to the end.
+	expect(await readList(302)).toMatchObject({ ItemIds: ['953', '641'] })
+})
+
+it('owns the list by the TOKEN, not by anything the caller can name', async () => {
+	await saveForLater('__SavedForLater_Rooms', '953', await bearer('303'))
+	await saveForLater('__SavedForLater_Rooms', '641', await bearer('304'))
+
+	// Two players, two lists — neither can reach the other's, and the route takes no
+	// creatorAccountId at all, so there is nothing to write into someone else's list with.
+	expect((await readList(303)).ItemIds).toEqual(['953'])
+	expect((await readList(304)).ItemIds).toEqual(['641'])
+})
+
+it('refuses an unauthenticated save', async () => {
+	const res = await saveForLater('__SavedForLater_Rooms', '953', {})
+	expect(res.status).toBe(401)
+})
+
+it('creates the list under the type the body names', async () => {
+	// `type` is part of a list's identity, so a body naming 4 must not land in the type-1
+	// list the client reads back — and must be findable under 4.
+	await saveForLater('__SavedForLater_Items', '77', await bearer('305'), 'accessibility=0&type=4')
+	expect((await readList(305, 4, '__SavedForLater_Items')).ItemIds).toEqual(['77'])
+	expect((await readList(305, 1, '__SavedForLater_Items')).ItemIds).toEqual([])
+})
+
+it('defaults a bodiless save to a private room list', async () => {
+	// A body that never arrives (or fails to parse) must not strand the list under a type the
+	// client's own read can't find.
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists/__SavedForLater_Rooms/items/953/createlistifneeded`,
+		{ method: 'PUT', headers: await bearer('306') }
+	)
+	expect(res.status).toBe(200)
+	expect(await readList(306)).toMatchObject({ Type: 1, Accessibility: 0, ItemIds: ['953'] })
+})
+
+it('leaves an existing list’s accessibility alone on a later save', async () => {
+	const headers = await bearer('307')
+	await saveForLater('__SavedForLater_Rooms', '953', headers, 'accessibility=1&type=1')
+	expect((await readList(307)).Accessibility).toBe(1)
+
+	// The client sends accessibility on every add, but this call is "add an item", not
+	// "change who can see the list" — one stray add must not flip a list the player made public.
+	await saveForLater('__SavedForLater_Rooms', '641', headers, 'accessibility=0&type=1')
+	expect(await readList(307)).toMatchObject({ Accessibility: 1, ItemIds: ['953', '641'] })
 })
 
 it('serves a discovery row from /algorithmiclists', async () => {

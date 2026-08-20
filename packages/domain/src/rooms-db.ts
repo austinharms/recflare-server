@@ -891,21 +891,30 @@ interface RoomRow {
 const ROOM_COLUMNS = 'data, visits'
 
 /**
- * Two keys on the client's room DTO that nothing here stores, defaulted on every read so
- * the key is PRESENT rather than absent — the seed blobs and every room written since
- * predate them, so they can't come from the data:
+ * Keys on the client's room DTO that nothing here stores, defaulted on every read so the
+ * key is PRESENT rather than absent — the seed blobs and every room written since predate
+ * them, so they can't come from the data:
  *
  * - `BoostCount` — how many boosts the room is carrying. No boost feature exists here, so
  *   it is 0 for every room.
  * - `CurrentSnapshotId` — the room's published snapshot. Nothing takes snapshots, so it is
  *   null, which is also what the reference serves for a room that has none.
+ * - `FriendlyName` — the display name, which the reference lets a creator set apart from
+ *   the unique `Name`. Nothing sets one here, so it falls back to `Name`; it must never be
+ *   null, because the client labels a room from it and renders nothing for a room without
+ *   one.
+ * - `CCU` — concurrent users. No live-population counter exists here, so it is null, which
+ *   is what the reference serves when it has no number rather than 0 (a 0 reads as "nobody
+ *   is in here" in the browse feeds).
  *
- * Defaulted rather than assigned, so a stored value wins if either is ever really written
+ * Defaulted rather than assigned, so a stored value wins if any is ever really written
  * (a blob keeps whatever `serializeRoom` last put in it).
  */
 function attachRoomDtoDefaults(room: Room): void {
 	room.BoostCount ??= 0
 	room.CurrentSnapshotId ??= null
+	room.FriendlyName ??= room.Name
+	room.CCU ??= null
 }
 
 /**
@@ -1782,33 +1791,39 @@ export async function countRoomsByCreator(db: D1Database, accountId: number): Pr
 }
 
 /**
- * Rooms an account CONTRIBUTES to: the ones whose `Roles` name them (Host, Moderator or
- * CoOwner), minus the ones they created themselves.
+ * Every room an account works on: the ones it CREATED plus the ones whose `Roles` name it
+ * (Host, Moderator or CoOwner). Every role tier counts, unlike {@link canManageRoom}'s
+ * owner-or-co-owner gate: this is "you have a job in this room", not "you may administer
+ * it".
  *
- * The creator is excluded deliberately. A room's `Roles` carries its creator too, so
- * without that filter this list would repeat everything `getRoomsByCreator` already
- * serves — and the client shows "rooms you own" and "rooms you contribute to" as two
- * separate lists. Every role tier counts here, unlike {@link canManageRoom}'s
- * owner-or-co-owner gate: this is "somebody gave you a job in their room", not "you may
- * administer it".
+ * The creator half used to be excluded — a room's `Roles` carries its creator too, and the
+ * client shows "rooms you own" and "rooms you contribute to" as separate lists, so the
+ * exclusion kept this from repeating `createdby/me`. It also made the list EMPTY for every
+ * account that had only ever built its own rooms, which is most of them, so the screen
+ * behind it showed nothing at all. Repeating `createdby/me` is the better failure, and
+ * overlap is what a client that renders one list wants anyway.
+ *
+ * The dorm stays out, on `ownedby/me`'s reasoning: it is auto-provisioned rather than a
+ * room the player made. A room matching BOTH halves appears once — the roles half is an
+ * EXISTS, not a join.
  *
  * Roles live inside the room blob rather than in a table of their own, so the match is a
  * `json_each` over `$.Roles`. A room with no `Roles` key (or a null one) simply yields no
- * rows there rather than erroring, so it drops out of the list.
+ * rows there rather than erroring, so it only reaches the list if the account created it.
  */
 export async function getContributedRooms(db: D1Database, accountId: number): Promise<Room[]> {
 	const { results } = await db
 		.prepare(
 			`SELECT ${ROOM_COLUMNS} FROM room
-			 WHERE creator_account_id IS NOT ?1
-			   AND EXISTS (
+			 WHERE creator_account_id = ?1
+			    OR EXISTS (
 			     SELECT 1 FROM json_each(room.data, '$.Roles') AS role
 			     WHERE json_extract(role.value, '$.AccountId') = ?1
 			   )`
 		)
 		.bind(accountId)
 		.all<RoomRow>()
-	return hydrateRooms(db, parseAll(results))
+	return (await hydrateRooms(db, parseAll(results))).filter((r) => r.IsDorm !== true)
 }
 
 /**
@@ -2006,6 +2021,8 @@ function roomHasAnyTag(room: Room, tags: Set<string>): boolean {
  * `#tag` terms match the room's Tags; plain terms match the room name
  * (substring). All terms must match. Returns a paginated `{ Results, TotalResults }`.
  * The dataset is small, so this filters in memory rather than in SQL.
+ *
+ * `#community` is the one tag term that isn't a tag lookup — see {@link COMMUNITY_TAG}.
  */
 export async function searchRooms(
 	db: D1Database,
@@ -2021,9 +2038,15 @@ export async function searchRooms(
 	// EVERY tag asked for, and each term expands to its aliases (`#recroomoriginal` accepts
 	// `rro`). Only the rooms that survive have their blobs read, which is what `room_tag` is
 	// for: a tag search no longer parses every room in the database to ask.
-	const tagSets = terms
-		.filter((t) => t.startsWith('#'))
-		.map((t) => t.slice(1))
+	//
+	// `#community` is held out of that query: no room CARRIES the tag (the browse chip posts
+	// it to the hot feed as a pseudo-tag, and the search box sends the same term), so asking
+	// `room_tag` for it matches nothing and the whole search comes back empty. It filters on
+	// who MADE the room instead, below.
+	const tagTerms = terms.filter((t) => t.startsWith('#')).map((t) => t.slice(1))
+	const communityOnly = tagTerms.includes(COMMUNITY_TAG)
+	const tagSets = tagTerms
+		.filter((tag) => tag !== COMMUNITY_TAG)
 		.map((tag) => [tag, ...(TAG_ALIASES[tag] ?? [])])
 	const { sql, binds } = roomsByTagsQuery(tagSets)
 	const { results } = await db
@@ -2031,6 +2054,11 @@ export async function searchRooms(
 		.bind(...binds)
 		.all<RoomRow>()
 	let rooms = parseAll(results).filter((r) => r.IsDorm !== true && r.Accessibility === 1)
+
+	// The same test the hot feed's `community` chip applies: every room a player made, which
+	// is every room the Coach account doesn't own. It narrows the other terms rather than
+	// replacing them, so `#community horror` is still a name search within player-made rooms.
+	if (communityOnly) rooms = rooms.filter(isPlayerMade)
 
 	// The plain terms still match in memory: they are substring matches on the name, which
 	// no index helps with.
@@ -2135,6 +2163,9 @@ const NEW_TAG = 'new'
  * isn't the Coach account — the system account that owns the seeded Rec Room rooms.
  * Unlike {@link NEW_TAG} it only filters: the page keeps the feed's normal
  * live-population ordering.
+ *
+ * The chip reaches {@link searchRooms} too, as the tag term `#community` — the search box
+ * carries the same word — so both feeds have to know it names no tag.
  */
 const COMMUNITY_TAG = 'community'
 
