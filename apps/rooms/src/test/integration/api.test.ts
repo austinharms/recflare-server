@@ -2299,6 +2299,127 @@ describe('rooms endpoints', () => {
 		expect(tagsIn(byCoOwner)).toContain('spooky')
 	})
 
+	// Tags live in `room_tag`, not in the room blob (migration 0013). These pin the
+	// invariant that makes that safe: the table is the only copy, and the DTO is rebuilt
+	// from it on read.
+	it('stores tags in room_tag and never in the room blob', async () => {
+		await putForm('/rooms/2/tags', { tag: 'ghostly' }, '1')
+
+		// The blob must carry no `Tags` key at all — a second copy is what the table exists
+		// to eliminate, and it would only be kept current by the writes that go through
+		// toggleRoomTag.
+		const row = await env.DB.prepare('SELECT data FROM room WHERE room_id = 2').first<{
+			data: string
+		}>()
+		expect(JSON.parse(row!.data).Tags).toBeUndefined()
+
+		// The table has it, lowercased — `tag` is the lookup key the index is on.
+		const tagRow = await env.DB.prepare(
+			'SELECT tag, type FROM room_tag WHERE room_id = 2 AND tag = ?1'
+		)
+			.bind('ghostly')
+			.first<{ tag: string; type: number }>()
+		expect(tagRow).toEqual({ tag: 'ghostly', type: 0 })
+
+		// And the read re-attaches it, so the client sees an unchanged DTO.
+		const room = (await (await SELF.fetch(`${ORIGIN}/rooms/2`)).json()) as {
+			Tags: Array<{ Tag: string; Type: number }>
+		}
+		expect(room.Tags).toContainEqual({ Tag: 'ghostly', Type: 0 })
+
+		// Toggle back off: the row goes, rather than lingering to answer `#ghostly` searches.
+		await putForm('/rooms/2/tags', { tag: 'ghostly' }, '1')
+		expect(
+			await env.DB.prepare('SELECT COUNT(*) AS n FROM room_tag WHERE room_id = 2 AND tag = ?1')
+				.bind('ghostly')
+				.first<{ n: number }>()
+		).toEqual({ n: 0 })
+	})
+
+	// D1 caps a statement at 100 bound parameters. The seeded database has 45 rooms, so
+	// every `IN (…)` list built per-room fitted and the cap went unnoticed until a real
+	// server crossed it: the hot feed attaches tags to EVERY room, so the bind list grew
+	// with the database and the query failed with "variable number must be between ?1 and
+	// ?100". This seeds past the cap so the feeds are exercised above it.
+	it('serves the feeds when there are more rooms than D1 allows bound parameters', async () => {
+		const FIRST = 20000
+		const COUNT = 150
+		for (let i = 0; i < COUNT; i++) {
+			const roomId = FIRST + i
+			await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						RoomId: roomId,
+						Name: `BulkRoom${i}`,
+						CreatorAccountId: 700,
+						IsDorm: false,
+						Accessibility: 1,
+						CreatedAt: '2026-05-01T00:00:00Z',
+						SubRooms: [],
+					})
+				)
+				.run()
+			// Every third one tagged, so the tag map is non-trivial above the cap too.
+			if (i % 3 === 0) {
+				await env.DB.prepare('INSERT INTO room_tag (room_id, tag, type) VALUES (?1, ?2, 0)')
+					.bind(roomId, 'bulky')
+					.run()
+			}
+		}
+
+		// The feed that failed: it reads every room, so it attaches tags for all of them.
+		const hot = await SELF.fetch(`${ORIGIN}/rooms/hot?take=5`)
+		expect(hot.status).toBe(200)
+
+		// Rooms owned by one account — this hydrates the WHOLE result set rather than a page,
+		// so its subroom and save reads run above the cap too. Those had the same latent bug.
+		const mine = await SELF.fetch(`${ORIGIN}/rooms/createdby/me`, { headers: await bearer('700') })
+		expect(mine.status).toBe(200)
+		expect(((await mine.json()) as unknown[]).length).toBe(COUNT)
+
+		// And the tag lookup still answers correctly above the cap.
+		const tagged = (await (
+			await SELF.fetch(`${ORIGIN}/rooms/search?query=%23bulky&take=200`)
+		).json()) as { Results: Array<{ RoomId: number }> }
+		expect(tagged.Results.length).toBe(Math.ceil(COUNT / 3))
+
+		// Clean up so the room counts other tests assert stay put.
+		await env.DB.prepare('DELETE FROM room WHERE room_id >= ?1').bind(FIRST).run()
+		await env.DB.prepare('DELETE FROM room_tag WHERE room_id >= ?1').bind(FIRST).run()
+	})
+
+	it("drops a deleted room's tag rows", async () => {
+		// Throwaway room owned by account 1, seeded directly the way the DELETE test above
+		// does, so this doesn't disturb the imported rooms.
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					RoomId: 9600,
+					Name: 'TagCascadeRoom',
+					CreatorAccountId: 1,
+					IsDorm: false,
+					Accessibility: 1,
+					SubRooms: [],
+				})
+			)
+			.run()
+		await putForm('/rooms/9600/tags', { tag: 'doomed' }, '1')
+
+		const count = async () =>
+			(await env.DB.prepare('SELECT COUNT(*) AS n FROM room_tag WHERE room_id = 9600').first<{
+				n: number
+			}>())!.n
+		expect(await count()).toBe(1)
+
+		expect(
+			(await SELF.fetch(`${ORIGIN}/rooms/9600`, { method: 'DELETE', headers: await bearer('1') }))
+				.status
+		).toBe(200)
+		// Otherwise the tag rows keep answering `#doomed` searches and category rows for a
+		// room nobody can open.
+		expect(await count()).toBe(0)
+	})
+
 	it('PUT /rooms/:id/name is auth-gated, owner-only, unique, and persists', async () => {
 		// No token → 401 (auth gate).
 		expect((await putForm('/rooms/2/name', { name: 'Whatever' })).status).toBe(401)
