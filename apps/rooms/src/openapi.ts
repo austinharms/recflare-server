@@ -301,6 +301,13 @@ export const RoomDto = z.object({
 		.int()
 		.nullable()
 		.describe('The room’s published snapshot. Nothing takes snapshots here, so always null'),
+	FriendlyName: z
+		.string()
+		.describe('Display name. Nothing sets one apart from `Name` here, so it mirrors `Name`'),
+	CCU: z
+		.int()
+		.nullable()
+		.describe('Concurrent users. Nothing counts live population here, so always null'),
 	RankingContext: z.unknown().nullable(),
 	IsDorm: z.boolean().describe('Auto-provisioned personal room; excluded from every feed'),
 	IsPlacePlay: z.boolean(),

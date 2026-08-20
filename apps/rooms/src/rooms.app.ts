@@ -733,6 +733,10 @@ const app = new Hono<App>()
 	// Room search: `query` is space/`+`-separated terms — `#tag` matches room tags,
 	// plain terms match the name. Public, non-dorm rooms only. Paginated via
 	// skip/take. Returns `{ Results, TotalResults }`.
+	//
+	// `#community` is the one tag term that isn't a tag lookup: it is the browse chip's
+	// pseudo-tag reaching search, and means rooms a PLAYER made rather than the seeded
+	// first-party ones — the same filter `/rooms/hot?tag=community` applies.
 	.get(
 		'/rooms/search',
 		describeRoute({
@@ -741,9 +745,14 @@ const app = new Hono<App>()
 			description: [
 				'Full room search. `query` is space- or `+`-separated terms: a `#tag` term matches the',
 				'room’s tags, a plain term matches its name. Public, non-dorm rooms only.',
+				'`#community` is a pseudo-tag no room carries — it narrows to rooms a player made',
+				'(anything the system Coach account didn’t create), like `/rooms/hot?tag=community`.',
 			].join(' '),
 			parameters: [
-				stringQuery('query', 'Search terms — `#tag` matches tags, plain terms match the name'),
+				stringQuery(
+					'query',
+					'Search terms — `#tag` matches tags, plain terms match the name, `#community` matches player-made rooms'
+				),
 				...pageParams(30),
 			],
 			responses: { 200: json(PagedRooms, 'The matching rooms') },
@@ -1093,13 +1102,15 @@ const app = new Hono<App>()
 		ownedRooms
 	)
 
-	// Rooms the caller CONTRIBUTES to — someone else's rooms that name them in `Roles`
-	// (Host, Moderator or CoOwner). Auth-scoped: `me` resolves from the bearer token, and
-	// there is no query string or body to read.
+	// Rooms the caller works on — the ones they CREATED plus anyone else's that name them in
+	// `Roles` (Host, Moderator or CoOwner). Auth-scoped: `me` resolves from the bearer token,
+	// and there is no query string or body to read.
 	//
-	// Rooms the caller created are excluded: a room's `Roles` carries its creator too, so
-	// without that this would repeat `createdby/me` wholesale, and the client shows the two
-	// as separate lists. Like the other `*by/me` lists it answers a bare array of the
+	// Created rooms used to be excluded, on the grounds that a room's `Roles` names its
+	// creator too and the client shows "owned" and "contributed" separately. That left the
+	// list empty for every account that had only built its own rooms — most of them — so it
+	// now overlaps `createdby/me` rather than coming back empty. The dorm stays out, as it
+	// does on `ownedby/me`. Like the other `*by/me` lists it answers a bare array of the
 	// canonical room DTO — no envelope, no paging wrapper — and doesn't filter on
 	// accessibility, since a contributor is working on the room whether or not it's
 	// published.
@@ -1107,18 +1118,18 @@ const app = new Hono<App>()
 		'/rooms/contributedby/me',
 		describeRoute({
 			tags: ['My rooms'],
-			summary: 'Rooms the caller contributes to',
+			summary: 'Rooms the caller owns or contributes to',
 			description: [
-				'The rooms that name the caller in their `Roles` — Host, Moderator or CoOwner — as a',
-				'bare array of rooms. Rooms the caller CREATED are excluded: those are',
-				'`ownedby/me`/`createdby/me`, and a room’s roles list its creator too, so including',
-				'them would just repeat that list. Every role tier counts, not only the owner-level',
-				'ones, and accessibility is not filtered: a contributor works on the room whether or',
-				'not it is published.',
+				'Every room the caller works on, as a bare array: the ones they CREATED plus the ones',
+				'that name them in their `Roles` — Host, Moderator or CoOwner. Overlaps',
+				'`createdby/me` deliberately, so a client rendering one list sees everything; the',
+				'dorm is excluded as it is on `ownedby/me`. Every role tier counts, not only the',
+				'owner-level ones, and accessibility is not filtered: a contributor works on the room',
+				'whether or not it is published.',
 			].join(' '),
 			security: AUTHED,
 			responses: {
-				200: json(RoomDto.array(), 'The rooms the caller contributes to (empty when none)'),
+				200: json(RoomDto.array(), 'The rooms the caller owns or contributes to (empty when none)'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),

@@ -153,15 +153,18 @@ describe('rooms endpoints', () => {
 		expect(body.SubRooms[0].UnitySceneId).toBe('76d98498-60a1-430c-ab76-b54a29b7a163')
 	})
 
-	// Neither is stored — the seed blobs predate both keys — so they are defaulted on read.
-	// The client's room DTO always carries them, and an ABSENT key is not the same as a
-	// zero/null one to its parser.
-	it('GET /rooms/:id carries BoostCount and CurrentSnapshotId', async () => {
+	// None of these are stored — the seed blobs predate the keys — so they are defaulted on
+	// read. The client's room DTO always carries them, and an ABSENT key is not the same as a
+	// zero/null one to its parser. `FriendlyName` is the one that can't be null: the client
+	// labels the room from it.
+	it('GET /rooms/:id carries BoostCount, CurrentSnapshotId, FriendlyName and CCU', async () => {
 		const res = await SELF.fetch(`${ORIGIN}/rooms/1`)
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as Record<string, unknown>
 		expect(body).toHaveProperty('BoostCount', 0)
 		expect(body).toHaveProperty('CurrentSnapshotId', null)
+		expect(body).toHaveProperty('FriendlyName', body.Name)
+		expect(body).toHaveProperty('CCU', null)
 	})
 
 	// Pinned whole: these are the numbers the client's publish UI counts against, and
@@ -418,7 +421,7 @@ describe('rooms endpoints', () => {
 		expect(publicList.some((r) => r.Name === 'MyUnpublishedRoom')).toBe(false)
 	})
 
-	it('GET /rooms/contributedby/me lists rooms the caller has a role in, not their own', async () => {
+	it('GET /rooms/contributedby/me lists rooms the caller owns or has a role in', async () => {
 		const seed = (data: Record<string, unknown>) =>
 			env.DB.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(data)).run()
 
@@ -445,12 +448,32 @@ describe('rooms endpoints', () => {
 			SubRooms: [],
 			Roles: [{ AccountId: 820, Role: 10 }],
 		})
-		// ...one they created themselves, whose Roles name them as Creator...
+		// ...one they created themselves, whose Roles name them as Creator (matched by BOTH
+		// halves of the query, so it must still appear exactly once)...
 		await seed({
 			RoomId: 30403,
 			Name: 'ContribOwn',
 			CreatorAccountId: 820,
 			Accessibility: 1,
+			SubRooms: [],
+			Roles: [{ AccountId: 820, Role: 255 }],
+		})
+		// ...one they created that names nobody in Roles at all — the older rooms have no
+		// Roles key, and those reach the list on the creator half alone...
+		await seed({
+			RoomId: 30406,
+			Name: 'ContribOwnNoRoles',
+			CreatorAccountId: 820,
+			Accessibility: 1,
+			SubRooms: [],
+		})
+		// ...and their dorm, which stays out: auto-provisioned, not a room they made.
+		await seed({
+			RoomId: 30407,
+			Name: "@player820's Dorm",
+			CreatorAccountId: 820,
+			IsDorm: true,
+			Accessibility: 2,
 			SubRooms: [],
 			Roles: [{ AccountId: 820, Role: 255 }],
 		})
@@ -473,9 +496,10 @@ describe('rooms endpoints', () => {
 		const rooms = (await res.json()) as Array<{ RoomId: number; Name: string }>
 		// A bare array of the canonical room DTO — no envelope, no paging wrapper.
 		expect(Array.isArray(rooms)).toBe(true)
-		expect(rooms.map((r) => r.RoomId).sort((a, b) => a - b)).toEqual([30401, 30402])
-		// The caller's OWN room is excluded, or this would just repeat createdby/me.
-		expect(rooms.some((r) => r.RoomId === 30403)).toBe(false)
+		expect(rooms.map((r) => r.RoomId).sort((a, b) => a - b)).toEqual([30401, 30402, 30403, 30406])
+		// Their own rooms are IN — the list overlaps createdby/me rather than coming back
+		// empty for someone who only ever built their own — but the dorm is not.
+		expect(rooms.some((r) => r.RoomId === 30407)).toBe(false)
 		expect(rooms[0]).toMatchObject({ Name: expect.any(String), Accessibility: expect.any(Number) })
 
 		// A player who contributes to nothing gets an empty array, not a 404.
@@ -489,7 +513,7 @@ describe('rooms endpoints', () => {
 
 		// The DB is shared across this file, and these are the only player-made public rooms
 		// in it — leaving them behind changes what the `new`/`community` room feeds serve.
-		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30405').run()
+		await env.DB.prepare('DELETE FROM room WHERE room_id BETWEEN 30401 AND 30407').run()
 	})
 
 	it('GET /rooms/:roomId/experience serves the fixed XP settings, no auth', async () => {
@@ -610,6 +634,57 @@ describe('rooms endpoints', () => {
 		}
 		expect(aliased.TotalResults).toBe(direct.TotalResults)
 		expect(aliased.TotalResults).toBeGreaterThan(0)
+	})
+
+	it('GET /rooms/search?query=#community serves rooms the Coach account did not create', async () => {
+		// The browse chip's word reaches search as a tag term, but no room CARRIES a
+		// `community` tag — it is the same pseudo-tag `/rooms/hot?tag=community` applies, so it
+		// filters on who MADE the room. Every seeded room belongs to Coach (account 1), so it
+		// finds nothing until another account makes something.
+		type Page = { Results: Array<{ Name: string }>; TotalResults: number }
+		const search = async (query: string): Promise<Page> =>
+			(await (
+				await SELF.fetch(`${ORIGIN}/rooms/search?query=${encodeURIComponent(query)}&take=100`)
+			).json()) as Page
+
+		expect(await search('#community')).toEqual({ Results: [], TotalResults: 0 })
+
+		const seeded: number[] = []
+		const seed = async (room: Record<string, unknown>) => {
+			seeded.push(Number(room.RoomId))
+			await seedRoomWithSubRooms(env.DB, {
+				Accessibility: 1,
+				IsDorm: false,
+				CreatorAccountId: 2,
+				...room,
+			})
+		}
+
+		await seed({ RoomId: 9201, Name: 'CommunityHorrorHouse' })
+		await seed({ RoomId: 9202, Name: 'CommunityArcade' })
+		// Coach's own rooms stay out, and so do non-public ones as everywhere else in search.
+		await seed({ RoomId: 9203, Name: 'CommunityCoachRoom', CreatorAccountId: 1 })
+		await seed({ RoomId: 9204, Name: 'CommunityUnlisted', Accessibility: 2 })
+
+		const found = await search('#community')
+		expect(found.Results.map((r) => r.Name)).toEqual(['CommunityHorrorHouse', 'CommunityArcade'])
+		expect(found.TotalResults).toBe(2)
+
+		// The client sends the chip with a trailing space (`?query=%23community+`), which the
+		// term split has to swallow rather than search for an empty second term.
+		expect(await search('#community ')).toEqual(found)
+
+		// It NARROWS the rest of the query rather than replacing it: a name term still applies,
+		// and so does a real tag, which is still the SQL lookup it always was.
+		expect((await search('#community arcade')).Results.map((r) => r.Name)).toEqual([
+			'CommunityArcade',
+		])
+		expect(await search('#community #rro')).toEqual({ Results: [], TotalResults: 0 })
+
+		// Leave the shared dataset as it was for the tests that follow.
+		const ids = seeded.join(',')
+		await env.DB.prepare(`DELETE FROM room WHERE room_id IN (${ids})`).run()
+		await env.DB.prepare(`DELETE FROM subroom WHERE room_id IN (${ids})`).run()
 	})
 
 	it('GET /rooms/favoritedby/me returns a bare array of the caller favorited rooms (auth-scoped)', async () => {
