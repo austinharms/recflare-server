@@ -113,12 +113,17 @@ export const GameAiSpendSummaryDenied = GameAiAccessDenied.extend({
 })
 
 /**
- * `GET /makerai/user/access` — a BARE JSON boolean, not an envelope and not a `{ value }`
- * wrapper. The whole body is the answer.
+ * `GET /makerai/user/access` — always granted, in an envelope that belongs to this endpoint
+ * alone: PascalCase `Success`/`Error` beside a snake_case `error_id`, and no `value` slot.
+ * It is neither the Game AI refusal's all-lowercase body nor the Roomie check's
+ * `{ success, error_id, error, value }`. Reproduced as the reference sends it — the casing
+ * mix is not a typo to normalise.
  */
-export const MakerAiAccessResponse = z
-	.boolean()
-	.describe('Whether the caller may use Maker AI; always false — no model runs here')
+export const MakerAiAccessResponse = z.object({
+	Success: z.boolean().describe('Whether the caller may use Maker AI. Always true'),
+	Error: z.null().describe('The failure message. Null — the check always passes'),
+	error_id: z.null().describe('The failure code. Null — the check always passes'),
+})
 
 /**
  * Maker AI's dollar balances. A FLAT body — no `{ success, error, value }` envelope — and

@@ -175,29 +175,31 @@ describe('GET /roomieai/user/facts', () => {
 })
 
 describe('GET /makerai/user/access', () => {
-	// Always false — nothing here runs a model. The body is the boolean itself, not an
-	// envelope, matching econ's `/api/makerai/checkfreetrialeligibility`.
-	it('refuses access with a bare false', async () => {
-		const res = await SELF.fetch(`${ORIGIN}/makerai/user/access?roomInstanceSpecificCheck=False`, {
+	// Granted, and pinned whole: the casing is mixed on purpose (PascalCase `Success`/`Error`
+	// beside a snake_case `error_id`) and matches neither neighbour on this worker, so a
+	// "consistency" edit has to fail here rather than on the client.
+	it('grants access', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/makerai/user/access?roomInstanceSpecificCheck=True`, {
 			headers: await bearer(),
 		})
 		expect(res.status).toBe(200)
 		expect(res.headers.get('content-type')).toContain('application/json')
-		expect(await res.text()).toBe('false')
+		expect(await res.json()).toEqual({ Success: true, Error: null, error_id: null })
 	})
 
 	it('answers the same without the query param', async () => {
 		// `roomInstanceSpecificCheck` is ignored, so its presence, absence and value change
 		// nothing.
+		const granted = { Success: true, Error: null, error_id: null }
 		const res = await SELF.fetch(`${ORIGIN}/makerai/user/access`, { headers: await bearer() })
-		expect(await res.text()).toBe('false')
-		const trueCheck = await SELF.fetch(
-			`${ORIGIN}/makerai/user/access?roomInstanceSpecificCheck=True`,
+		expect(await res.json()).toEqual(granted)
+		const falseCheck = await SELF.fetch(
+			`${ORIGIN}/makerai/user/access?roomInstanceSpecificCheck=False`,
 			{
 				headers: await bearer(),
 			}
 		)
-		expect(await trueCheck.text()).toBe('false')
+		expect(await falseCheck.json()).toEqual(granted)
 	})
 
 	it('401s without a bearer token', async () => {

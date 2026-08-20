@@ -235,28 +235,32 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Whether the caller may use Maker AI at all. Always false: no model runs behind this
-	// worker, so the honest answer is that the feature isn't available — and false is what
-	// leaves the creation UI in its normal state rather than offering a tool that can't
-	// work. (The balances below are still served: the client reads its usage meter
-	// separately, and a server that bills nothing has spent nothing.)
+	// Whether the caller may use Maker AI at all. Granted, like the Roomie budget reads and
+	// unlike the Game AI checks: this is a gate, not a model call, and refusing it hides the
+	// feature outright. (The balances below are still zeroed: the client reads its usage
+	// meter separately, and a server that bills nothing has spent nothing.)
 	//
-	// The body is a BARE JSON `false` — not an envelope, unlike the Game AI refusal and the
-	// Roomie access check on either side of it. `econ`'s
-	// `/api/makerai/checkfreetrialeligibility` answers the same bare shape.
+	// The envelope is its own shape again — PascalCase `Success`/`Error` beside a snake_case
+	// `error_id`, which is neither the Game AI refusal's all-lowercase body nor the Roomie
+	// check's `{ success, error_id, error, value }`. Reproduced as the reference sends it;
+	// the mixed casing is not a typo to tidy up.
 	.get(
 		'/makerai/user/access',
 		describeRoute({
 			tags: ['Maker AI'],
 			summary: 'May the caller use Maker AI?',
 			description: [
-				'Asked before the client offers Maker AI. Always `false` — no model runs behind this',
-				'worker. The body is a bare JSON boolean, not the `{ success, error, value }` envelope',
-				'the neighbouring checks answer with.',
+				'Asked before the client offers Maker AI. Always granted — the gate is about',
+				'entitlement, not capacity, and nothing here meters what Maker AI would cost.',
 				'',
-				'`roomInstanceSpecificCheck` (the client sends .NET’s `False`) is accepted and ignored:',
-				'it asks whether the check is about the instance the player is standing in rather than',
-				'the account, and the answer is the same either way. The token is still validated first.',
+				'The envelope carries PascalCase `Success`/`Error` next to a snake_case `error_id`,',
+				'which matches neither neighbour on this worker. That mix is what the reference sends;',
+				'it is not an inconsistency to clean up.',
+				'',
+				'`roomInstanceSpecificCheck` (the client sends .NET’s `True`/`False`) is accepted and',
+				'ignored: it asks whether the check is about the instance the player is standing in',
+				'rather than the account, and the answer is the same either way. The token is still',
+				'validated first.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -266,7 +270,7 @@ const app = new Hono<App>()
 				),
 			],
 			responses: {
-				200: json(MakerAiAccessResponse, 'Always `false`'),
+				200: json(MakerAiAccessResponse, 'Always granted'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
@@ -274,7 +278,7 @@ const app = new Hono<App>()
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 
-			return c.json(false)
+			return c.json({ Success: true, Error: null, error_id: null })
 		}
 	)
 
