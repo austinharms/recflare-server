@@ -41,14 +41,14 @@ apex/`ns` host and isn't listed within it. Each implemented worker has its own
 | Geo                   | `geo`                   | —                       | Not yet implemented                                                   |
 | Images                | `img`                   | `img`                   | Image storage & signed delivery (R2)                                  |
 | Leaderboard           | `leaderboard`           | —                       | Not yet implemented                                                   |
-| Link                  | `link`                  | —                       | Not yet implemented                                                   |
+| Link                  | `link`                  | `link`                  | Stub — deploys and answers, no link endpoints yet                     |
 | Lists                 | `lists`                 | `lists`                 | Curated & algorithmic discovery lists (canned — nothing ranks yet)    |
 | Matchmaking           | `match`                 | `match`                 | Matchmaking & per-player presence (D1, KV)                            |
 | Moderation            | `moderation`            | `moderation`            | Stub — the reporting routes still live in `api`; see note below       |
 | Notifications         | `notify`                | `notify`                | Real-time notifications over SignalR/WebSockets (Durable Object)      |
 | PlatformNotifications | `platformnotifications` | `platformnotifications` | Stub — deploys and answers, no notification endpoints yet             |
 | PlayerSettings        | `playersettings`        | `playersettings`        | Per-player settings (KV)                                              |
-| RoomComments          | `roomcomments`          | `roomcomments`          | Stub — deploys and answers, no comment endpoints yet                  |
+| RoomComments          | `roomcomments`          | `roomcomments`          | Notes pinned in a room’s scene — read & create (D1)                   |
 | RoomieIntegrations    | `roomieintegrations`    | —                       | Not yet implemented                                                   |
 | Rooms                 | `rooms`                 | `rooms`                 | Room storage & queries; seeds the Dorm & Orientation rooms (D1)       |
 | Storage               | `storage`               | —                       | Room uploader                                                         |
