@@ -1,13 +1,5 @@
 [
   {
-    "id": "Rooms_RoomBanner_SketchyShowdown",
-    "sectionType": 6,
-    "sectionSubType": "RoomBanner",
-    "source": "2477031627165896495",
-    "sourceMetadata": "2477031627165896495",
-    "displayMetadata": null
-  },
-  {
     "id": "Rooms_ForYou_PlayHighlight",
     "sectionType": 0,
     "sectionSubType": "Rooms_ForYou",
@@ -60,7 +52,7 @@
     "sectionType": 13,
     "sectionSubType": "featured_creator",
     "source": "PlayerCreatedRooms",
-    "sourceMetadata": "1",
+    "sourceMetadata": "2",
     "displayMetadata": "{\"DisplayTitle\":\"Featured Creator\", \"descriptionText\":\"Making moments you can play again and again!\",\"itemCount\":\"4\", \"unsupportedPlatforms\":[\"Switch\"]}"
   },
   {

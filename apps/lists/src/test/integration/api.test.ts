@@ -21,23 +21,117 @@ beforeAll(async () => {
 	await adminSecretsStore(env.JWT_SECRET).create('test-signing-key')
 
 	// The shared room schema (owned by the `rooms` worker) plus a few public rooms — the
-	// HotList row ranks these. Presence is what makes a room "hot", so its table is here too.
+	// live rows rank these. Presence is what makes a room "hot", so its table is here too.
 	for (const stmt of ROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of SUBROOM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Creation order and publish order are deliberately near-REVERSES of each other, so the
+	// `new` row and the `recentlyupdated` row can't both be passing on the same ordering.
+	//
+	//   room  created     published    →  new order: 7, 4, 8, 3
+	//      3  2026-01-01  2026-06-01      recentlyupdated: 3, 4, 8, 7
+	//      8  2026-01-15  2026-04-01
+	//      4  2026-02-01  2026-05-01
+	//      7  2026-03-01  never
 	for (const room of [
-		// Account 1 is the Coach — its rooms are this server's stock ones, which the hot row
-		// leaves out.
-		{ RoomId: 2, Name: 'RecCenter', CreatorAccountId: 1, Accessibility: 1, IsDorm: false },
-		{ RoomId: 3, Name: 'DodgeBall', CreatorAccountId: 500, Accessibility: 1, IsDorm: false },
-		{ RoomId: 4, Name: 'Quietly', CreatorAccountId: 501, Accessibility: 1, IsDorm: false },
-		// Non-public and a dorm: neither belongs in a discovery row.
+		// Account 1 is the Coach — its rooms are this server's stock ones, which the discovery
+		// rows leave out.
+		//
+		// Tags fill the CATEGORY rows. Room 2 carries `quest` on purpose: every quest-tagged
+		// room this server ships with is the Coach's, so a category row that dropped them
+		// would be permanently empty.
+		{
+			RoomId: 2,
+			Name: 'RecCenter',
+			CreatorAccountId: 1,
+			CreatedAt: '2026-04-01T00:00:00Z',
+			Tags: [
+				{ Tag: 'rro', Type: 2 },
+				{ Tag: 'Quest', Type: 0 },
+			],
+		},
+		{
+			RoomId: 3,
+			Name: 'DodgeBall',
+			CreatorAccountId: 500,
+			CreatedAt: '2026-01-01T00:00:00Z',
+			Tags: [{ Tag: 'quest', Type: 0 }],
+		},
+		{
+			RoomId: 4,
+			Name: 'Quietly',
+			CreatorAccountId: 501,
+			CreatedAt: '2026-02-01T00:00:00Z',
+			Tags: [
+				{ Tag: 'pvp', Type: 0 },
+				{ Tag: 'horror', Type: 0 },
+			],
+		},
+		// Never published a save, so `recentlyupdated` falls back to its creation time — which
+		// is the newest of the lot, so it leads `new` and trails `recentlyupdated`.
+		{ RoomId: 7, Name: 'FreshRoom', CreatorAccountId: 503, CreatedAt: '2026-03-01T00:00:00Z' },
+		{ RoomId: 8, Name: 'Staged', CreatorAccountId: 504, CreatedAt: '2026-01-15T00:00:00Z' },
+	]) {
+		await seedRoomWithSubRooms(env.DB, {
+			...room,
+			Accessibility: 1,
+			IsDorm: false,
+			SubRooms: [],
+		} as Record<string, unknown>)
+	}
+	// Non-public and a dorm: neither belongs in a discovery row.
+	for (const room of [
 		{ RoomId: 5, Name: 'SecretRoom', CreatorAccountId: 500, Accessibility: 0, IsDorm: false },
 		{ RoomId: 6, Name: '@Dorm', CreatorAccountId: 502, Accessibility: 1, IsDorm: true },
 	]) {
 		await seedRoomWithSubRooms(env.DB, { ...room, SubRooms: [] } as Record<string, unknown>)
 	}
+
+	// What a room's "last updated" reads from: the save its subroom currently PUBLISHES.
+	await publishSave(3, '2026-06-01T00:00:00Z')
+	await publishSave(4, '2026-05-01T00:00:00Z')
+	await publishSave(8, '2026-04-01T00:00:00Z')
+	// …and a STAGED save far in the future on room 8, which must not move it. Nothing anyone
+	// else can load has changed, so a row about updates must not float it to the top.
+	await stageSave(8, '2026-12-01T00:00:00Z')
 })
+
+/**
+ * Give a room a subroom whose published save was created at `createdAt`. Written straight
+ * to the shared tables rather than through the `rooms` worker's save route, which this
+ * worker has no way to call.
+ */
+async function publishSave(roomId: number, createdAt: string): Promise<void> {
+	await env.DB.prepare('INSERT INTO subroom (sub_room_id, room_id, data) VALUES (?1, ?1, ?2)')
+		.bind(roomId, JSON.stringify({ SubRoomId: roomId, RoomId: roomId, Name: 'Home' }))
+		.run()
+	const id = await insertSave(roomId, createdAt)
+	await env.DB.prepare('UPDATE subroom SET current_save_id = ?2 WHERE sub_room_id = ?1')
+		.bind(roomId, id)
+		.run()
+}
+
+/** Attach an UNPUBLISHED save to a subroom that already exists. */
+async function stageSave(subRoomId: number, createdAt: string): Promise<void> {
+	const id = await insertSave(subRoomId, createdAt)
+	await env.DB.prepare('UPDATE subroom SET staged_save_id = ?2 WHERE sub_room_id = ?1')
+		.bind(subRoomId, id)
+		.run()
+}
+
+/** Append a save row and return its (globally unique) id. */
+async function insertSave(subRoomId: number, createdAt: string): Promise<number> {
+	const row = await env.DB.prepare(
+		'INSERT INTO subroom_save (sub_room_id, data) VALUES (?1, ?2) RETURNING sub_room_data_save_id'
+	)
+		.bind(
+			subRoomId,
+			JSON.stringify({ SubRoomId: subRoomId, DataBlob: 'scene', CreatedAt: createdAt })
+		)
+		.first<{ sub_room_data_save_id: number }>()
+	return row!.sub_room_data_save_id
+}
 
 /** Put a player in a room, the way the `match` heartbeat would — this is what ranks it. */
 async function putInRoom(accountId: number, roomId: number): Promise<void> {
@@ -278,6 +372,103 @@ it('serves the live hot-room ranking for /algorithmiclists/HotList', async () =>
 	expect(((await lower.json()) as { Entities: unknown[] }).Entities).toEqual(body.Entities)
 })
 
+/** Fetch a discovery row and return the room ids it serves, in order. */
+async function rowIds(list: string): Promise<string[]> {
+	const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/${list}?type=1`)
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as {
+		Type: number
+		Entities: Array<{ Id: string; Context: null }>
+	}
+	expect(body.Type).toBe(1)
+	// Same entity shape as any other row: ids as STRINGS, `Context` null.
+	expect(body.Entities.every((e) => e.Context === null)).toBe(true)
+	return body.Entities.map((e) => e.Id)
+}
+
+it('orders /algorithmiclists/recentlyupdated by when each room last PUBLISHED', async () => {
+	// Publish order, newest first — room 7 last because it has never published and falls back
+	// to its own creation time. Note this is nearly the reverse of the `new` row below: the
+	// two rows read different timestamps, not the same one twice.
+	expect(await rowIds('recentlyupdated')).toEqual(['3', '4', '8', '7'])
+})
+
+it('does not let a STAGED save float a room up recentlyupdated', async () => {
+	// Room 8's staged save is dated December, later than every published save here. It stays
+	// third all the same: staging changes nothing another player can load, so a row about
+	// updates must not react to it.
+	const ids = await rowIds('recentlyupdated')
+	expect(ids.indexOf('8')).toBe(2)
+})
+
+it('orders /algorithmiclists/new by creation time', async () => {
+	expect(await rowIds('new')).toEqual(['7', '4', '8', '3'])
+})
+
+it.each(['recentlyupdated', 'new'])(
+	'leaves stock, private and dorm rooms out of %s',
+	async (list) => {
+		const ids = await rowIds(list)
+		// Room 2 is the Coach's — this server's stock rooms, which a row about what players have
+		// been building must not be full of.
+		expect(ids).not.toContain('2')
+		// Not public, and a dorm.
+		expect(ids).not.toContain('5')
+		expect(ids).not.toContain('6')
+	}
+)
+
+it('serves the rooms tagged `quest` for /algorithmiclists/quests_algoendpoint', async () => {
+	const ids = await rowIds('quests_algoendpoint')
+	// Ordering is the hot feed's (live players, then engagement), so assert membership.
+	expect([...ids].sort()).toEqual(['2', '3'])
+
+	// Room 2 is the COACH's and belongs here all the same. Every quest-tagged room this
+	// server ships with is the Coach's, so applying the player-made filter the Hot/New rows
+	// use would leave this carousel empty — a category row asks what a room is about, not
+	// who made it.
+	expect(ids).toContain('2')
+
+	// Tagged `pvp`, not `quest`.
+	expect(ids).not.toContain('4')
+	// A category row is still a discovery row: the private room and the dorm stay out.
+	expect(ids).not.toContain('5')
+	expect(ids).not.toContain('6')
+})
+
+// One row per category, each selecting on its own tag. The slugs and tags line up here,
+// but the table maps them explicitly — see ROW_FEEDS.
+it.each([
+	['horror_algoendpoint', ['4']],
+	// Nothing carries these tags yet, so the rows are genuinely EMPTY rather than falling
+	// back to the canned entities. An empty category is the honest answer; the fallback would
+	// show five unrelated rooms under a category heading.
+	['battle_algoendpoint', []],
+	['roleplay_algoendpoint', []],
+	['hangout_algoendpoint', []],
+	['casual_algoendpoint', []],
+	['explore_algoendpoint', []],
+])('serves the %s category row', async (list, expected) => {
+	expect(await rowIds(list)).toEqual(expected)
+})
+
+it('matches the tag case-insensitively', async () => {
+	// Room 2 carries `Quest` capitalised — tags are matched lowercased, so casing a player
+	// typed must not decide whether their room is in the category.
+	expect(await rowIds('quests_algoendpoint')).toContain('2')
+})
+
+it.each([
+	['RecentlyUpdated', 'recentlyupdated'],
+	['New', 'new'],
+	['HOTLIST', 'hotlist'],
+	['Quests_AlgoEndpoint', 'quests_algoendpoint'],
+])('matches the row key %s case-insensitively', async (asked, canonical) => {
+	// The slug reaches us from a curated page's ItemIds or a section's sourceMetadata, whose
+	// casing is the reference's rather than ours.
+	expect(await rowIds(asked)).toEqual(await rowIds(canonical))
+})
+
 it('echoes the requested type and answers an unknown row', async () => {
 	const other = await SELF.fetch(`${ORIGIN}/algorithmiclists/Nothing_Ranks_This_Row?type=4`)
 	expect(other.status).toBe(200)
@@ -318,4 +509,52 @@ it('401s the contextual-features post without a bearer token', async () => {
 	const res = await SELF.fetch(`${ORIGIN}/contextualfeatures`, { method: 'POST' })
 	expect(res.status).toBe(401)
 	expect(await res.text()).toBe('')
+})
+
+// D1 caps a statement at 100 bound parameters. The seed above has a handful of rooms, so
+// every per-room `IN (…)` list fitted and the cap went unnoticed until a real server
+// crossed it: a discovery row reads every room to rank it and attaches tags to all of
+// them, so the bind list grew with the database until the query failed with "variable
+// number must be between ?1 and ?100". The ranking lives in `@repo/domain`, which this
+// worker bundles from source — so this is the same fix the `rooms` worker got, asserted
+// again from the worker that reported it.
+it('serves the rows when there are more rooms than D1 allows bound parameters', async () => {
+	const FIRST = 20000
+	const COUNT = 150
+	for (let i = 0; i < COUNT; i++) {
+		const roomId = FIRST + i
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					RoomId: roomId,
+					Name: `BulkRoom${i}`,
+					CreatorAccountId: 700,
+					IsDorm: false,
+					Accessibility: 1,
+					CreatedAt: '2026-05-01T00:00:00Z',
+				})
+			)
+			.run()
+		if (i % 3 === 0) {
+			await env.DB.prepare('INSERT INTO room_tag (room_id, tag, type) VALUES (?1, ?2, 0)')
+				.bind(roomId, 'quest')
+				.run()
+		}
+	}
+
+	// The row that reported the error, plus the three others that read every room.
+	for (const list of ['HotList', 'new', 'recentlyupdated']) {
+		const res = await SELF.fetch(`${ORIGIN}/algorithmiclists/${list}?type=1`)
+		expect(res.status, `${list} above the bound-parameter cap`).toBe(200)
+		const body = (await res.json()) as { Entities: unknown[] }
+		expect(body.Entities.length).toBeGreaterThan(0)
+	}
+
+	// And a category row, which narrows on the tag index rather than reading every room.
+	const quests = await SELF.fetch(`${ORIGIN}/algorithmiclists/quests_algoendpoint?type=1`)
+	expect(quests.status).toBe(200)
+	expect(((await quests.json()) as { Entities: unknown[] }).Entities.length).toBeGreaterThan(0)
+
+	await env.DB.prepare('DELETE FROM room WHERE room_id >= ?1').bind(FIRST).run()
+	await env.DB.prepare('DELETE FROM room_tag WHERE room_id >= ?1').bind(FIRST).run()
 })

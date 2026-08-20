@@ -1,13 +1,14 @@
 import { Hono } from 'hono'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
-import { getHotRooms } from '@repo/domain'
+import { getHotRooms, getNewRooms, getRecentlyUpdatedRooms } from '@repo/domain'
 import { withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
 import { resolveCuratedList, serializeCuratedList } from './curated-lists'
 
 import type { Context } from 'hono'
+import type { Room } from '@repo/domain'
 import type { App } from './context'
 
 /**
@@ -50,10 +51,10 @@ const ListEntityType = {
 const MAX_LIST_ENTITY_TYPE = 255
 
 /**
- * The entities an algorithmic list hands back (`GET /algorithmiclists/:list`) — ROOMS, which
- * is what a Play/Explore row is built from. Nothing ranks anything here yet, so one canned
- * set answers every row: rooms 2–6, the low ids this server's own rooms occupy, so a
- * discovery row resolves to something real instead of five dead ids.
+ * The fallback entities for a row with no live feed behind it (`GET /algorithmiclists/:list`)
+ * — ROOMS, which is what a Play/Explore row is built from. Rooms 2–6, the low ids this
+ * server's own rooms occupy, so an unranked row resolves to something real instead of five
+ * dead ids. The rows in `ROW_FEEDS` are ranked for real and never reach this.
  *
  * `Id` is a STRING even though a room id is a number, and `Context` is where the reference
  * server attributes the ranking/experiment that produced the entity. Nothing produced these,
@@ -68,25 +69,79 @@ const ALGORITHMIC_LIST_ENTITIES: Array<{ Id: string; Context: string | null }> =
 	'6',
 ].map((Id) => ({ Id, Context: null }))
 
-/**
- * The row key that serves the LIVE hot-room ranking rather than the canned entities — the
- * same feed the rooms worker's `/rooms/hot` answers, which is what a "Hot" row on a
- * discovery page is supposed to show. Matched case-insensitively, since the key reaches us
- * from a curated page's `ItemIds` and its casing is the reference's, not ours.
- */
-const HOT_LIST_KEY = 'hotlist'
-
-/** How many rooms the hot row carries. A discovery carousel shows a page, not the world. */
-const HOT_LIST_SIZE = 20
+/** How many rooms a row carries. A discovery carousel shows a page, not the world. */
+const LIST_SIZE = 20
 
 /**
- * The feed the hot row is drawn from: `community`, which is the hot ranking with the rooms
+ * The feed the Hot row is drawn from: `community`, which is the hot ranking with the rooms
  * the Coach account (id 1) created dropped. Those are this server's stock/seeded rooms, and
  * a "Hot" row that is mostly Rec Center is a row about the server rather than about what
  * players are doing. The pseudo-tag is the rooms worker's own — see `getHotRooms` — so the
  * definition of "community" stays in one place.
  */
 const HOT_LIST_FEED = 'community'
+
+/**
+ * A CATEGORY row: the public, listable rooms carrying one tag, ordered the way the hot feed
+ * orders anything — live player count first, then engagement — so the busiest rooms in the
+ * category lead. `getHotRooms` already means "rooms with this tag, most active first" when
+ * handed a real tag, so a category row is that call with the tag pinned.
+ *
+ * Only the `new`/`community` pseudo-tags get special treatment in there, so a category row
+ * must never be given one of those names.
+ */
+const tagRow =
+	(tag: string) =>
+	(db: D1Database): Promise<{ Results: Room[] }> =>
+		getHotRooms(db, tag, 0, LIST_SIZE)
+
+/**
+ * The rows that serve a LIVE ranking, keyed by the row slug, each answering the rooms that
+ * fill it. Everything not in this table falls back to the canned entities, so adding a real
+ * row is adding a line here rather than another branch in the handler.
+ *
+ * Keys are lowercase and looked up folded: a slug reaches us from a curated page's `ItemIds`
+ * or a discovery section's `sourceMetadata`, and the casing there is the reference's rather
+ * than ours (`HotList`, `recentlyupdated`).
+ *
+ * Every row here yields ROOMS — a discovery carousel is a room carousel — and only the ids
+ * travel, which is why each of these reads a ranking and throws the room blobs away: the
+ * client resolves each room against the `rooms` worker itself.
+ *
+ * The three "what's happening" rows — Hot, Recently Updated, New — share one notion of
+ * which rooms are eligible (public, listable, and made by a PLAYER rather than by the Coach
+ * account), so none of them can show a room its siblings hide. A CATEGORY row deliberately
+ * does not: `quest` is carried by five rooms on this server and every one of them is the
+ * Coach's, so filtering them out would leave the Quests carousel permanently empty. A
+ * category row asks what a room is about, not who made it.
+ *
+ * The definitions live in `@repo/domain` next to the browse feeds they are cousins of.
+ */
+const ROW_FEEDS: Record<string, (db: D1Database) => Promise<{ Results: Room[] }>> = {
+	// The same ranking the rooms worker's `/rooms/hot` serves — live player count first,
+	// then engagement — so the Hot row shows the rooms people are actually in.
+	hotlist: (db) => getHotRooms(db, HOT_LIST_FEED, 0, LIST_SIZE),
+
+	// Ordered by when each room's live scene was last PUBLISHED. A staged save doesn't
+	// count: nothing anyone else can load has changed, so it must not float the room.
+	recentlyupdated: (db) => getRecentlyUpdatedRooms(db, 0, LIST_SIZE),
+
+	// Newest player-made rooms by creation time. Distinct from the browse screen's `tag=new`
+	// chip, which selects on the RRO flag instead — see `getNewRooms`.
+	new: (db) => getNewRooms(db, 0, LIST_SIZE),
+
+	// The category rows. Each names its tag OUTRIGHT rather than deriving one from the slug,
+	// because the mapping is not mechanical — `quests_algoendpoint` is plural and its tag
+	// `quest` is singular, while the six below happen to match. Deriving would quietly invent
+	// a `quests` tag no room carries and serve an empty carousel under a category heading.
+	quests_algoendpoint: tagRow('quest'),
+	battle_algoendpoint: tagRow('battle'),
+	roleplay_algoendpoint: tagRow('roleplay'),
+	horror_algoendpoint: tagRow('horror'),
+	hangout_algoendpoint: tagRow('hangout'),
+	casual_algoendpoint: tagRow('casual'),
+	explore_algoendpoint: tagRow('explore'),
+}
 
 /**
  * The entity type an algorithmic list reports when the query names none. The client always
@@ -169,12 +224,12 @@ const app = new Hono<App>()
 	// `Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore`), and the answer is the
 	// ranked entities that fill it, which the client then resolves by id itself.
 	//
-	// `HotList` is ranked for real — the same feed the rooms worker's `/rooms/hot` serves.
-	// Every other row still serves the canned entities, and an unknown row key gets them too
-	// rather than a 404, which the client renders as a row that failed to load. `Type` is
-	// echoed back from the query: it tells the client what the `Id`s ARE (rooms, players, …),
-	// so answering with a type the caller didn't ask for would have it resolve the ids
-	// against the wrong service.
+	// `HotList`, `recentlyupdated` and `new` are ranked for real (see `ROW_FEEDS`). Every
+	// other row still serves the canned entities, and an unknown row key gets them too rather
+	// than a 404, which the client renders as a row that failed to load. `Type` is echoed
+	// back from the query: it tells the client what the `Id`s ARE (rooms, players, …), so
+	// answering with a type the caller didn't ask for would have it resolve the ids against
+	// the wrong service.
 	.get('/algorithmiclists/:list', async (c) => {
 		// Echoed, but only when it fits the byte the client reads it back into — anything
 		// outside 0–255 can't round-trip, so a nonsense `?type=` gets the default instead of a
@@ -182,13 +237,12 @@ const app = new Hono<App>()
 		const type = Number.parseInt(c.req.query('type') ?? '', 10)
 		const echoed = type >= 0 && type <= MAX_LIST_ENTITY_TYPE ? type : DEFAULT_ALGORITHMIC_LIST_TYPE
 
-		// `HotList` is real: it serves the same ranking the rooms worker's `/rooms/hot` feed
-		// does — live player count first, then engagement — so the Hot row on a discovery page
-		// shows the rooms people are actually in, minus the Coach account's stock rooms (see
-		// HOT_LIST_FEED). Only the ids travel; the client resolves each room itself, which is
-		// why this reads the ranking and throws the room blobs away.
-		if (c.req.param('list').toLowerCase() === HOT_LIST_KEY) {
-			const { Results } = await getHotRooms(c.env.DB, HOT_LIST_FEED, 0, HOT_LIST_SIZE)
+		// A row with a live feed behind it serves that; everything else gets the canned
+		// entities. Only the ids travel — the client resolves each room itself — so the
+		// ranking is read for its order and the room blobs are thrown away.
+		const feed = ROW_FEEDS[c.req.param('list').toLowerCase()]
+		if (feed !== undefined) {
+			const { Results } = await feed(c.env.DB)
 			return c.json({
 				Type: echoed,
 				Entities: Results.map((room) => ({ Id: String(room.RoomId), Context: null })),
