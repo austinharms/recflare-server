@@ -1,6 +1,7 @@
 import { Hono } from 'hono'
 import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
+import { z } from 'zod'
 
 import {
 	countAccountsBySignupIp,
@@ -1177,6 +1178,31 @@ const app = new Hono<App>()
 		if (!account) return c.body(null, 404)
 		return c.json(account.isModerator === true)
 	})
+
+	// @guess Oculus nonce. The client asks for this before a Meta login; the exact shape
+	// it expects hasn't been observed, so this mints a fresh 64-char hex nonce (the length
+	// Meta's own `GetUserProof` nonces have) and answers it as a bare JSON string. Nothing
+	// is stored — Meta's nonce validation (meta-nonce.ts) is what actually proves a login,
+	// so this value is not security-relevant to the server. Revisit once the client's use
+	// of it is seen.
+	.get(
+		'/oculus/nonce',
+		describeRoute({
+			tags: ['Account'],
+			summary: 'A fresh nonce for the Oculus login flow',
+			description: [
+				'Mints a random 64-char hex nonce and returns it as a bare JSON string. Not stored',
+				'and not verified later — a best guess at the shape the client wants.',
+			].join(' '),
+			responses: { 200: json(z.string(), 'The nonce') },
+		}),
+		(c) => {
+			const bytes = crypto.getRandomValues(new Uint8Array(32))
+			const nonce = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('')
+			logger.info('oculus nonce issued')
+			return c.json(nonce)
+		}
+	)
 
 // The generated spec. Documentation only — no request is validated against it (see
 // openapi.ts). `hide: true` keeps this route out of its own output.
