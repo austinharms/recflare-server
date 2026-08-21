@@ -1053,6 +1053,54 @@ describe('rooms endpoints', () => {
 		expect(body.length).toBeLessThanOrEqual(3)
 	})
 
+	// The feeds narrow to the listable rooms in SQL (LISTABLE_WHERE, off idx_room_public)
+	// rather than by parsing every room in the database. That predicate has to answer
+	// exactly what the in-memory `isListable` answered, and the interesting case is the
+	// MISSING key: `ExcludeFromLists !== true` accepts a blob that never carried the field,
+	// so the SQL has to accept the NULL its generated column extracts.
+	it('the feeds’ SQL filter treats a missing ExcludeFromLists as not-excluded', async () => {
+		const seed = (data: Record<string, unknown>) =>
+			env.DB.prepare('INSERT INTO room (data) VALUES (?1)').bind(JSON.stringify(data)).run()
+
+		// No `ExcludeFromLists` key at all — the shape of every room seeded before the flag
+		// existed.
+		await seed({
+			RoomId: 30801,
+			Name: 'NoExcludeKey',
+			CreatorAccountId: 830,
+			Accessibility: 1,
+			IsDorm: false,
+			SubRooms: [],
+		})
+		// Same room, opted out.
+		await seed({
+			RoomId: 30802,
+			Name: 'OptedOut',
+			CreatorAccountId: 830,
+			Accessibility: 1,
+			IsDorm: false,
+			ExcludeFromLists: true,
+			SubRooms: [],
+		})
+
+		const namesIn = async (path: string) => {
+			const body = (await (await SELF.fetch(`${ORIGIN}${path}`)).json()) as
+				{ Results: Array<{ Name: string }> } | Array<{ Name: string }>
+			return (Array.isArray(body) ? body : body.Results).map((r) => r.Name)
+		}
+
+		for (const feed of ['/rooms/hot?take=200', '/rooms/recommendations?take=200']) {
+			expect(await namesIn(feed)).toContain('NoExcludeKey')
+			expect(await namesIn(feed)).not.toContain('OptedOut')
+		}
+
+		// SEARCH is the wider filter (PUBLIC_WHERE): a room can opt out of the browse feeds
+		// and still be findable by name, so this must not have narrowed with the feeds.
+		expect(await namesIn('/rooms/search?query=optedout')).toContain('OptedOut')
+
+		await env.DB.prepare('DELETE FROM room WHERE room_id IN (30801, 30802)').run()
+	})
+
 	// Served only to the client builds that render it — the 2023 client's other room
 	// listings start failing with NREs when it gets this payload, which is why the route
 	// was parked entirely for a while (see FEATURED_ROOMS_VERSIONS in rooms.app.ts).

@@ -34,11 +34,26 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		-- and served as the room's \`Stats.VisitCount\`. A real column rather than a field
 		-- in the blob so a visit is one atomic UPDATE that can't lose a concurrent
 		-- read-modify-write of the whole room.
-		visits INTEGER NOT NULL DEFAULT 0
+		visits INTEGER NOT NULL DEFAULT 0,
+		-- The two flags every public feed filters on, alongside \`is_dorm\`
+		-- (migrations/0014_room_listable.sql, which appends them here). Generated like the
+		-- rest so the blob stays the only copy; they exist to be INDEXED — see
+		-- {@link LISTABLE_WHERE}.
+		accessibility INTEGER GENERATED ALWAYS AS (json_extract(data, '$.Accessibility')) VIRTUAL,
+		exclude_from_lists INTEGER GENERATED ALWAYS AS (json_extract(data, '$.ExcludeFromLists')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_room_id ON room (room_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_rooms_name_lower ON room (name_lower)`,
 	`CREATE INDEX IF NOT EXISTS idx_rooms_creator ON room (creator_account_id)`,
+	// PARTIAL index over the public, non-dorm rooms — the only rooms any feed can serve,
+	// and a small minority of the table (most rooms are dorms, one per account). Scanning
+	// it visits those rooms alone instead of every room in the database; see
+	// {@link LISTABLE_WHERE} for why the feeds select on it.
+	//
+	// Indexed on `room_id` because a partial index needs some column to key on and the
+	// feeds all order by it eventually; the WHERE clause is the point, not the key.
+	`CREATE INDEX IF NOT EXISTS idx_room_public ON room (room_id)
+	 WHERE is_dorm IS NOT 1 AND accessibility = 1`,
 	// A room's tags, one row per tag (migrations/0013_room_tag.sql). Modelled on the
 	// `api` worker's `event_tag`, and the table is AUTHORITATIVE: `serializeRoom` strips
 	// `Tags` from the blob and the reads re-attach it, the same arrangement `subroom` and
@@ -891,6 +906,32 @@ interface RoomRow {
 const ROOM_COLUMNS = 'data, visits'
 
 /**
+ * The rooms a public feed may consider, as a SQL predicate: public, not a dorm, and not
+ * opted out of lists — the same test {@link isListable} makes in memory, pushed down so
+ * the blobs of the rooms that fail it never cross the wire. `IS NOT 1` rather than `= 0`
+ * because a blob missing the key extracts as NULL, which the JS `!== true` accepts.
+ *
+ * The feeds all scanned the whole table and threw most of it away: a server's rooms are
+ * mostly DORMS (one per account, private by construction), so a scan read megabytes of
+ * blob to rank a hundred rooms. `idx_room_public` covers the first two terms, so this
+ * visits only the rooms that can actually be served.
+ *
+ * The in-memory filter STAYS wherever this is used. It costs nothing once the set is
+ * small, and it — not the SQL — remains the definition of listable: a blob with a
+ * surprising type in one of these fields (`"1"` for `Accessibility`, say) would satisfy
+ * the column's integer affinity while failing `=== 1` in JS, and the feeds must agree
+ * with {@link isListable} rather than with SQLite.
+ */
+const LISTABLE_WHERE = 'is_dorm IS NOT 1 AND accessibility = 1 AND exclude_from_lists IS NOT 1'
+
+/**
+ * The wider half of {@link LISTABLE_WHERE}: public and not a dorm, without the
+ * `ExcludeFromLists` term. What SEARCH considers — a room can opt out of the browse feeds
+ * and still be findable by name — so the two searching reads select on this instead.
+ */
+const PUBLIC_WHERE = 'is_dorm IS NOT 1 AND accessibility = 1'
+
+/**
  * Keys on the client's room DTO that nothing here stores, defaulted on every read so the
  * key is PRESENT rather than absent — the seed blobs and every room written since predate
  * them, so they can't come from the data:
@@ -1210,8 +1251,12 @@ export async function setRoomTags(db: D1Database, roomId: number, tags: RoomTag[
  * what the in-memory filter it replaced cost. The join searches the tag index FIRST and
  * then looks up only the rooms that matched, which is what makes a category row cheap.
  */
-function roomsByTagsQuery(tagSets: string[][]): { sql: string; binds: string[] } {
-	if (tagSets.length === 0) return { sql: `SELECT ${ROOM_COLUMNS} FROM room`, binds: [] }
+function roomsByTagsQuery(tagSets: string[][], where = ''): { sql: string; binds: string[] } {
+	// `where` is the caller's row filter ({@link LISTABLE_WHERE} or {@link PUBLIC_WHERE}) —
+	// unqualified, which is unambiguous under either shape below. It matters most when
+	// `tagSets` is EMPTY: that branch is the full scan every pseudo-tag feed still runs.
+	const filter = where === '' ? '' : ` WHERE ${where}`
+	if (tagSets.length === 0) return { sql: `SELECT ${ROOM_COLUMNS} FROM room${filter}`, binds: [] }
 
 	const binds: string[] = []
 	const joins = tagSets.map((tags, i) => {
@@ -1222,7 +1267,7 @@ function roomsByTagsQuery(tagSets: string[][]): { sql: string; binds: string[] }
 	})
 	// `data`/`visits` are unqualified but unambiguous: the joined subqueries expose only
 	// `room_id`.
-	return { sql: `SELECT ${ROOM_COLUMNS} FROM room r ${joins.join(' ')}`, binds }
+	return { sql: `SELECT ${ROOM_COLUMNS} FROM room r ${joins.join(' ')}${filter}`, binds }
 }
 
 /** Parse subroom rows and resolve their `CurrentSave` in one batched query. */
@@ -2020,7 +2065,8 @@ function roomHasAnyTag(room: Room, tags: Set<string>): boolean {
  * Search public, non-dorm rooms. The query is split into terms (space/`+`):
  * `#tag` terms match the room's Tags; plain terms match the room name
  * (substring). All terms must match. Returns a paginated `{ Results, TotalResults }`.
- * The dataset is small, so this filters in memory rather than in SQL.
+ * The rows narrow in SQL — public, non-dorm ({@link PUBLIC_WHERE}) — and the name terms
+ * match in memory over what comes back.
  *
  * `#community` is the one tag term that isn't a tag lookup — see {@link COMMUNITY_TAG}.
  */
@@ -2048,7 +2094,7 @@ export async function searchRooms(
 	const tagSets = tagTerms
 		.filter((tag) => tag !== COMMUNITY_TAG)
 		.map((tag) => [tag, ...(TAG_ALIASES[tag] ?? [])])
-	const { sql, binds } = roomsByTagsQuery(tagSets)
+	const { sql, binds } = roomsByTagsQuery(tagSets, PUBLIC_WHERE)
 	const { results } = await db
 		.prepare(sql)
 		.bind(...binds)
@@ -2091,7 +2137,8 @@ export async function searchRooms(
  *
  * Matching is case-insensitive and suggestions are de-duplicated case-insensitively, but
  * each is returned in its stored casing — search doesn't care, and the player reads these.
- * The dataset is small, so this filters in memory like {@link searchRooms}.
+ * Narrowed in SQL to the same rooms {@link searchRooms} considers; the matching itself is
+ * in memory, like search's.
  */
 export async function autocompleteRoomSearch(
 	db: D1Database,
@@ -2101,9 +2148,11 @@ export async function autocompleteRoomSearch(
 	const q = query.trim().toLowerCase()
 	if (q === '' || take <= 0) return []
 
-	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
-	// Tags attached up front: suggestions are drawn from them, and this reads every room for
-	// its NAME regardless, so the tags cost one extra query rather than a second scan.
+	const { results } = await db
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${PUBLIC_WHERE}`)
+		.all<RoomRow>()
+	// Tags attached up front: suggestions are drawn from them, and this reads every candidate
+	// room for its NAME regardless, so the tags cost one extra query rather than a second scan.
 	const rooms = (await parseAllWithTags(db, results)).filter(
 		(r) => r.IsDorm !== true && r.Accessibility === 1
 	)
@@ -2216,8 +2265,8 @@ function createdAt(room: Room): number {
  * aliases as search). "Hot" is a live-population feed, so current players lead;
  * rooms nobody is in — and the all-zero seed data — fall back to the stored
  * engagement score, then to RoomId order so paging stays stable. Paginated via
- * skip/take; returns `{ Results, TotalResults }` like search. The dataset is
- * small, so this filters/sorts in memory rather than in SQL.
+ * skip/take; returns `{ Results, TotalResults }` like search. The listable filter runs in
+ * SQL ({@link LISTABLE_WHERE}); the ranking is in memory.
  *
  * `tag=new` and `tag=community` are the filters that aren't tag lookups — see
  * {@link NEW_TAG} and {@link COMMUNITY_TAG}.
@@ -2234,7 +2283,10 @@ export async function getHotRooms(
 	// discovery category row runs: only the rooms carrying the tag have their blobs read.
 	// The two pseudo-tags below name no tag at all, so they still scan.
 	const isPseudo = t === '' || t === NEW_TAG || t === COMMUNITY_TAG
-	const { sql, binds } = roomsByTagsQuery(isPseudo ? [] : [[t, ...(TAG_ALIASES[t] ?? [])]])
+	const { sql, binds } = roomsByTagsQuery(
+		isPseudo ? [] : [[t, ...(TAG_ALIASES[t] ?? [])]],
+		LISTABLE_WHERE
+	)
 	const { results } = await db
 		.prepare(sql)
 		.bind(...binds)
@@ -2319,15 +2371,17 @@ async function lastPublishedAtByRoom(db: D1Database): Promise<Map<number, number
  * dropping them would leave the row empty. RoomId — minted in creation order — breaks ties
  * newest-first so paging stays stable.
  *
- * Paginated via skip/take, `{ Results, TotalResults }` like the hot feed. The dataset is
- * small, so this filters and sorts in memory rather than in SQL.
+ * Paginated via skip/take, `{ Results, TotalResults }` like the hot feed. The listable
+ * filter runs in SQL ({@link LISTABLE_WHERE}); the ranking is in memory.
  */
 export async function getRecentlyUpdatedRooms(
 	db: D1Database,
 	skip: number,
 	take: number
 ): Promise<{ Results: Room[]; TotalResults: number }> {
-	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
+	const { results } = await db
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.all<RoomRow>()
 	const rooms = parseAll(results).filter((r) => isListable(r) && isPlayerMade(r))
 
 	const published = await lastPublishedAtByRoom(db)
@@ -2357,7 +2411,9 @@ export async function getNewRooms(
 	skip: number,
 	take: number
 ): Promise<{ Results: Room[]; TotalResults: number }> {
-	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
+	const { results } = await db
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.all<RoomRow>()
 	const rooms = parseAll(results)
 		.filter((r) => isListable(r) && isPlayerMade(r))
 		.sort((a, b) => createdAt(b) - createdAt(a) || roomIdOf(b) - roomIdOf(a))
@@ -2373,15 +2429,17 @@ export async function getNewRooms(
  * by engagement (same score as the hot feed). Unlike the hot feed this returns a
  * bare array — the client's recommendation room-source loader expects a plain
  * list, like the other `*by/me`/base sources. The `splitTest*` A/B params the
- * client passes don't change the result. Paginated via skip/take; the dataset is
- * small, so this filters/sorts in memory rather than in SQL.
+ * client passes don't change the result. Paginated via skip/take; the listable filter runs
+ * in SQL ({@link LISTABLE_WHERE}); the ranking is in memory.
  */
 export async function getRecommendedRooms(
 	db: D1Database,
 	skip: number,
 	take: number
 ): Promise<Room[]> {
-	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
+	const { results } = await db
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.all<RoomRow>()
 	const stats = await getRoomStats(db)
 	return hydrateRooms(
 		db,
@@ -2416,10 +2474,12 @@ export interface FeaturedRoomGroup {
  * Featured rooms group: public, non-dorm rooms not excluded from lists, in random
  * order. There's no editorial curation behind this yet, so "featured" is just a
  * random shuffle of the eligible rooms wrapped in a single always-active group.
- * Small dataset, so done in memory.
+ * Eligibility is filtered in SQL ({@link LISTABLE_WHERE}); the rest is in memory.
  */
 export async function getFeaturedRooms(db: D1Database): Promise<FeaturedRoomGroup> {
-	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
+	const { results } = await db
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.all<RoomRow>()
 	const rooms = parseAll(results).filter(isListable)
 	// Fisher–Yates shuffle so the feed varies between requests.
 	for (let i = rooms.length - 1; i > 0; i--) {
@@ -2450,7 +2510,8 @@ export async function getFeaturedRooms(db: D1Database): Promise<FeaturedRoomGrou
  * that share at least one tag with it, ranked by shared-tag count then
  * engagement. Returns a paginated `{ Results, TotalResults }` (the client's
  * RoomSimilarity source expects an object, not a bare array); empty if the target
- * isn't in D1 or is untagged. Small dataset, so done in memory.
+ * isn't in D1 or is untagged. Eligibility is filtered in SQL ({@link LISTABLE_WHERE}); the
+ * tag ranking is in memory.
  */
 export async function getSimilarRooms(
 	db: D1Database,
@@ -2464,7 +2525,9 @@ export async function getSimilarRooms(
 	const targetTags = new Set(roomTags(target))
 	if (targetTags.size === 0) return empty
 
-	const { results } = await db.prepare(`SELECT ${ROOM_COLUMNS} FROM room`).all<RoomRow>()
+	const { results } = await db
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.all<RoomRow>()
 	const sharedCount = (r: Room): number => roomTags(r).filter((t) => targetTags.has(t)).length
 	const stats = await getRoomStats(db)
 
