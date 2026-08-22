@@ -3418,6 +3418,20 @@ describe('messages', () => {
 		expect(res.status).toBe(401)
 		expect(await pushed()).toEqual([])
 	})
+
+	test('POST /api/messages/v3/delete accepts anything with an empty 200', async () => {
+		// No message store, so no id can be real and nothing is gated — an unknown id, an
+		// empty list and a missing body all land the same way.
+		for (const body of [{ MessageIds: [1787377235629] }, { MessageIds: [] }, {}]) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/messages/v3/delete`, {
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+			expect(res.status).toBe(200)
+			expect(await res.text()).toBe('')
+		}
+	})
 })
 
 describe('mutual friends', () => {
@@ -4837,6 +4851,7 @@ describe('openapi', () => {
 			'POST /api/messages/v1/friendOnlineStatus',
 			'POST /api/messages/v1/sendMultiple',
 			'POST /api/messages/v2/send',
+			'POST /api/messages/v3/delete',
 			'POST /api/playerReputation/v1/bulk',
 			'POST /api/playerReputation/v2/bulk',
 			'POST /api/playerevents/v1/bulkInvite',

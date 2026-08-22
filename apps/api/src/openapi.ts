@@ -214,6 +214,15 @@ export const SendMultipleMessagesRequest = z.object({
 })
 
 /**
+ * `POST /api/messages/v3/delete` JSON body — the messages the client is dropping from
+ * its inbox. Ids are the `Id` of a stored message, which this server has never issued:
+ * with no message store the list is only ever echoed back as accepted.
+ */
+export const DeleteMessagesRequest = z.object({
+	MessageIds: z.array(z.int()).describe('Ids of the messages to delete'),
+})
+
+/**
  * `POST /api/messages/v1/friendOnlineStatus` — how many of the caller's friends are
  * online, wrapped in the client's `{ success, value }` envelope.
  */
