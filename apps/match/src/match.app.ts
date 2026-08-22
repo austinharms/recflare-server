@@ -7,6 +7,7 @@ import {
 	areFriends,
 	canManageRoom,
 	createRoomInstance,
+	createRoomInvite,
 	deleteEmptyRoomInstances,
 	deleteExpiredPresence,
 	deletePresence,
@@ -61,6 +62,7 @@ import {
 	form,
 	InProgressRequest,
 	InviteRequest,
+	InviteResponse,
 	JoinModeRequest,
 	json,
 	jsonBody,
@@ -609,6 +611,7 @@ const HUB_INSTANCE = 'global'
 function nextLiveMessageId(): number {
 	return Date.now()
 }
+
 
 /**
  * Deliver a game invite from `fromId` to `toId` for a room instance — a `MessageReceived`
@@ -2262,9 +2265,11 @@ const app = new Hono<App>()
 	// `roomInstanceId` they're being invited into. Delivers a game-invite Message to the
 	// target over the notify hub as a MessageReceived frame — the client renders the
 	// join prompt from it. When the room instance resolves, its RoomId rides along on the
-	// message so the client knows which room the invite points at. Always acks 200 (a bad
-	// playerId is a 400, a missing token a 401); hub delivery is best-effort, so a target
-	// who's offline simply has the frame queued (or dropped) without failing the invite.
+	// message so the client knows which room the invite points at. The invite is also
+	// recorded as a `room_invite` row, and that row IS the response —
+	// `{ RoomInviteId, FromPlayerId, ToPlayerId, RoomId }` (a bad playerId is a 400, a
+	// missing token a 401). Hub delivery is best-effort, so a target who's offline simply
+	// has the frame queued (or dropped) without failing the invite.
 	.post(
 		'/invite',
 		describeRoute({
@@ -2274,14 +2279,16 @@ const app = new Hono<App>()
 				'Sends a game invite from the caller (the Bearer token) to `playerId` for',
 				'`roomInstanceId`. Delivered to the target over the notify hub as a `MessageReceived`',
 				'notification carrying a game-invite `Message`; the resolved instance’s `RoomId` rides',
-				'on the message. Acks 200 (bad `playerId` → 400); hub delivery is best-effort.',
+				'on the message. The invite is recorded as a `room_invite` row and that row is the',
+				'response (bad `playerId` → 400); hub delivery is best-effort.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(InviteRequest, 'The target player and the room instance'),
 			responses: {
-				200: EMPTY_OK,
+				200: json(InviteResponse, 'The invite that was sent'),
 				400: { description: 'Missing, non-numeric, or zero playerId (empty body)' },
 				401: UNAUTHORIZED_RESPONSE,
+				500: { description: 'The invite could not be recorded; nothing was sent (empty body)' },
 			},
 		}),
 		async (c) => {
@@ -2306,8 +2313,19 @@ const app = new Hono<App>()
 				if (instance) roomId = instance.roomId
 			}
 
+			// Record the invite before delivering it: the row is what mints the `RoomInviteId`
+			// the response carries, while the frame itself is fire-and-forget.
+			const invite = await createRoomInvite(c.env.DB, id, toPlayerId, roomId)
+			// No row, no id to answer with — and nothing for a later lookup or expiry to find.
+			// A server fault rather than the caller's, so don't push the frame either: an
+			// invite the response can't name is worse than no invite.
+			if (invite === null) {
+				logger.error('failed to record room invite', { fromPlayerId: id, toPlayerId, roomId })
+				return c.body(null, 500)
+			}
+
 			await sendGameInvite(c, id, toPlayerId, roomInstanceIdStr, roomId)
-			return c.body(null, 200)
+			return c.json(invite)
 		}
 	)
 

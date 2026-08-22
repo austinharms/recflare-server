@@ -16,6 +16,7 @@ import {
 	getRoomInstance,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
+	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	SUBROOM_SCHEMA_DDL,
@@ -120,6 +121,8 @@ beforeAll(async () => {
 	for (const stmt of ROOM_INSTANCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Presence table (owned by the rooms worker) — written/read by matchmake + heartbeat.
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Room invites (owned by this worker) — POST /invite mints a row per invite.
+	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Accounts table (owned by the auth worker) — dorm creation reads the username
 	// to name the room. Seed the players the dorm tests authenticate as.
@@ -2242,6 +2245,25 @@ describe('auth-gated endpoints', () => {
 		// The client's exact request: player 42 invites 153 into their instance.
 		const res = await invite(`playerId=153&roomInstanceId=${instance.roomInstanceId}`, '42')
 		expect(res.status).toBe(200)
+		// The response is the `room_invite` row the invite just created.
+		const created = (await res.json()) as Record<string, unknown>
+		expect(created).toMatchObject({ FromPlayerId: 42, ToPlayerId: 153, RoomId: 2 })
+		expect(created.RoomInviteId).toBeGreaterThan(0)
+
+		// ...and the row is really there, `created_at` stamped in epoch seconds so the
+		// eventual expiry sweep can compare it.
+		const row = await env.DB.prepare(
+			'SELECT from_player_id, to_player_id, room_id, created_at FROM room_invite WHERE room_invite_id = ?1'
+		)
+			.bind(created.RoomInviteId)
+			.first<{
+				from_player_id: number
+				to_player_id: number
+				room_id: number | null
+				created_at: number
+			}>()
+		expect(row).toMatchObject({ from_player_id: 42, to_player_id: 153, room_id: 2 })
+		expect(row!.created_at).toBeGreaterThan(1_700_000_000)
 
 		const notes = await sent()
 		expect(notes).toHaveLength(1)
@@ -2269,6 +2291,10 @@ describe('auth-gated endpoints', () => {
 		// RoomId (which the real hub drops from the frame).
 		const noRoom = await invite('playerId=153&roomInstanceId=999999', '42')
 		expect(noRoom.status).toBe(200)
+		const noRoomInvite = (await noRoom.json()) as Record<string, unknown>
+		expect(noRoomInvite).toMatchObject({ RoomId: null })
+		// Each invite gets its own id.
+		expect(noRoomInvite.RoomInviteId).not.toBe(created.RoomInviteId)
 		const after = await sent()
 		expect(after).toHaveLength(1)
 		expect(after[0].data.RoomId).toBeNull()

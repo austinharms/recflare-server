@@ -384,3 +384,17 @@ export const InviteRequest = z.object({
 		.optional()
 		.describe('The caller’s room instance to invite them into; resolves the invite’s RoomId'),
 })
+
+/**
+ * `POST /invite` response — the `room_invite` row the invite just created. The frame the
+ * invitee receives is ephemeral; the row is what gives the invite an id of its own.
+ */
+export const InviteResponse = z.object({
+	RoomInviteId: z.int().describe('Id of the new `room_invite` row'),
+	FromPlayerId: z.int().describe('The caller (the Bearer token)'),
+	ToPlayerId: z.int().describe('The invited account'),
+	RoomId: z
+		.int()
+		.nullable()
+		.describe('The room the invite points at; null when the room instance didn’t resolve'),
+})
