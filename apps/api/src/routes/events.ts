@@ -17,6 +17,7 @@ import {
 	getEventsByClubs,
 	getEventsByCreator,
 	getEventsByIds,
+	getEventsByRoom,
 	getEventTags,
 	getLiveEvents,
 	inviteToEvent,
@@ -356,6 +357,30 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			const events = await getEventsByClubs(c.env.DB, [clubId])
 			return c.json({ ContinuationToken: '', Events: events })
 		}
+	)
+
+	// A room's event shelf (`/room/12`) — what is on in this room, current and upcoming.
+	// A bare array of the stored record, like the multi-club shelf and `/searchlive`: the
+	// single-club form's `{ ContinuationToken, Events }` envelope is the odd one out, and a
+	// room's shelf is small enough that there is nothing to page.
+	.get(
+		'/api/playerevents/v1/room/:roomId{[0-9]+}',
+		describeRoute({
+			tags: ['Events'],
+			summary: 'Player events in one room',
+			description:
+				'The events scheduled in a room — the shelf on the room’s page — soonest first. A ' +
+				'bare array of the stored record, the same projection `/searchlive` and the ' +
+				'multi-club shelf serve.\n\n' +
+				'CURRENT and UPCOMING only: the filter is on the END time, so a running event stays ' +
+				'listed until it is over rather than vanishing the moment it starts, and an event ' +
+				'that has finished is dropped — this answers what someone can still turn up to. A ' +
+				'room with nothing scheduled, and a room id that does not exist, both answer an ' +
+				'empty array; the shelf is about events, not about whether the room is real.',
+			parameters: [idParam('roomId', 'Room id')],
+			responses: { 200: json(PlayerEventDto.array(), 'The room’s current and upcoming events') },
+		}),
+		async (c) => c.json(await getEventsByRoom(c.env.DB, Number.parseInt(c.req.param('roomId'), 10)))
 	)
 
 	// Live player-event search (the "happening now" browse query) — events that have

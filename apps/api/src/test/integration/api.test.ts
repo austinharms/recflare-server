@@ -4075,6 +4075,53 @@ describe('player events', () => {
 		expect(ids).not.toContain(pastEvent.PlayerEventId)
 	})
 
+	test('GET /api/playerevents/v1/room/:roomId serves that room’s current and upcoming events', async () => {
+		// A room of this test's own, so events other tests create can't drift into the shelf.
+		const soon = await create({
+			RoomId: 12,
+			Name: 'Room 12 Soon',
+			StartTime: at(2 * HOUR),
+			EndTime: at(3 * HOUR),
+		})
+		const running = await create({
+			RoomId: 12,
+			Name: 'Room 12 Running',
+			StartTime: at(-HOUR),
+			EndTime: at(HOUR),
+		})
+		const finished = await create({
+			RoomId: 12,
+			Name: 'Room 12 Finished',
+			StartTime: at(-3 * HOUR),
+			EndTime: at(-2 * HOUR),
+		})
+		const elsewhere = await create({
+			RoomId: 13,
+			Name: 'Room 13 Soon',
+			StartTime: at(HOUR),
+			EndTime: at(2 * HOUR),
+		})
+
+		const res = await get('/api/playerevents/v1/room/12')
+		expect(res.status).toBe(200)
+		const events = (await res.json()) as PlayerEvent[]
+
+		// Soonest first, and RUNNING counts as current: the filter is on the end time, so an
+		// event stays on the shelf until it is over rather than vanishing when it starts.
+		expect(events.map((e) => e.PlayerEventId)).toEqual([running.PlayerEventId, soon.PlayerEventId])
+		// A finished event is dropped — the shelf answers what you can still turn up to — and
+		// another room's event is not this room's business.
+		expect(events.map((e) => e.PlayerEventId)).not.toContain(finished.PlayerEventId)
+		expect(events.map((e) => e.PlayerEventId)).not.toContain(elsewhere.PlayerEventId)
+
+		// A bare array of the STORED record, like `/searchlive` and the multi-club shelf —
+		// not the base projection the browse feed serves, and not the single-club envelope.
+		expect(events[0]).toEqual(asRecord(running, null))
+
+		// A room with nothing scheduled, and a room id nothing knows about, are both empty.
+		expect(await (await get('/api/playerevents/v1/room/999999')).json()).toEqual([])
+	})
+
 	test('GET /api/playerevents/v1/clubs is a bare array; /club/:id is a paged envelope', async () => {
 		// The client deserializes the multi-club form as a list — an envelope here fails
 		// with "expected:'[', actual:'{'". Do not unify the two.
@@ -4788,6 +4835,7 @@ describe('openapi', () => {
 			'GET /api/playerevents/v1/bulk',
 			'GET /api/playerevents/v1/club/{clubId}',
 			'GET /api/playerevents/v1/clubs',
+			'GET /api/playerevents/v1/room/{roomId}',
 			'GET /api/playerevents/v1/search',
 			'GET /api/playerevents/v1/searchlive',
 			'GET /api/playerevents/v1/tagfilters',

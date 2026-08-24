@@ -41,6 +41,7 @@ export const SCHEMA_DDL: string[] = [
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_event_id ON event (id)`,
 	`CREATE INDEX IF NOT EXISTS idx_event_creator ON event (creator_player_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_event_club ON event (club_id)`,
+	`CREATE INDEX IF NOT EXISTS idx_event_room ON event (room_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_event_start ON event (start_time)`,
 	`CREATE TABLE IF NOT EXISTS event_attendee (
 		event_id INTEGER NOT NULL,
@@ -857,6 +858,30 @@ export async function getEventsByClubs(db: D1Database, clubIds: number[]): Promi
 	const { results } = await db
 		.prepare(`SELECT data FROM event WHERE club_id IN (${placeholders})`)
 		.bind(...clubIds)
+		.all<EventRow>()
+	return results.map((r) => JSON.parse(r.data) as PlayerEvent).sort(bySoonest)
+}
+
+/**
+ * A room's events — what is happening in this room and what is coming up, soonest first.
+ * Backs the room's event shelf (`GET /api/playerevents/v1/room/{roomId}`).
+ *
+ * FINISHED events are left out, like the browse feed's: this answers "what can I still turn
+ * up to in this room", and an event that ended last month is not that. Running events count
+ * as current — the filter is on the END time, so an event stays listed until it is over
+ * rather than disappearing the moment it starts.
+ *
+ * Selected on the indexed room_id column, with the time bound in SQL too: end_time is a
+ * generated column of an ISO-8601 UTC string, so it compares lexicographically.
+ */
+export async function getEventsByRoom(
+	db: D1Database,
+	roomId: number,
+	now = Date.now()
+): Promise<PlayerEvent[]> {
+	const { results } = await db
+		.prepare('SELECT data FROM event WHERE room_id = ?1 AND end_time >= ?2')
+		.bind(roomId, eventTime(now))
 		.all<EventRow>()
 	return results.map((r) => JSON.parse(r.data) as PlayerEvent).sort(bySoonest)
 }
