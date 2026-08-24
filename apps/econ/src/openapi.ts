@@ -227,6 +227,18 @@ export const InfluencerIdsResponse = z.object({
 })
 
 /**
+ * `GET /api/influencerpartnerprogram/influencer` and `…/myinfluencer` — one account's
+ * standing in the partner program.
+ *
+ * A BARE NUMBER, not an object: the body is the literal `0`, which is the "not an
+ * influencer" tier. Nobody on this server is one, so 0 is the answer for every account, the
+ * caller's own included.
+ */
+export const InfluencerTierResponse = z
+	.literal(0)
+	.describe('The account’s partner tier. Always 0 — nobody here is an influencer')
+
+/**
  * `GET /api/incentivizedreferrals/progress` — how far the caller has got with the
  * refer-a-friend rewards: how many referrals have been verified, and which rewards they
  * have taken from that track.

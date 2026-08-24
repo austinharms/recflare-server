@@ -82,6 +82,7 @@ import {
 	form,
 	GameRewardRequest,
 	InfluencerIdsResponse,
+	InfluencerTierResponse,
 	json,
 	JsonArray,
 	jsonBody,
@@ -356,6 +357,13 @@ async function pushBalancePurchase(
 		})
 	}
 }
+
+/**
+ * The influencer partner tier every account has here — the "not an influencer" one. It is
+ * the whole body of both `/api/influencerpartnerprogram/influencer` and `…/myinfluencer`,
+ * served as a bare number rather than wrapped in anything.
+ */
+const NOT_AN_INFLUENCER = 0
 
 /** The operator-granted role that comes with a complimentary subscription. */
 const DEVELOPER_ROLE = 'developer'
@@ -3233,27 +3241,26 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// Whether the caller is in the influencer partner program. NOBODY is: this server runs
-	// no such program, and "not an influencer" is a 404 rather than a body saying so — the
-	// reference answers 404 with an EMPTY body typed `application/json`, which is what the
-	// client branches on. A 200 carrying null or `{}` is a different answer to it.
+	// One account's standing in the influencer partner program. NOBODY here has one: this
+	// server runs no such program, so the answer is the literal `0` — the "not an influencer"
+	// tier — for every account.
 	//
-	// Deliberately built by hand rather than through `c.notFound()`: the worker's not-found
-	// handler answers its own body, and this has to be empty with that content type.
+	// A BARE NUMBER is the whole body, like `…/makerai/checkfreetrialeligibility`'s bare
+	// `false`, not a number wrapped in an object. This used to answer 404 with an empty body;
+	// the tier is what the client actually reads.
 	//
-	// `accountId` is accepted and ignored — the reference binds it and never reads it, the
-	// answer being the same for everyone. The token is still validated first, so an
-	// unauthenticated caller gets 401 rather than the 404.
+	// `accountId` names the account being asked about. It makes no difference to the answer
+	// while nobody is an influencer, but it is read rather than ignored so this stays the
+	// question it looks like — the caller's own standing is `…/myinfluencer` below.
 	.get(
 		'/api/influencerpartnerprogram/influencer',
 		describeRoute({
 			tags: ['Econ'],
-			summary: 'The caller’s influencer partner program status',
+			summary: 'An account’s influencer partner program tier',
 			description: [
-				'Always 404 with an EMPTY body typed `application/json` — this server runs no partner',
-				'program, and 404 is how the reference says “not an influencer”. `accountId` is',
-				'accepted and ignored; the answer is the same for every caller. Auth is checked first,',
-				'so a missing or invalid token is 401, not 404.',
+				'The partner tier of the account named by `accountId`, as a BARE NUMBER — the whole',
+				'body is `0`, not an object around it. Always 0: this server runs no partner program,',
+				'so no account is an influencer. Auth-gated; a missing or invalid token is a 401.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -3261,19 +3268,47 @@ const app = new Hono<App>({ strict: false })
 					name: 'accountId',
 					in: 'query',
 					required: false,
-					description: 'The account being asked about. Accepted and ignored.',
+					description: 'The account being asked about. Every account answers 0.',
 					schema: { type: 'integer' },
 				},
 			],
 			responses: {
-				404: { description: 'Not in the partner program — always. Empty body' },
+				200: json(InfluencerTierResponse, 'The account’s tier — always 0'),
 				401: UNAUTHORIZED_RESPONSE,
 			},
 		}),
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
-			return c.body('', 404, { 'Content-Type': 'application/json' })
+			return c.json(NOT_AN_INFLUENCER)
+		}
+	)
+
+	// The same question about the CALLER — the `my` form, which names no account because the
+	// token already does. Same bare `0`, for the same reason: nobody here is an influencer.
+	//
+	// Its own route rather than an alias of the one above, because the two differ in who they
+	// are about; they agree today only because the answer is currently the same for everyone.
+	.get(
+		'/api/influencerpartnerprogram/myinfluencer',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'The caller’s influencer partner program tier',
+			description: [
+				'The caller’s own partner tier — the `my` form of the route above, taking the account',
+				'from the token rather than a query parameter. A BARE NUMBER, always `0`: this server',
+				'runs no partner program. Auth-gated; a missing or invalid token is a 401.',
+			].join(' '),
+			security: AUTHED,
+			responses: {
+				200: json(InfluencerTierResponse, 'The caller’s tier — always 0'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+			return c.json(NOT_AN_INFLUENCER)
 		}
 	)
 

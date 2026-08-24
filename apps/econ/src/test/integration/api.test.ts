@@ -2448,9 +2448,8 @@ describe('econ endpoints', () => {
 			{ headers: await bearer('207') }
 		)
 		expect(res.status).toBe(200)
-		// An object around the list, not a bare array. Note this is a 200 while its
-		// single-account sibling below answers 404 — "nobody is" is a complete answer to
-		// "who is?", where "are you?" is answered by the 404 itself.
+		// An object around the list, not a bare array — unlike its single-account siblings
+		// below, whose whole body is a bare tier number.
 		expect(await res.json()).toEqual({ InfluencerIds: [] })
 	})
 
@@ -2459,24 +2458,43 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(401)
 	})
 
-	test('GET /api/influencerpartnerprogram/influencer 404s with an empty JSON body', async () => {
+	test('GET /api/influencerpartnerprogram/influencer answers a bare 0', async () => {
 		const res = await exports.default.fetch(
+			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=220`,
+			{ headers: await bearer('206') }
+		)
+		expect(res.status).toBe(200)
+		// The tier is the WHOLE body — a bare number, not `{ Tier: 0 }` or a string. 0 is
+		// "not an influencer", which every account is here.
+		expect(res.headers.get('content-type')).toContain('application/json')
+		expect(await res.text()).toBe('0')
+
+		// Any account, the caller's own included, gets the same answer.
+		const self = await exports.default.fetch(
 			`${ORIGIN}/api/influencerpartnerprogram/influencer?accountId=206`,
 			{ headers: await bearer('206') }
 		)
-		// 404 IS the answer — "not an influencer" — and the body is empty, not `{}` or null,
-		// with the content type the reference sends.
-		expect(res.status).toBe(404)
-		expect(res.headers.get('content-type')).toContain('application/json')
-		expect(await res.text()).toBe('')
+		expect(await self.json()).toBe(0)
 	})
 
-	test('GET /api/influencerpartnerprogram/influencer 401s without a bearer token', async () => {
-		// Auth is checked before the 404, so an unauthenticated caller is told that, not that
-		// they aren't an influencer.
-		const res = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/influencer`)
-		expect(res.status).toBe(401)
-		expect(await res.text()).toBe('')
+	test('GET /api/influencerpartnerprogram/myinfluencer answers a bare 0', async () => {
+		// The `my` form takes the account from the token instead of a query parameter, and
+		// answers the same tier in the same shape.
+		const res = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/myinfluencer`, {
+			headers: await bearer('206'),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.text()).toBe('0')
+	})
+
+	test('the influencer tier routes 401 without a bearer token', async () => {
+		// Auth is checked before anything is answered, so an unauthenticated caller is told
+		// that rather than handed a tier.
+		for (const path of ['influencer', 'myinfluencer']) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/influencerpartnerprogram/${path}`)
+			expect(res.status, path).toBe(401)
+			expect(await res.text()).toBe('')
+		}
 	})
 
 	test('GET /api/makerai/checkfreetrialeligibility answers a bare false', async () => {
@@ -2592,6 +2610,7 @@ describe('econ endpoints', () => {
 			'GET /api/incentivizedreferrals/progress',
 			'GET /api/influencerpartnerprogram/influencer',
 			'GET /api/influencerpartnerprogram/influencers',
+			'GET /api/influencerpartnerprogram/myinfluencer',
 			'GET /api/itemWishlists/v1/wishlist/me',
 			'GET /api/itemWishlists/v1/wishlist/{accountId}',
 			'GET /api/makerai/checkfreetrialeligibility',
