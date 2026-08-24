@@ -85,6 +85,7 @@ import {
 	InteractionDto,
 	intQuery,
 	IsBannedEnvelope,
+	IsBannedPascalEnvelope,
 	json,
 	jsonBody,
 	LoadScreenRequest,
@@ -359,6 +360,21 @@ const STAFF_ROLES: ReadonlySet<string> = new Set(['developer', 'moderator'])
 async function isStaff(c: Context<App>): Promise<boolean> {
 	const roles = await validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
 	return roles?.some((role) => STAFF_ROLES.has(role)) ?? false
+}
+
+/**
+ * Whether the `:playerId` in the path is banned from the `:roomId` in it — the read behind
+ * both `isBanned` routes, which differ only in the envelope they wrap the answer in.
+ *
+ * Reads the same `room_ban` rows the ban writes make and `match` refuses matchmakes on, so
+ * the answer is what would actually happen. A room that does not exist simply has no ban
+ * rows and comes back false: the question is about the ban, not about the room.
+ */
+async function pathBan(c: Context<App>): Promise<boolean> {
+	// Both routes constrain these to `[0-9]+`, so neither is ever missing — the fallback is
+	// only here because a helper is typed against the whole app rather than one route.
+	const id = (name: string) => Number.parseInt(c.req.param(name) ?? '', 10)
+	return isPlayerBannedFromRoom(c.env.DB, id('roomId'), id('playerId'))
 }
 
 /** 401 for the auth-gated `*by/me` endpoints — no stub-account fallback. */
@@ -899,8 +915,8 @@ const app = new Hono<App>()
 	)
 
 	// Featured rooms — a single always-active group whose `Rooms` are a randomly
-	// ordered set of public, non-dorm rooms. No real curation yet, so `current`
-	// just returns a shuffled list of eligible rooms in the featured-group shape.
+	// ordered set of public, non-dorm rooms, at most ten of them. No real curation yet, so
+	// `current` just returns a shuffled sample of eligible rooms in the featured-group shape.
 	//
 	// Gated on the caller's BUILD, not just their token: this payload breaks the 2023
 	// client — its other room listings start failing with NREs, apparently because the
@@ -917,7 +933,9 @@ const app = new Hono<App>()
 			summary: 'Featured rooms',
 			description: [
 				'A single always-active group of featured rooms: a random shuffle of eligible public',
-				'rooms, since there is no editorial curation yet.',
+				'rooms, since there is no editorial curation yet. Capped at 10 rooms — a featured',
+				'group is a short selection, not the whole room list — and the cap is applied after',
+				'the shuffle, so each request serves a different sample.',
 				'',
 				'Restricted by CLIENT BUILD. Serving this to the 2023 client breaks its other room',
 				'listings (NREs, apparently from the featured-room load corrupting its room cache), so',
@@ -2008,12 +2026,50 @@ const app = new Hono<App>()
 			const accountId = await authedAccountId(c)
 			if (accountId === null) return unauthorized(c)
 
-			const banned = await isPlayerBannedFromRoom(
-				c.env.DB,
-				Number.parseInt(c.req.param('roomId'), 10),
-				Number.parseInt(c.req.param('playerId'), 10)
-			)
-			return c.json({ success: true, error: null, error_id: null, value: banned })
+			return c.json({ success: true, error: null, error_id: null, value: await pathBan(c) })
+		}
+	)
+
+	// The SAME check on the unprefixed path (`GET /rooms/112/bans/1/isBanned`), which is the
+	// spelling the client uses on the rooms host itself. Registered as its own route rather
+	// than as an alias because the answer is not the same bytes: this one is PascalCase
+	// (`Value`/`Success`/`Error`, `error_id` still lowercase), and the client's decoder drops
+	// members it doesn't know silently — a lowercase `value` here would read as `false` and
+	// show a banned player as unbanned.
+	//
+	// Same gate as its sibling: auth-gated, not owner-gated. A ban is not a secret from the
+	// player it stops, and the client asks this before offering a room action so it can grey
+	// it out rather than let the attempt fail.
+	.get(
+		'/rooms/:roomId{[0-9]+}/bans/:playerId{[0-9]+}/isBanned',
+		describeRoute({
+			tags: ['Room settings'],
+			summary: 'Whether a player is banned from a room (unprefixed path)',
+			description: [
+				'The same `room_ban` check as the `/Room_server/` route, on the path the client uses',
+				'against the rooms host directly — and in the PascalCase envelope it reads there:',
+				'`{ Value, Success, Error, error_id }`, with `error_id` lowercase.',
+				'',
+				'The two envelopes are NOT unified. The client’s decoder drops members it does not',
+				'recognise, so serving the other route’s lowercase `value` here would decode as',
+				'`false` — a banned player shown as unbanned — rather than fail.',
+				'',
+				'Auth-gated, but any authenticated caller may ask: a ban is not a secret from the',
+				'player it stops. A room that does not exist has no bans, so it answers',
+				'`Value: false` rather than 404ing — the check is about the ban row, not the room.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [roomIdParam, bannedPlayerIdParam],
+			responses: {
+				200: json(IsBannedPascalEnvelope, 'Whether that player is banned from that room'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const accountId = await authedAccountId(c)
+			if (accountId === null) return unauthorized(c)
+
+			return c.json({ Value: await pathBan(c), Success: true, Error: null, error_id: null })
 		}
 	)
 

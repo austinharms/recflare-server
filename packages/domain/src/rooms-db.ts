@@ -2470,11 +2470,19 @@ export interface FeaturedRoomGroup {
 	Rooms: FeaturedRoom[]
 }
 
+/** How many rooms one featured group carries. See {@link getFeaturedRooms}. */
+export const FEATURED_ROOM_LIMIT = 10
+
 /**
  * Featured rooms group: public, non-dorm rooms not excluded from lists, in random
  * order. There's no editorial curation behind this yet, so "featured" is just a
  * random shuffle of the eligible rooms wrapped in a single always-active group.
  * Eligibility is filtered in SQL ({@link LISTABLE_WHERE}); the rest is in memory.
+ *
+ * At most {@link FEATURED_ROOM_LIMIT} rooms — a featured group is a short editorial
+ * selection, not the whole room list. The cap is applied AFTER the shuffle, so it is a
+ * random SAMPLE that varies between requests; a `LIMIT` in the SQL would instead pin the
+ * same handful of rooms forever and make the shuffle cosmetic.
  */
 export async function getFeaturedRooms(db: D1Database): Promise<FeaturedRoomGroup> {
 	const { results } = await db
@@ -2486,6 +2494,7 @@ export async function getFeaturedRooms(db: D1Database): Promise<FeaturedRoomGrou
 		const j = Math.floor(Math.random() * (i + 1))
 		;[rooms[i], rooms[j]] = [rooms[j], rooms[i]]
 	}
+	rooms.length = Math.min(rooms.length, FEATURED_ROOM_LIMIT)
 
 	const str = (v: unknown): string => (typeof v === 'string' ? v : '')
 	const num = (v: unknown): number => (typeof v === 'number' ? v : 0)

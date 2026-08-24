@@ -401,6 +401,23 @@ export const IsBannedEnvelope = z.object({
 	value: z.boolean().describe('Whether that player is banned from that room'),
 })
 
+/**
+ * `GET /rooms/{roomId}/bans/{playerId}/isBanned` — the same check, in the shape the client
+ * reads on the UNPREFIXED path.
+ *
+ * PascalCase, and deliberately not unified with {@link IsBannedEnvelope}: the two paths are
+ * two calls the client makes with two different decoders, and its decoder drops members it
+ * does not recognise silently, so a `value` served where it wants `Value` reads as `false` —
+ * a banned player looking unbanned — rather than as an error. `error_id` stays lowercase
+ * even here; that is how it comes off the wire, not a slip.
+ */
+export const IsBannedPascalEnvelope = z.object({
+	Value: z.boolean().describe('Whether that player is banned from that room'),
+	Success: z.literal(true).describe('The check ran; whether the player is banned is `Value`'),
+	Error: z.string().nullable().describe('Null — the check itself does not fail'),
+	error_id: z.string().nullable().describe('Null. Lowercase, unlike its three siblings'),
+})
+
 /** The bare JSON string the bulk lookups answer when the id list is over the cap. */
 export const TooManyLookupIds = z
 	.string()
@@ -437,7 +454,9 @@ export const FeaturedRoomGroupDto = z.object({
 	name: z.string(),
 	StartAt: z.string(),
 	EndAt: z.string(),
-	Rooms: z.array(FeaturedRoomDto).describe('Randomly ordered — no editorial curation yet'),
+	Rooms: z
+		.array(FeaturedRoomDto)
+		.describe('Randomly ordered, at most 10 — no editorial curation yet'),
 })
 
 // ---- Envelopes -------------------------------------------------------------

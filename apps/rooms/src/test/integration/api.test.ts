@@ -1125,6 +1125,38 @@ describe('rooms endpoints', () => {
 		expect(body.Rooms.some((r) => r.RoomId === 1)).toBe(false)
 	})
 
+	it('GET /featuredrooms/current serves at most 10 rooms', async () => {
+		// Seed more eligible rooms than the cap, so the length is decided by the cap rather
+		// than by how many rooms the suite happens to have.
+		const ids = Array.from({ length: 14 }, (_, i) => 30900 + i)
+		for (const RoomId of ids) {
+			await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						RoomId,
+						Name: `Featurable${RoomId}`,
+						CreatorAccountId: 831,
+						Accessibility: 1,
+						IsDorm: false,
+						SubRooms: [],
+					})
+				)
+				.run()
+		}
+
+		const res = await SELF.fetch(`${ORIGIN}/featuredrooms/current`, {
+			headers: await bearer('1', undefined, '20250718.01'),
+		})
+		const body = (await res.json()) as { Rooms: Array<{ RoomId: number }> }
+		// A featured group is a short selection, not the whole room list.
+		expect(body.Rooms).toHaveLength(10)
+		// The cap TRIMS the shuffled list rather than sampling with replacement, so no room
+		// can appear twice in one group.
+		expect(new Set(body.Rooms.map((r) => r.RoomId)).size).toBe(10)
+
+		await env.DB.prepare(`DELETE FROM room WHERE room_id IN (${ids.join(', ')})`).run()
+	})
+
 	it('GET /featuredrooms/current withholds the group from other client builds', async () => {
 		// The 2023 build gets the 404 it got while the route was parked — the state in which
 		// its room listings work. Same for a token with no `rn.ver` at all.
@@ -1664,6 +1696,62 @@ describe('rooms endpoints', () => {
 
 		await env.DB.prepare('DELETE FROM room_ban WHERE room_id = ?1 AND banned_player_id = ?2')
 			.bind(3, 4242)
+			.run()
+	})
+
+	it('GET /rooms/:id/bans/:playerId/isBanned answers the same check, PascalCase', async () => {
+		const isBanned = async (roomId: number, playerId: number) =>
+			SELF.fetch(`${ORIGIN}/rooms/${roomId}/bans/${playerId}/isBanned`, {
+				headers: await bearer('300'),
+			})
+
+		// Same gate as the `/Room_server/` spelling: a token is needed, any token will do.
+		expect((await SELF.fetch(`${ORIGIN}/rooms/112/bans/1/isBanned`)).status).toBe(401)
+
+		const clean = await isBanned(112, 1)
+		expect(clean.status).toBe(200)
+		// PascalCase — `Value`/`Success`/`Error`, and `error_id` lowercase all the same. The
+		// client's decoder drops members it doesn't recognise, so the other route's lowercase
+		// keys here would decode as `false` rather than fail. Room 112 does not exist and the
+		// answer is still a clean `false`: the question is about the ban row, not the room.
+		expect(await clean.json()).toEqual({
+			Value: false,
+			Success: true,
+			Error: null,
+			error_id: null,
+		})
+
+		// The same `room_ban` rows the other route and `match` read.
+		await env.DB.prepare(
+			'INSERT INTO room_ban (room_id, banned_player_id, ban_mask, banned_by_account_id, created_at)' +
+				" VALUES (?1, ?2, 0, 1, '2026-01-01T00:00:00Z')"
+		)
+			.bind(112, 1)
+			.run()
+		expect(await (await isBanned(112, 1)).json()).toEqual({
+			Value: true,
+			Success: true,
+			Error: null,
+			error_id: null,
+		})
+
+		// Per (room, player), like every other read of these rows.
+		expect(await (await isBanned(113, 1)).json()).toMatchObject({ Value: false })
+		expect(await (await isBanned(112, 2)).json()).toMatchObject({ Value: false })
+
+		// …and the prefixed route sees the same ban, in its own lowercase envelope.
+		const prefixed = await SELF.fetch(`${ORIGIN}/Room_server/rooms/112/bans/1/isBanned`, {
+			headers: await bearer('300'),
+		})
+		expect(await prefixed.json()).toEqual({
+			success: true,
+			error: null,
+			error_id: null,
+			value: true,
+		})
+
+		await env.DB.prepare('DELETE FROM room_ban WHERE room_id = ?1 AND banned_player_id = ?2')
+			.bind(112, 1)
 			.run()
 	})
 
@@ -3609,6 +3697,7 @@ describe('rooms endpoints', () => {
 			'GET /rooms/visitedby/{playerId}',
 			'GET /rooms/{roomId}',
 			'GET /rooms/{roomId}/bans',
+			'GET /rooms/{roomId}/bans/{playerId}/isBanned',
 			'GET /rooms/{roomId}/experience',
 			'GET /rooms/{roomId}/experience/player',
 			'GET /rooms/{roomId}/interactionby/me',
