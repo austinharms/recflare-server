@@ -59,17 +59,31 @@ const ListEntityType = {
 const MAX_LIST_ENTITY_TYPE = 255
 
 /**
- * The fallback entities for a row with no live feed behind it (`GET /algorithmiclists/:list`)
- * — ROOMS, which is what a Play/Explore row is built from. Rooms 2–6, the low ids this
- * server's own rooms occupy, so an unranked row resolves to something real instead of five
- * dead ids. The rows in `ROW_FEEDS` are ranked for real and never reach this.
- *
- * `Id` is a STRING even though a room id is a number, and `Context` is where the reference
- * server attributes the ranking/experiment that produced the entity. Nothing produced these,
- * so it is null on every one rather than a made-up context the client would carry into
- * telemetry.
+ * One entity of an algorithmic list. `Id` is a STRING even though most of the things a row
+ * names (rooms, items) are numbered, and `Context` is where the reference server attributes
+ * the ranking or experiment that produced the entity — nothing here produces one, so it is
+ * null on every entity rather than a made-up context the client would carry into telemetry.
  */
-const ALGORITHMIC_LIST_ENTITIES: Array<{ Id: string; Context: string | null }> = [].map((Id) => ({ Id, Context: null }))
+interface ListEntity {
+	Id: string
+	Context: string | null
+}
+
+/** Ids as the entities the client reads back — see `ListEntity`. */
+function entities(ids: string[]): ListEntity[] {
+	return ids.map((Id) => ({ Id, Context: null }))
+}
+
+/**
+ * What a row with nothing behind it answers (`GET /algorithmiclists/:list`): NO entities.
+ * The row still answers 200 — a 404 renders as a carousel that failed to load rather than
+ * one the client hides — but it names nothing, because there is no honest answer for a row
+ * this server has never heard of. It once served rooms 2–6 so an unranked row resolved to
+ * something real; that put the same five stock rooms under every unimplemented heading,
+ * which reads as a broken row rather than an absent one. The rows with a real answer are in
+ * `ROW_FEEDS`, `PERSONAL_ROW_FEEDS` and `STATIC_ROW_ENTITIES`.
+ */
+const ALGORITHMIC_LIST_ENTITIES: ListEntity[] = []
 
 /** How many rooms a row carries. A discovery carousel shows a page, not the world. */
 const LIST_SIZE = 20
@@ -77,10 +91,10 @@ const LIST_SIZE = 20
 /**
  * A row's rooms as the entities the client reads back. Only the ids travel — it resolves
  * each room against the `rooms` worker itself — so `Id` is the room id as a STRING and
- * `Context` (the ranking attribution) is null, exactly as in `ALGORITHMIC_LIST_ENTITIES`.
+ * `Context` (the ranking attribution) is null, like every other entity.
  */
-function toEntities(rooms: Room[]): Array<{ Id: string; Context: string | null }> {
-	return rooms.map((room) => ({ Id: String(room.RoomId), Context: null }))
+function toEntities(rooms: Room[]): ListEntity[] {
+	return entities(rooms.map((room) => String(room.RoomId)))
 }
 
 /**
@@ -181,6 +195,43 @@ const PERSONAL_ROW_FEEDS: Record<string, (db: D1Database, accountId: number) => 
 	// which the `match` heartbeat stamps, and served straight from `getVisitedRooms` so this
 	// row and `rooms` `GET /rooms/visitedby/me` can never disagree about where someone has been.
 	recentlyvisited: (db, accountId) => getVisitedRooms(db, accountId, 0, LIST_SIZE),
+}
+
+/**
+ * The placeholder contents of a STORE carousel: four purchasable items out of storefront 3,
+ * held here because nothing on this server ranks store items yet and what the reference
+ * actually served these rows is not known. Every store row shares the one list rather than
+ * each carrying its own copy — they are all the same placeholder, and a row that gets a real
+ * answer should stop pointing at it rather than have its ids edited in place.
+ */
+const STORE_PLACEHOLDER_ITEMS = entities(['257', '192', '641', '657'])
+
+/**
+ * Rows served from a FIXED id list — a carousel somebody picked by hand, with no ranking
+ * behind it. Keyed and looked up exactly like `ROW_FEEDS` (lowercase, folded), and checked
+ * after it, so a row that later grows a real feed is promoted by moving its line up there.
+ *
+ * Unlike the room rows, these do NOT all name rooms: the store's carousels name purchasable
+ * items, which is why the ids are written out as the strings they go on the wire as rather
+ * than derived from anything. The `Type` the response reports is still the caller's — see
+ * the handler.
+ *
+ * The slugs are the reference's own and several do not match the heading they render under
+ * (`summerpartycarousel` fills a medieval row). Key on the SLUG regardless: it is what the
+ * discovery section's `sourceMetadata` names, so renaming one to something that reads better
+ * would leave that section pointing at nothing.
+ */
+const STATIC_ROW_ENTITIES: Record<string, ListEntity[]> = {
+	// The store Featured page's "Medieval Masterpieces from the Community" carousel —
+	// `StoreItemCarousel_UnifiedAlgorithmicList_UGCMedievalCarousel` in the `discovery`
+	// worker's `StoreFeatured` page. Asked for with `?type=5`, Generic.
+	summerpartycarousel: STORE_PLACEHOLDER_ITEMS,
+
+	// The store Clothing page's "New" carousel —
+	// `StoreItemCarousel_UnifiedAlgorithmicList_New` in `StoreClothing`, and the `newitems`
+	// category the client's own store-category game config lists. Same placeholder items as
+	// the row above until something here actually knows which items are new.
+	newitems: STORE_PLACEHOLDER_ITEMS,
 }
 
 /**
@@ -292,8 +343,13 @@ const app = new Hono<App>()
 	//
 	// D1 is asked FIRST, so a player's own list wins over a capture that happens to share its
 	// name — the captures are this server's fixtures and a player's list is their data.
-	// Nothing else distinguishes the two requests: both are the same three parameters, and a
-	// name nobody owns still has to answer something (see `resolveCuratedList`).
+	// Nothing else distinguishes the two requests: both are the same three parameters.
+	//
+	// A name that matches NEITHER 404s. There is no list to serve, and the fallbacks this
+	// once had answered with an unrelated capture instead — a page's rows under another
+	// page's heading, which reads as real content rather than as a missing list. The
+	// exceptions are the client's own reserved playlists and a request naming no list at all;
+	// both are real answers, not misses (see `resolveCuratedList`).
 	.get('/curatedlists', async (c) => {
 		const creatorAccountId = c.req.query('creatorAccountId')
 		const type = c.req.query('type')
@@ -302,6 +358,7 @@ const app = new Hono<App>()
 		const list =
 			(await ownedList(c, creatorAccountId, type, name)) ??
 			resolveCuratedList(creatorAccountId, type, name)
+		if (list === undefined) return c.notFound()
 
 		// Serialized by hand rather than through `c.json`: the reference's `ListId`s are
 		// 64-bit and are carried as strings so their digits survive being parsed — see
@@ -358,10 +415,11 @@ const app = new Hono<App>()
 	// `Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore`), and the answer is the
 	// ranked entities that fill it, which the client then resolves by id itself.
 	//
-	// `HotList`, `recentlyupdated` and `new` are ranked for real (see `ROW_FEEDS`), and
-	// `recentlyvisited` is per-caller (see `PERSONAL_ROW_FEEDS`). Every other row still serves
-	// the canned entities, and an unknown row key gets them too rather than a 404, which the
-	// client renders as a row that failed to load. `Type` is echoed back from the query: it
+	// `HotList`, `recentlyupdated` and `new` are ranked for real (see `ROW_FEEDS`),
+	// `recentlyvisited` is per-caller (see `PERSONAL_ROW_FEEDS`), and a few are hand-picked id
+	// lists (see `STATIC_ROW_ENTITIES`). Every other row — an unknown key included — answers an
+	// EMPTY 200 rather than a 404, which the client renders as a row that failed to load
+	// instead of one it hides. `Type` is echoed back from the query: it
 	// tells the client what the `Id`s ARE (rooms, players, …), so answering with a type the
 	// caller didn't ask for would have it resolve the ids against the wrong service.
 	.get('/algorithmiclists/:list', async (c) => {
@@ -391,6 +449,12 @@ const app = new Hono<App>()
 		const feed = ROW_FEEDS[key]
 		if (feed !== undefined) {
 			return c.json({ Type: echoed, Entities: toEntities(await feed(c.env.DB)) })
+		}
+
+		// Then the hand-picked rows, which are already entities: the ids are the answer.
+		const canned = STATIC_ROW_ENTITIES[key]
+		if (canned !== undefined) {
+			return c.json({ Type: echoed, Entities: canned })
 		}
 
 		return c.json({ Type: echoed, Entities: ALGORITHMIC_LIST_ENTITIES })
