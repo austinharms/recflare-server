@@ -220,50 +220,78 @@ parses it to finish the action, so a bare 200 reads as a failure and the item ne
 finishes unlocking. Deletes are scoped to the caller, so an unauthenticated or
 mismatched call is a harmless no-op (opening _another_ player's box is a 403).
 
-## Weekly challenge (`static/weekly-challenge.json`)
+## Weekly challenge (`src/challenge-rotation.ts`)
 
 Served by `GET /api/challenge/v2/getCurrent` (with each challenge's per-player `Complete`
-stamped in — see Progress below). The server never evaluates the rules: the client reads
-the rule tree in each challenge's `Config`, watches its own gameplay, and posts the tree
-back to `/api/challenge/v2/updateProgress` with its verdict. So this file is the entire
-definition of a week's challenges — ids, display strings, matching rules and the reward
-preview.
+and `Config` stamped in — see Progress below). The server never evaluates the rules: the
+client reads the rule tree in each challenge's `Config`, watches its own gameplay, and posts
+the tree back to `/api/challenge/v2/updateProgress` with its verdict. So a rotation is the
+entire definition of a week's challenges — ids, display strings, matching rules and the
+reward preview.
+
+**Rotations are generated from the calendar week, not authored.** `buildRotation(now)` in
+`src/challenge-rotation.ts` derives everything from the week index: five challenges drawn
+from a pool of rooms crossed with the challenge kinds each room supports, the week's window,
+and a `ChallengeMapId` of `1000 + weekIndex`. It is a pure function of which week it is, and
+that is load-bearing rather than tidy — `challenge_status` rows are scoped by
+`ChallengeMapId` and the gift threshold counts completions against `Challenges`, so two
+callers who disagreed about what the week holds would disagree about who had finished it.
+Selection runs off a seeded PRNG (mulberry32 over the week index); nothing calls
+`Math.random()`.
+
+The week rolls at **Wednesday 21:00 UTC**, the boundary both captured rotations sit on,
+counted from an epoch of 2020-01-01. Each week publishes five challenges, no room twice and
+at most two of any one kind, so a week is never five variations of "finish some games".
+
+| Kind    | Asks for                                 | Target | Rooms                                   |
+| ------- | ---------------------------------------- | ------ | --------------------------------------- |
+| `games` | Finished games in one room               | 5      | Head-to-head and score-based rooms      |
+| `win`   | One finished game, won (or quest closed) | 1      | Quests, plus rooms with a real opponent |
+| `ai`    | Enemies defeated in one room             | 10     | Quests — the rooms with enemies in them |
+
+`static/weekly-challenge.json` still ships and still **wins**: a non-empty `Challenges` array
+there pins the week to that hand-authored rotation and skips generation entirely, which is
+how a debug or event week gets served without a code change. Empty (as shipped), it supplies
+only what generation doesn't own — `CompletedRequired`, `FallbackGiftName` and
+`ChallengeThemeString`, plus the `Gift` block used as a fallback if the catalog can't be read.
 
 Everything below was read off reference data (one captured live rotation), not a spec.
-Field meanings marked _(inferred)_ are read from how the values line up with the strings
-the client renders; the rest are pinned by the data itself. The file itself is edited
-freely as rotations change — the examples here are the captured week, so expect the shipped
-rotation to differ.
+Field meanings marked _(inferred)_ are read from how the values line up with the strings the
+client renders; the rest are pinned by the data itself. The field notes describe both the
+generated rotation and the pinned file, since they are the same shape on the wire.
 
 ### Top level
 
-| Field                  | Example                        | Notes                                                                                                                        |
-| ---------------------- | ------------------------------ | ---------------------------------------------------------------------------------------------------------------------------- |
-| `ChallengeMapId`       | `17`                           | Id of the rotation as a whole ("map" of challenges). Echoed back on `updateProgress`; bump it when you publish a new week.   |
-| `CompletedRequired`    | `false`                        | _(inferred)_ All-or-nothing: `true` makes the `Gift` need every challenge, `false` the three-of-five threshold below.        |
-| `StartAt` / `EndAt`    | `2026-03-25T21:00:00`          | The window, 7 days apart, **no timezone suffix** — unlike `ServerTime`. Treat as UTC.                                        |
-| `ServerTime`           | `2026-03-31T14:42:54.2754728Z` | .NET round-trip timestamp (7-digit fraction, `Z`). The client dates the countdown off this, so it is **frozen** — see below. |
-| `Challenges`           | array                          | The week's challenges, rendered in order.                                                                                    |
-| `Gift`                 | object                         | The reward preview for finishing the set.                                                                                    |
-| `FallbackGiftName`     | `"4-Star Box"`                 | Shown when the client can't resolve `Gift` into a name.                                                                      |
-| `ChallengeThemeString` | a designer quote               | Free text carried through from the captured rotation; a theme note, not a rendered UI string as far as we can tell.          |
+| Field                  | Example                        | Notes                                                                                                                                                                                                                                                                         |
+| ---------------------- | ------------------------------ | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ChallengeMapId`       | `1347`                         | Id of the rotation as a whole ("map" of challenges). Echoed back on `updateProgress`. Generated as `1000 + weekIndex`; the four-digit floor keeps it clear of hand-authored ids (17, 19), which would otherwise read a player's old rows as progress against a different set. |
+| `CompletedRequired`    | `false`                        | _(inferred)_ All-or-nothing: `true` makes the `Gift` need every challenge, `false` the three-of-five threshold below.                                                                                                                                                         |
+| `StartAt` / `EndAt`    | `2026-03-25T21:00:00`          | The window, 7 days apart, **no timezone suffix** — unlike `ServerTime`. Treat as UTC.                                                                                                                                                                                         |
+| `ServerTime`           | `2026-03-31T14:42:54.2754728Z` | .NET round-trip timestamp (7-digit fraction, `Z`). The client dates the countdown off this. Generated rotations send the REAL clock — see below.                                                                                                                              |
+| `Challenges`           | array                          | The week's challenges, rendered in order.                                                                                                                                                                                                                                     |
+| `Gift`                 | object                         | The reward preview for finishing the set.                                                                                                                                                                                                                                     |
+| `FallbackGiftName`     | `"4-Star Box"`                 | Shown when the client can't resolve `Gift` into a name.                                                                                                                                                                                                                       |
+| `ChallengeThemeString` | a designer quote               | Free text carried through from the captured rotation; a theme note, not a rendered UI string as far as we can tell.                                                                                                                                                           |
 
-**The frozen clock:** `ServerTime` sits _inside_ `StartAt`…`EndAt`, about a day before the
-end, and the file is static — so the client always sees an active rotation with a ~1-day
-countdown rather than an expired one (the captured week: Mar 31 inside Mar 25 → Apr 1). If
-you edit the window, move `ServerTime` inside the new one too, or the challenges may render
-as already over.
+**The clock:** a generated rotation's window is genuinely the current week, so `ServerTime`
+is simply now and the countdown the client draws is real — the challenges expire on Wednesday
+at 21:00 UTC and the next week's set replaces them.
+
+That is the thing generation fixes. A **pinned** rotation is static, so its `ServerTime` has
+to be _frozen_ inside `StartAt`…`EndAt` — a day before the end is the captured shape (Mar 31
+inside Mar 25 → Apr 1) — or the client renders the week as already over. Move the window on a
+pinned rotation and you must move `ServerTime` into it too.
 
 ### A challenge entry
 
-| Field         | Notes                                                                                                                                                                           |
-| ------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `ChallengeId` | Unique within the rotation, not sequential (`37, 38, 44, 49, 63`). Posted back on `updateProgress`.                                                                             |
-| `Name`        | Internal slug, never displayed — and **not authoritative**: `63` is named `Complete3SpillwayGames` but its `Config` and description are Clearcut. Trust `Config`, not the name. |
-| `Config`      | The rule tree, as an **escaped JSON string** (not a nested object). See below.                                                                                                  |
-| `Description` | The one-line goal, e.g. `"Complete 10 games in ^Paintball"`.                                                                                                                    |
-| `Tooltip`     | The longer hint under it.                                                                                                                                                       |
-| `Complete`    | Per-player state, so always `false` in the file — `getCurrent` overwrites it per caller from `challenge_status`.                                                                |
+| Field         | Notes                                                                                                                                                                                                                                                           |
+| ------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `ChallengeId` | Unique within the rotation, not sequential (`37, 38, 44, 49, 63`). Posted back on `updateProgress`. Generated ids are the index of the (room, kind) pair in the generator's candidate list, so id 12 is always the same challenge — append rooms, never insert. |
+| `Name`        | Internal slug, never displayed — and **not authoritative**: `63` is named `Complete3SpillwayGames` but its `Config` and description are Clearcut. Trust `Config`, not the name.                                                                                 |
+| `Config`      | The rule tree, as an **escaped JSON string** (not a nested object). See below.                                                                                                                                                                                  |
+| `Description` | The one-line goal, e.g. `"Complete 10 games in ^Paintball"`.                                                                                                                                                                                                    |
+| `Tooltip`     | The longer hint under it.                                                                                                                                                                                                                                       |
+| `Complete`    | Per-player state, so always `false` as generated — `getCurrent` overwrites it per caller from `challenge_status`, along with `Config`.                                                                                                                          |
 
 `^Token` in `Description`/`Tooltip` is a client-side room link: the client resolves the
 token to a room and renders a tappable name. Subrooms use a dotted path
@@ -293,21 +321,29 @@ of avatar-item guids, `AvatarItemType`, `ConsumableItemDesc`, `EquipmentPrefabNa
 **renamed**: a storefront's `Context`/`Rarity` are `GiftContext`/`GiftRarity` here. Don't
 feed one shape to the other's reader.
 
-`EquipmentModificationGuid` is the Rec Room packed guid — 22-char URL-safe base64 of the 16
-guid bytes in .NET little-endian order, padding stripped (`g5u0weNLmkCLeUXFUVn74Q` →
-`c1b49b83-4be3-409a-8b79-45c55159fbe1`). The reward is identified by prefab + that guid,
-_not_ by `GiftDropId`: this block's `GiftDropId` is `3994`, while the same skin sells in
-`sf3.json` as `2121` ("Camera Skin (Comic)").
+**Weekly rewards are equipment**, so a generated week rolls one from sf3 — every item there
+carrying an `EquipmentModificationGuid` (187 of its 1161), drawn with the week's own seed.
+Drawing from the live catalog rather than a copied list is what lets the grant path resolve
+the pick back to the entry selling it, so the player receives a properly named item; the
+block a generated week emits carries that entry's `GiftDropId` and rarity.
+
+`EquipmentModificationGuid` is sometimes the Rec Room packed guid — 22-char URL-safe base64
+of the 16 guid bytes in .NET little-endian order, padding stripped (`g5u0weNLmkCLeUXFUVn74Q` →
+`c1b49b83-4be3-409a-8b79-45c55159fbe1`) — and sometimes a plain guid; sf3 carries both forms
+and they are matched as opaque strings, never converted. The reward is identified by prefab +
+that guid, _not_ by `GiftDropId`: the captured block's `GiftDropId` is `3994`, while the same
+skin sells in `sf3.json` as `2121` ("Camera Skin (Comic)").
 
 **Granted when the set is finished** — see below. The grant path is `buyItem`'s, so the
 block is translated into a storefront gift-drop first (`toChallengeGiftDrop`); the renamed
 `GiftContext`/`GiftRarity` are exactly what that translation is for.
 
-The block carries no display strings and a `GiftRarity` of `0` for an item that sells at
-rarity `5`, so both are taken from the catalog entry selling the same item (matched on
-equipment guid / avatar desc) — the reward reads as "Camera Skin (Comic)", not as the box it
-might have arrived in. An explicit `FriendlyName`/`Tooltip` on the block wins over the
-catalog if a rotation we publish sets them; neither is present in the captured one.
+The block carries no display strings (and the captured one carries a `GiftRarity` of `0` for
+an item that sells at rarity `5`), so both are taken from the catalog entry selling the same
+item, matched on equipment guid / avatar desc — the reward reads as "Camera Skin (Comic)",
+not as the box it might have arrived in. An explicit `FriendlyName`/`Tooltip` on the block
+wins over the catalog if a pinned rotation sets them; neither is present in the captured one
+or in a generated block.
 
 **`FallbackGiftName` is the other half of the reward, not just a label.** "4-Star Box" is
 what the player gets _instead_ when they already own the item — the real game phrased it
@@ -319,8 +355,8 @@ consolation tier with no code change; a name that doesn't parse falls back to 4 
 
 There is no claim endpoint and the client never asks: the reward is handed out from the
 `updateProgress` call that reaches the threshold. Every completing report on the **live**
-rotation re-reads the caller's completions and, once enough of `weekly-challenge.json`'s
-challenges are there, grants the `Gift` the way a purchase grants a drop — the item into
+rotation re-reads the caller's completions and, once enough of the week's own challenges are
+there, grants the `Gift` the way a purchase grants a drop — the item into
 `inventory`/`equipment`/`consumable`, plus a gift box (message
 `Weekly challenge complete!`) the player finds in `GET /api/avatar/v2/gifts`.
 

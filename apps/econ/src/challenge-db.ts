@@ -116,9 +116,9 @@ export async function recordChallengeProgress(
  * reported anything against it.
  *
  * Read by `getCurrent` to overwrite the static rotation, and by the gift path: the `Gift` is
- * due once ENOUGH of the challenges in static/weekly-challenge.json are complete here —
- * three of the five a week publishes, not all of them (see `CHALLENGES_REQUIRED_FOR_GIFT`
- * in econ.app.ts).
+ * due once ENOUGH of the week's own challenges are complete here — three of the five a
+ * rotation publishes, not all of them (see `CHALLENGES_REQUIRED_FOR_GIFT` in econ.app.ts).
+ * The rotation itself is generated per week by src/challenge-rotation.ts.
  */
 export async function getChallengeStatuses(
 	db: D1Database,

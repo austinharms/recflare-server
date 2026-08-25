@@ -19,9 +19,6 @@ import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventio
 // The notification-type ids the hub carries, from the worker that owns them — asserting
 // against the enum rather than a copied number is what keeps these frames honest.
 import { NotificationType } from '../../../../notify/src/notification-types'
-// The live weekly rotation, so the challenge tests exercise whatever it currently holds
-// instead of hard-coded ids from a rotation that has since been replaced.
-import weeklyChallenge from '../../../static/weekly-challenge.json'
 import { SCHEMA_DDL } from '../../avatar-db'
 import {
 	BALANCE_SCHEMA_DDL,
@@ -31,6 +28,10 @@ import {
 	spendCurrency,
 } from '../../balance-db'
 import { CHALLENGE_GIFT_SCHEMA_DDL, CHALLENGE_STATUS_SCHEMA_DDL } from '../../challenge-db'
+// The live weekly rotation, generated the same way the worker generates it, so the challenge
+// tests exercise whatever this week actually holds instead of ids from a rotation that has
+// since rolled over.
+import { buildRotation, rotationIndex } from '../../challenge-rotation'
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL, grantEquipment } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
@@ -44,8 +45,11 @@ declare module 'cloudflare:test' {
 
 const ORIGIN = 'https://example.com'
 
+/** This week's rotation — the same one the worker builds for these requests. */
+const weekly = buildRotation(new Date())
+
 /** The first challenge of the live rotation — the progress tests report against it. */
-const CURRENT_CHALLENGE = weeklyChallenge.Challenges[0]
+const CURRENT_CHALLENGE = weekly.Challenges[0]
 
 // Build the accounts table and seed the test player (the default token's sub, 42)
 // so avatar reads/writes have a row to attach to.
@@ -1834,9 +1838,71 @@ describe('econ endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`)
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as { ChallengeMapId: number; Challenges: unknown[] }
-		expect(body).toHaveProperty('ChallengeMapId')
-		expect(Array.isArray(body.Challenges)).toBe(true)
+		expect(body.ChallengeMapId).toBe(weekly.ChallengeMapId)
+		expect(body.Challenges).toHaveLength(weekly.Challenges.length)
 	})
+
+	test('the rotation is a pure function of the week', async () => {
+		const at = new Date('2026-08-25T12:00:00Z')
+		// Same instant, same rotation — and any instant in the same week, too. Two players
+		// served different challenges for one `ChallengeMapId` would disagree about who has
+		// finished the week.
+		expect(buildRotation(at)).toEqual(buildRotation(at))
+		const laterSameWeek = new Date('2026-08-26T20:59:59Z')
+		expect(rotationIndex(laterSameWeek)).toBe(rotationIndex(at))
+		expect(buildRotation(laterSameWeek).Challenges).toEqual(buildRotation(at).Challenges)
+
+		// …and the week rolls at Wednesday 21:00 UTC, one map id at a time.
+		const nextWeek = new Date('2026-08-26T21:00:00Z')
+		expect(rotationIndex(nextWeek)).toBe(rotationIndex(at) + 1)
+		expect(buildRotation(nextWeek).ChallengeMapId).toBe(buildRotation(at).ChallengeMapId + 1)
+		expect(buildRotation(nextWeek).StartAt).toBe(buildRotation(at).EndAt)
+	})
+
+	test('every generated week is five valid, distinct challenges', async () => {
+		// Walk two years of rotations: the pool, the constraints and the tree builders all have
+		// to hold for every week, not just this one.
+		for (let week = 0; week < 104; week++) {
+			const at = new Date(Date.UTC(2026, 0, 7, 21, 0, 0) + week * 7 * 24 * 60 * 60 * 1000)
+			const rotation = buildRotation(at)
+			const where = `week ${week}`
+			expect(rotation.Challenges, where).toHaveLength(5)
+			// Ids have to be unique within a rotation — `challenge_status` is keyed by them.
+			const ids = rotation.Challenges.map((ch) => ch.ChallengeId)
+			expect(new Set(ids).size, where).toBe(ids.length)
+			// One room per week: five ways to say "play Paintball" is not a rotation.
+			const scenes = rotation.Challenges.flatMap((ch) => sceneIdsOf(ch.Config))
+			expect(new Set(scenes).size, where).toBe(scenes.length)
+			for (const challenge of rotation.Challenges) {
+				// A malformed tree fails SILENTLY in the client — the challenge just never
+				// completes — so the shape is asserted here rather than discovered in game.
+				const tree = JSON.parse(challenge.Config) as { ct: number; t?: number }
+				expect([0, 1], `${where} ${challenge.Name}`).toContain(tree.ct)
+				if (tree.ct === 1) expect(tree.t, `${where} ${challenge.Name}`).toBeGreaterThan(0)
+				expect(sceneIdsOf(challenge.Config).length, `${where} ${challenge.Name}`).toBeGreaterThan(0)
+				// The copy is generated from the same inputs as the tree, so it can't drift — but a
+				// counter still has to say out loud how far it counts.
+				if (tree.ct === 1) expect(challenge.Description, where).toContain(String(tree.t))
+				expect(challenge.Tooltip.length, `${where} ${challenge.Name}`).toBeGreaterThan(0)
+				expect(challenge.Complete, `${where} ${challenge.Name}`).toBe(false)
+			}
+		}
+	})
+
+	/** Every `ct:7` scene id in a rule tree, however deep the tree nests them. */
+	function sceneIdsOf(config: string): string[] {
+		const scenes: string[] = []
+		const walk = (node: unknown): void => {
+			if (Array.isArray(node)) return node.forEach(walk)
+			if (node === null || typeof node !== 'object') return
+			const record = node as { ct?: number; vs?: Array<{ l?: string }> }
+			if (record.ct === 7)
+				for (const value of record.vs ?? []) if (value.l !== undefined) scenes.push(value.l)
+			for (const value of Object.values(record)) walk(value)
+		}
+		walk(JSON.parse(config))
+		return scenes
+	}
 
 	test('GET /api/storefronts/v1/adcarouselitems returns the carousel items', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v1/adcarouselitems`)
@@ -1860,7 +1926,7 @@ describe('econ endpoints', () => {
 			method: 'POST',
 			headers: { ...(await bearer('70')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+				ChallengeMapId: String(weekly.ChallengeMapId),
 				ChallengeId: String(challenge.ChallengeId),
 				Config: challenge.Config,
 				// .NET's bool.ToString() — the capitalized string, which `Boolean("False")`
@@ -1870,7 +1936,7 @@ describe('econ endpoints', () => {
 		})
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({
-			ChallengeMapId: weeklyChallenge.ChallengeMapId,
+			ChallengeMapId: weekly.ChallengeMapId,
 			ChallengeId: challenge.ChallengeId,
 			Config: challenge.Config,
 			Complete: false,
@@ -1893,7 +1959,7 @@ describe('econ endpoints', () => {
 			method: 'POST',
 			headers: { ...bearerHeaders, 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+				ChallengeMapId: String(weekly.ChallengeMapId),
 				ChallengeId: completedId,
 				Complete: 'True',
 			}),
@@ -1944,7 +2010,7 @@ describe('econ endpoints', () => {
 
 	test('the reported Config is stored and served back over the static rule tree', async () => {
 		const challenge = CURRENT_CHALLENGE
-		const bearerHeaders = await bearer('74')
+		const bearerHeaders = await bearer('78')
 		const headers = { ...bearerHeaders, 'Content-Type': 'application/json' }
 		// The client posts the catalog's tree with its own running count written into it —
 		// `cc` on the counter — which is the progress that has to survive the session.
@@ -1955,14 +2021,14 @@ describe('econ endpoints', () => {
 				method: 'POST',
 				headers,
 				body: JSON.stringify({
-					ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+					ChallengeMapId: String(weekly.ChallengeMapId),
 					ChallengeId: String(challenge.ChallengeId),
 					...body,
 				}),
 			})
 		const reported = await post({ Config: inProgress, Complete: 'False' })
 		expect(await reported.json()).toEqual({
-			ChallengeMapId: weeklyChallenge.ChallengeMapId,
+			ChallengeMapId: weekly.ChallengeMapId,
 			ChallengeId: challenge.ChallengeId,
 			Config: inProgress,
 			Complete: false,
@@ -1988,7 +2054,7 @@ describe('econ endpoints', () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`)
 		const anonBody = (await anon.json()) as { Challenges: Array<{ Config: string }> }
 		expect(anonBody.Challenges.map((ch) => ch.Config)).toEqual(
-			weeklyChallenge.Challenges.map((ch) => ch.Config)
+			weekly.Challenges.map((ch) => ch.Config)
 		)
 	})
 
@@ -1996,25 +2062,35 @@ describe('econ endpoints', () => {
 	 * How many of the rotation's challenges earn the gift — three, unless the rotation
 	 * publishes fewer or declares itself all-or-nothing (`CHALLENGES_REQUIRED_FOR_GIFT`).
 	 */
-	const REQUIRED_FOR_GIFT = weeklyChallenge.CompletedRequired
-		? weeklyChallenge.Challenges.length
-		: Math.min(3, weeklyChallenge.Challenges.length)
+	const REQUIRED_FOR_GIFT = weekly.CompletedRequired
+		? weekly.Challenges.length
+		: Math.min(3, weekly.Challenges.length)
 
 	/** Report the live rotation's challenges complete, for one player. */
 	async function finishTheRotation(sub: string) {
 		const headers = { ...(await bearer(sub)), 'Content-Type': 'application/json' }
-		const ids = weeklyChallenge.Challenges.map((challenge) => challenge.ChallengeId)
+		const ids = weekly.Challenges.map((challenge) => challenge.ChallengeId)
 		const report = (challengeId: number) =>
 			exports.default.fetch(`${ORIGIN}/api/challenge/v2/updateProgress`, {
 				method: 'POST',
 				headers,
 				body: JSON.stringify({
-					ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+					ChallengeMapId: String(weekly.ChallengeMapId),
 					ChallengeId: String(challengeId),
 					Complete: 'True',
 				}),
 			})
 		return { ids, report }
+	}
+
+	/**
+	 * The reward this week advertises, read back from the route that shows it to the client.
+	 * The gift is rolled from the storefront catalog rather than authored, so the assertion
+	 * that matters is that the box a player receives carries what the rotation promised.
+	 */
+	async function advertisedGift() {
+		const res = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`)
+		return ((await res.json()) as { Gift: Record<string, string & number> }).Gift
 	}
 
 	/** A player's unopened gift boxes, as the client reads them back. */
@@ -2033,7 +2109,8 @@ describe('econ endpoints', () => {
 	}
 
 	test('completing enough of the rotation grants its gift, once', async () => {
-		// The live rotation, so this follows whatever static/weekly-challenge.json holds.
+		// The live rotation, so this follows whatever this week generated.
+		const gift = await advertisedGift()
 		const { ids, report } = await finishTheRotation('74')
 		// The threshold can't ask for more than the week publishes: a five-challenge week asks
 		// for three, and a rotation of three or fewer asks for all of them.
@@ -2050,7 +2127,7 @@ describe('econ endpoints', () => {
 		const won = await giftBoxes('74')
 		expect(won).toHaveLength(1)
 		expect(won[0]?.Message).toBe('Weekly challenge complete!')
-		expect(won[0]?.EquipmentModificationGuid).toBe(weeklyChallenge.Gift.EquipmentModificationGuid)
+		expect(won[0]?.EquipmentModificationGuid).toBe(gift.EquipmentModificationGuid)
 
 		// The client is told the moment the set is finished, rather than finding the box the
 		// next time it reads the gifts list. `Immediate` (31), from Coach (1).
@@ -2063,10 +2140,10 @@ describe('econ endpoints', () => {
 			FromGiftDropId: 0,
 			FromPlayerId: 1,
 			ConsumableItemDesc: '',
-			AvatarItemDesc: weeklyChallenge.Gift.AvatarItemDesc,
-			AvatarItemType: weeklyChallenge.Gift.AvatarItemType,
-			EquipmentPrefabName: weeklyChallenge.Gift.EquipmentPrefabName,
-			EquipmentModificationGuid: weeklyChallenge.Gift.EquipmentModificationGuid,
+			AvatarItemDesc: gift.AvatarItemDesc,
+			AvatarItemType: gift.AvatarItemType,
+			EquipmentPrefabName: gift.EquipmentPrefabName,
+			EquipmentModificationGuid: gift.EquipmentModificationGuid,
 			CurrencyType: 0,
 			Currency: 0,
 			Xp: 0,
@@ -2074,9 +2151,10 @@ describe('econ endpoints', () => {
 			Platform: -1,
 			PlatformsToSpawnOn: -1,
 			BalanceType: -2,
-			GiftContext: weeklyChallenge.Gift.GiftContext,
-			// The catalog's rarity for the item, not the block's `GiftRarity` of 0.
-			GiftRarity: 5,
+			GiftContext: gift.GiftContext,
+			// The catalog's rarity for the item — which is also what the generated block carries,
+			// since the week's gift is drawn from the catalog itself.
+			GiftRarity: gift.GiftRarity,
 			Message: 'Weekly challenge complete!',
 		})
 
@@ -2085,9 +2163,7 @@ describe('econ endpoints', () => {
 			headers: await bearer('74'),
 		})
 		const owned = (await unlocked.json()) as Array<{ ModificationGuid: string }>
-		expect(owned.map((e) => e.ModificationGuid)).toContain(
-			weeklyChallenge.Gift.EquipmentModificationGuid
-		)
+		expect(owned.map((e) => e.ModificationGuid)).toContain(gift.EquipmentModificationGuid)
 
 		// Finishing the REST of the set, and re-reporting what's already done (which the client
 		// keeps doing), must not mint a second reward.
@@ -2097,10 +2173,11 @@ describe('econ endpoints', () => {
 
 	test('a player who already owns the rotation’s gift rolls the fallback box instead', async () => {
 		// Own the reward up front — the case the rotation's `FallbackGiftName` exists for.
+		const gift = await advertisedGift()
 		await grantEquipment(env.DB, 75, {
-			ModificationGuid: weeklyChallenge.Gift.EquipmentModificationGuid,
-			PrefabName: weeklyChallenge.Gift.EquipmentPrefabName,
-			FriendlyName: 'Camera Skin (Comic)',
+			ModificationGuid: gift.EquipmentModificationGuid,
+			PrefabName: gift.EquipmentPrefabName,
+			FriendlyName: 'The week’s reward, already owned',
 			Tooltip: '',
 			Rarity: 5,
 			PlatformMask: -1,
@@ -2119,9 +2196,7 @@ describe('econ endpoints', () => {
 		// Something they don't have, at the tier `FallbackGiftName` names ("4-Star Box" → 30),
 		// rather than a second copy of the gift.
 		const rolled = won[0]
-		expect(rolled?.EquipmentModificationGuid).not.toBe(
-			weeklyChallenge.Gift.EquipmentModificationGuid
-		)
+		expect(rolled?.EquipmentModificationGuid).not.toBe(gift.EquipmentModificationGuid)
 		expect(rolled?.GiftRarity).toBe(30)
 		expect(
 			(rolled?.AvatarItemDesc ?? '') !== '' || (rolled?.EquipmentModificationGuid ?? '') !== ''

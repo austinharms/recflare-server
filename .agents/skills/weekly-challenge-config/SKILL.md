@@ -1,12 +1,21 @@
 ---
 name: weekly-challenge-config
-description: Read and author the `Config` rule tree in apps/econ/static/weekly-challenge.json — the full node-type enum, event types, event variables, named scene constants, and the shared-scene traps
+description: Read and author the `Config` rule tree a weekly challenge carries — the full node-type enum, event types, event variables, named scene constants, the shared-scene traps, and where the generator in apps/econ/src/challenge-rotation.ts emits them from
 ---
 
 # The weekly-challenge `Config` rule tree
 
-Reference for reading and writing the `Config` field of a challenge in
-`apps/econ/static/weekly-challenge.json` (served by `GET /api/challenge/v2/getCurrent`).
+Reference for reading and writing the `Config` field of a weekly challenge (served by
+`GET /api/challenge/v2/getCurrent`).
+
+**Rotations are generated, so there are two places a tree comes from.** Normally
+`apps/econ/src/challenge-rotation.ts` emits it: a week is five (room, kind) pairs drawn from
+`CHALLENGE_ROOMS` with the week's seed, and the tree is built by `configFor` from one of the
+three idioms below. Adding variety means adding a room or a kind there, not hand-writing a
+tree. The other place is `apps/econ/static/weekly-challenge.json`: a non-empty `Challenges`
+array in that file PINS the week to a hand-authored rotation and skips generation, which is
+how a one-off debug or event week gets served. Both end up as the same `Config` string on
+the wire, and everything below applies to both.
 
 **The server never evaluates these rules.** The client reads the tree, watches its own
 gameplay, and posts the tree back to `/api/challenge/v2/updateProgress` with its verdict.
@@ -43,12 +52,15 @@ Author the tree as an object and stringify it into the field — don't hand-esca
 bun -e 'const t={ct:0,ipc:false,wc:[{ct:6,vs:[2]}]}; console.log(JSON.stringify(JSON.stringify(t)))'
 ```
 
-To read one back:
+To read this week's back (the generated rotation, or the pinned file if one is in place):
 
 ```sh
-bun -e 'const c=require("./apps/econ/static/weekly-challenge.json");
-for (const x of c.Challenges) console.log(x.ChallengeId, x.Description, "\n ", JSON.parse(x.Config))'
+bun -e 'const {buildRotation}=await import("./apps/econ/src/challenge-rotation.ts");
+for (const x of buildRotation(new Date()).Challenges)
+  console.log(x.ChallengeId, x.Description, "\n ", JSON.parse(x.Config))'
 ```
+
+Pass a date to look at any other week — the rotation is a pure function of which week it is.
 
 ## Node types (`ct`) — the full enum
 
@@ -293,7 +305,7 @@ On `updateProgress` the client posts the same tree back with its own progress wr
 it: **`cc`** on a counter is the current count (`…,"t":5,"cc":1`), and **`c`** (`"c":true`)
 marks a node it now considers satisfied.
 
-Neither belongs in `weekly-challenge.json` — they are progress, not definition. The server
+Neither belongs in an authored tree — they are progress, not definition. The server
 stores the posted tree per player (`challenge_status.config`; see
 `apps/econ/src/challenge-db.ts`) and `getCurrent` serves it back in place of the authored
 tree, which is how a half-finished challenge survives a session — but it still evaluates
@@ -324,7 +336,30 @@ all worth checking before trusting a lib-only field:
 - **`SpawnableToolTypes` re-rolls per build**, so `ct:5` and any `t_t` comparison is pinned
   to one client version.
 
-## Authoring a new challenge
+## Adding to the generator
+
+This is the usual way a new challenge ships: the week picks from `CHALLENGE_ROOMS` in
+`apps/econ/src/challenge-rotation.ts`, so a room added there starts appearing in rotations
+on its own.
+
+1. **A new room** — add an entry with its `UnitySceneId`(s) from
+   `apps/rooms/static/ImportRooms.json`. A scene no room on this server hosts can never be
+   completed and nothing will tell you. Check the shared-scene table above and record the
+   extra rooms in `shares`. Set `kinds` conservatively: `win` reads the `won` variable, so
+   only rooms where winning is a real outcome; `ai` is quests. **Append, never insert** —
+   `ChallengeId` is the candidate's index, so inserting renumbers every challenge after it.
+2. **A new kind** — add it to `ChallengeKind` and give it a branch in all three of
+   `configFor` (the tree), `copyFor` (the strings) and `nameFor` (the slug). The compiler
+   will point at the two you forget. Build the tree from an idiom below; the copy is
+   generated from the same inputs so it can't drift out of step with the tree.
+3. Keep the target constants (`GAMES_TARGET`, `AI_TARGET`) as the single source for both the
+   tree and the copy.
+
+## Authoring a pinned rotation
+
+For a one-off week: put challenges in `apps/econ/static/weekly-challenge.json` and the file
+takes over completely — generation is skipped, and its `Gift`, window and `ChallengeMapId`
+are served as written.
 
 1. Pick the idiom: one-shot (`ct:0` root, add the `won` predicate if winning is required),
    counted (`ct:1` root with `t`), or buffered/streak (`ct:2` root, `rc` on the child).
@@ -340,21 +375,24 @@ all worth checking before trusting a lib-only field:
    client renders the strings and evaluates the tree independently, so a mismatch ships a
    challenge that advances somewhere the text never mentions.
 6. Leave `Complete: false`; `getCurrent` stamps it per caller.
-7. Bump `ChallengeMapId` if this is a new rotation — ids only need to be unique within one,
-   and a new map id is what resets stored completions.
+7. Set a `ChallengeMapId` that no recent week has used — a new map id is what resets stored
+   completions, and generated weeks are `1000 + weekIndex`, so stay well clear of that range.
 8. Keep `ServerTime` inside `StartAt`…`EndAt`, or the client renders the rotation as expired.
+   A pinned file is static, so its clock has to be frozen there; a generated week doesn't,
+   because its window is really the current one.
 
-Sanity check the file parses and every tree parses:
+Sanity check that every tree in this week's rotation parses, pinned or generated:
 
 ```sh
-bun -e 'const c=require("./apps/econ/static/weekly-challenge.json");
-c.Challenges.forEach(x => JSON.parse(x.Config)); console.log("ok", c.Challenges.length)'
+bun -e 'const {buildRotation}=await import("./apps/econ/src/challenge-rotation.ts");
+const c=buildRotation(new Date());
+c.Challenges.forEach(x => JSON.parse(x.Config)); console.log("ok", c.ChallengeMapId, c.Challenges.length)'
 ```
 
-Then `bun vitest run apps/econ` — `src/test/integration/api.test.ts` imports the file and
-asserts `getCurrent` against it. Note the gift threshold follows the rotation size
-(`CHALLENGES_REQUIRED_FOR_GIFT` clamps to what you publish), so a rotation of three or fewer
-asks for all of them.
+Then `bun vitest run apps/econ` — `src/test/integration/api.test.ts` builds the same rotation
+and asserts `getCurrent` against it, and walks two years of generated weeks checking every
+tree. Note the gift threshold follows the rotation size (`CHALLENGES_REQUIRED_FOR_GIFT`
+clamps to what you publish), so a pinned rotation of three or fewer asks for all of them.
 
 ## Credits
 

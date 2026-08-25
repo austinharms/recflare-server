@@ -33,7 +33,6 @@ import defaultAvatarItems from '../static/default-avatar-items.json'
 import defaultAvatar from '../static/default-avatar.json'
 import defaultBaseAvatarItems from '../static/default-base-avatar-items.json'
 import myProgress from '../static/my-progress.json'
-import weeklyChallenge from '../static/weekly-challenge.json'
 import { getAvatar, setAvatar } from './avatar-db'
 import {
 	ALL_PLATFORMS,
@@ -46,6 +45,7 @@ import {
 	spendCurrency,
 } from './balance-db'
 import { claimChallengeGift, getChallengeStatuses, recordChallengeProgress } from './challenge-db'
+import { buildRotation, rotationMapId, withWeeklyGift } from './challenge-rotation'
 import {
 	consumeConsumable,
 	countConsumable,
@@ -105,6 +105,11 @@ import type {
 	PurchaseBalanceModificationPayload,
 } from '../../notify/src/notification-payloads'
 import type { Avatar } from './avatar-db'
+import type {
+	ChallengeGiftBlock,
+	EquipmentGift,
+	WeeklyChallengeRotation,
+} from './challenge-rotation'
 import type { ConsumeResult } from './consumables-db'
 import type { App } from './context'
 import type { Equipment } from './equipment-db'
@@ -678,6 +683,40 @@ const ROLL_STOREFRONT_TYPE = 3
 async function loadRollCatalog(c: Context<App>): Promise<StoreItem[]> {
 	const storefront = await loadStorefront(c, ROLL_STOREFRONT_TYPE)
 	return storefront?.StoreItems ?? []
+}
+
+/**
+ * The equipment a weekly challenge gift can be drawn from: every roll-catalog item carrying
+ * an `EquipmentModificationGuid`. Weekly rewards are equipment — the captured rotation's is a
+ * camera skin — and in sf3 that guid is exactly what marks an item as equipment (187 of its
+ * 1161, all with a prefab, none with an avatar item or consumable attached).
+ *
+ * `GiftDropId` comes off `PurchasableItemId`, which every sf3 equipment entry agrees with.
+ */
+function toEquipmentGiftPool(catalog: StoreItem[]): EquipmentGift[] {
+	return catalog
+		.filter((item) => item.GiftDrop.EquipmentModificationGuid !== '')
+		.map((item) => ({
+			GiftDropId: item.PurchasableItemId,
+			EquipmentPrefabName: item.GiftDrop.EquipmentPrefabName,
+			EquipmentModificationGuid: item.GiftDrop.EquipmentModificationGuid,
+			Rarity: item.GiftDrop.Rarity,
+		}))
+}
+
+/**
+ * The same pool, memoised for the life of the isolate. `getCurrent` needs it on every call
+ * just to show the week's reward, and sf3 is a megabyte and a half of JSON to fetch and parse
+ * — but it is a bundled asset, so it cannot change under a running isolate and a deploy
+ * builds new ones. A failed read is deliberately NOT cached: it would pin an empty pool (and
+ * so the static fallback gift) until the next deploy.
+ */
+let cachedGiftPool: EquipmentGift[] | null = null
+async function loadEquipmentGiftPool(c: Context<App>): Promise<EquipmentGift[]> {
+	if (cachedGiftPool !== null) return cachedGiftPool
+	const pool = toEquipmentGiftPool(await loadRollCatalog(c))
+	if (pool.length > 0) cachedGiftPool = pool
+	return pool
 }
 
 /**
@@ -1289,30 +1328,6 @@ async function grantLevelUpGifts(
 	}
 }
 
-/**
- * The rotation's reward, as static/weekly-challenge.json writes it. Same item vocabulary as
- * a storefront `GiftDrop` but with `Context`/`Rarity` spelled `GiftContext`/`GiftRarity`,
- * so it has to be translated before the grant path can read it (see
- * {@link toChallengeGiftDrop}).
- *
- * `FriendlyName`/`Tooltip` are OPTIONAL because the captured rotation has neither — the
- * client resolves the reward's name from the item itself, falling back to
- * `FallbackGiftName`. A rotation we publish can carry them to name the granted item
- * properly without a code change.
- */
-interface ChallengeGift {
-	AvatarItemDesc: string
-	AvatarItemType: number
-	ConsumableItemDesc: string
-	EquipmentPrefabName: string
-	EquipmentModificationGuid: string
-	GiftContext: number
-	GiftRarity: number
-	Xp: number
-	FriendlyName?: string
-	Tooltip?: string
-}
-
 /** The message on the gift box the weekly reward arrives in. */
 const CHALLENGE_GIFT_MESSAGE = 'Weekly challenge complete!'
 
@@ -1334,8 +1349,8 @@ const DEFAULT_FALLBACK_STARS = 4
  * it is what the client renders when the gift resolves to a box rather than a named item —
  * so a rotation can retune the tier by renaming it, with no code change.
  */
-function fallbackGiftRarity(): number {
-	const stars = Number(/^(\d+)-star/i.exec(weeklyChallenge.FallbackGiftName)?.[1])
+function fallbackGiftRarity(rotation: WeeklyChallengeRotation): number {
+	const stars = Number(/^(\d+)-star/i.exec(rotation.FallbackGiftName)?.[1])
 	return STAR_RARITY[stars - 1] ?? STAR_RARITY[DEFAULT_FALLBACK_STARS - 1] ?? 0
 }
 
@@ -1350,8 +1365,11 @@ function fallbackGiftRarity(): number {
  * selling the same item, so the granted item reads as itself — "Camera Skin (Comic)" rather
  * than the name of the box it might have arrived in.
  */
-function toChallengeGiftDrop(catalog: StoreItem[]): StoreGiftDrop {
-	const gift = weeklyChallenge.Gift as ChallengeGift
+function toChallengeGiftDrop(
+	rotation: WeeklyChallengeRotation,
+	catalog: StoreItem[]
+): StoreGiftDrop {
+	const gift: ChallengeGiftBlock = rotation.Gift
 	const sold = catalog.find(
 		({ GiftDrop: drop }) =>
 			(gift.EquipmentModificationGuid !== '' &&
@@ -1359,7 +1377,7 @@ function toChallengeGiftDrop(catalog: StoreItem[]): StoreGiftDrop {
 			(gift.AvatarItemDesc !== '' && drop.AvatarItemDesc === gift.AvatarItemDesc)
 	)?.GiftDrop
 	return {
-		FriendlyName: gift.FriendlyName ?? sold?.FriendlyName ?? weeklyChallenge.FallbackGiftName,
+		FriendlyName: gift.FriendlyName ?? sold?.FriendlyName ?? rotation.FallbackGiftName,
 		Tooltip: gift.Tooltip ?? sold?.Tooltip ?? '',
 		ConsumableItemDesc: gift.ConsumableItemDesc,
 		AvatarItemDesc: gift.AvatarItemDesc,
@@ -1380,17 +1398,17 @@ function toChallengeGiftDrop(catalog: StoreItem[]): StoreGiftDrop {
  * it. Handed over instead of the rotation's item when that item would be a duplicate, which
  * is what the fallback name is for — the reward reads "the Camera Skin, or a 4-Star Box".
  */
-function toChallengeFallbackDrop(): StoreGiftDrop {
+function toChallengeFallbackDrop(rotation: WeeklyChallengeRotation): StoreGiftDrop {
 	return {
-		FriendlyName: weeklyChallenge.FallbackGiftName,
+		FriendlyName: rotation.FallbackGiftName,
 		Tooltip: '',
 		ConsumableItemDesc: '',
 		AvatarItemDesc: '',
 		AvatarItemType: null,
 		EquipmentPrefabName: '',
 		EquipmentModificationGuid: '',
-		Rarity: fallbackGiftRarity(),
-		Context: (weeklyChallenge.Gift as ChallengeGift).GiftContext,
+		Rarity: fallbackGiftRarity(rotation),
+		Context: rotation.Gift.GiftContext,
 		Currency: 0,
 		CurrencyType: 0,
 		IsQuery: true,
@@ -1410,11 +1428,9 @@ const CHALLENGES_REQUIRED_FOR_GIFT = 3
  * all-or-nothing when it's true — the reading its name and the partial default suggest —
  * and a rotation shorter than the threshold can only ever ask for what it publishes.
  */
-function challengesRequiredForGift(): number {
-	const published = weeklyChallenge.Challenges.length
-	return weeklyChallenge.CompletedRequired
-		? published
-		: Math.min(CHALLENGES_REQUIRED_FOR_GIFT, published)
+function challengesRequiredForGift(rotation: WeeklyChallengeRotation): number {
+	const published = rotation.Challenges.length
+	return rotation.CompletedRequired ? published : Math.min(CHALLENGES_REQUIRED_FOR_GIFT, published)
 }
 
 /**
@@ -1440,23 +1456,27 @@ function challengesRequiredForGift(): number {
  * would otherwise meet without playing.
  */
 async function awardChallengeGift(c: Context<App>, accountId: number): Promise<void> {
+	const rotation = buildRotation(new Date())
 	try {
-		if (weeklyChallenge.Challenges.length === 0) return
-		const statuses = await getChallengeStatuses(c.env.DB, accountId, weeklyChallenge.ChallengeMapId)
-		const done = weeklyChallenge.Challenges.filter(
+		if (rotation.Challenges.length === 0) return
+		const statuses = await getChallengeStatuses(c.env.DB, accountId, rotation.ChallengeMapId)
+		const done = rotation.Challenges.filter(
 			(ch) => statuses.get(ch.ChallengeId)?.complete === true
 		).length
-		if (done < challengesRequiredForGift()) return
+		if (done < challengesRequiredForGift(rotation)) return
 		// Claim first: this is what stops the next report paying out a second time.
-		const claimed = await claimChallengeGift(c.env.DB, accountId, weeklyChallenge.ChallengeMapId)
+		const claimed = await claimChallengeGift(c.env.DB, accountId, rotation.ChallengeMapId)
 		if (!claimed) return
+		// Only now is the catalog worth reading: it names the week's reward and is what the
+		// grant path rolls a duplicate's replacement from.
 		const catalog = await loadRollCatalog(c)
-		const reward = toChallengeGiftDrop(catalog)
+		const week = withWeeklyGift(rotation, toEquipmentGiftPool(catalog))
+		const reward = toChallengeGiftDrop(week, catalog)
 		const duplicate = await ownsGiftDrop(c.env.DB, accountId, reward)
 		const granted = await grantGiftDrop(
 			c,
 			accountId,
-			duplicate ? toChallengeFallbackDrop() : reward,
+			duplicate ? toChallengeFallbackDrop(week) : reward,
 			CHALLENGE_GIFT_MESSAGE,
 			{ rollCatalog: catalog }
 		)
@@ -1467,7 +1487,7 @@ async function awardChallengeGift(c: Context<App>, accountId: number): Promise<v
 		await pushGiftReceived(c, accountId, granted, CHALLENGE_GIFT_MESSAGE, COACH_ACCOUNT_ID)
 		logger.info('weekly challenge gift granted', {
 			accountId,
-			challengeMapId: weeklyChallenge.ChallengeMapId,
+			challengeMapId: rotation.ChallengeMapId,
 			giftId: granted.id,
 			fallbackRoll: duplicate,
 			challengesComplete: done,
@@ -1475,7 +1495,7 @@ async function awardChallengeGift(c: Context<App>, accountId: number): Promise<v
 	} catch (err) {
 		logger.error('failed to grant weekly challenge gift', {
 			accountId,
-			challengeMapId: weeklyChallenge.ChallengeMapId,
+			challengeMapId: rotation.ChallengeMapId,
 			error: err instanceof Error ? err.message : String(err),
 		})
 	}
@@ -2859,40 +2879,43 @@ const app = new Hono<App>({ strict: false })
 		(c) => c.json(adCarouselItems)
 	)
 
-	// Current weekly challenge. The rotation itself is the bundled static JSON (its format
-	// is documented in the README) but each challenge's state is per-player, so the caller's
-	// rows from `challenge_status` are stamped over the static ones: `Complete` over the
-	// static `false`, and `Config` over the static rule tree — the client evaluates that tree
-	// locally and reports it back with its running counts written into it (`cc`/`c`), so
-	// serving the pristine tree back is what makes partial progress reset every session.
-	// Auth is OPTIONAL: without a valid bearer the static catalog is served unchanged
-	// rather than 401, since the rotation is public information and a 404/401 on this
-	// route can stall the client's load orchestration.
+	// Current weekly challenge. The rotation is GENERATED from the calendar week (see
+	// challenge-rotation.ts — the same five challenges, window and gift for everyone, derived
+	// from the week index; static/weekly-challenge.json pins it instead when it carries
+	// challenges), but each challenge's state is per-player, so the caller's rows from
+	// `challenge_status` are stamped over the week's: `Complete` over the published `false`,
+	// and `Config` over the published rule tree — the client evaluates that tree locally and
+	// reports it back with its running counts written into it (`cc`/`c`), so serving the
+	// pristine tree back is what makes partial progress reset every session.
+	// Auth is OPTIONAL: without a valid bearer the week is served unstamped rather than 401,
+	// since the rotation is public information and a 404/401 on this route can stall the
+	// client's load orchestration.
 	.get(
 		'/api/challenge/v2/getCurrent',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Current weekly challenge',
 			description: [
-				'The bundled static rotation, with each challenge’s `Complete` and `Config` stamped',
-				'from the caller’s progress rows — the stored `Config` carries the client’s running',
-				'counts. Auth is optional — unauthenticated callers get the static catalog with every',
-				'`Complete` false and every `Config` as authored.',
+				'This week’s rotation — generated from the calendar week — with each challenge’s',
+				'`Complete` and `Config` stamped from the caller’s progress rows, the stored `Config`',
+				'carrying the client’s running counts. Auth is optional: unauthenticated callers get',
+				'the week unstamped, every `Complete` false and every `Config` as published.',
 			].join(' '),
 			security: OPTIONAL_AUTHED,
 			responses: { 200: json(JsonObject, 'The current weekly challenge') },
 		}),
 		async (c) => {
+			const rotation = withWeeklyGift(buildRotation(new Date()), await loadEquipmentGiftPool(c))
 			const id = await authedId(c)
-			if (id === null) return c.json(weeklyChallenge)
-			const statuses = await getChallengeStatuses(c.env.DB, id, weeklyChallenge.ChallengeMapId)
-			if (statuses.size === 0) return c.json(weeklyChallenge)
-			// Rebuild rather than mutate: the static import is module state shared by every
-			// request this isolate serves, so stamping it in place would leak one player's
-			// progress to the next caller.
+			if (id === null) return c.json(rotation)
+			const statuses = await getChallengeStatuses(c.env.DB, id, rotation.ChallengeMapId)
+			if (statuses.size === 0) return c.json(rotation)
+			// Rebuild rather than mutate: the generated rotation is cached module state shared
+			// by every request this isolate serves, so stamping it in place would leak one
+			// player's progress to the next caller.
 			return c.json({
-				...weeklyChallenge,
-				Challenges: weeklyChallenge.Challenges.map((challenge) => {
+				...rotation,
+				Challenges: rotation.Challenges.map((challenge) => {
 					const status = statuses.get(challenge.ChallengeId)
 					if (status === undefined) return challenge
 					// A row with no stored tree (never reported one) keeps the authored `Config`;
@@ -2964,11 +2987,7 @@ const app = new Hono<App>({ strict: false })
 			// The response is unchanged whether or not a gift was won: the client learns about
 			// the box from `GET /api/avatar/v2/gifts`, and adding a field here would be
 			// inventing response shape the client never sent us.
-			if (
-				stored.complete &&
-				challengeId !== 0 &&
-				challengeMapId === weeklyChallenge.ChallengeMapId
-			) {
+			if (stored.complete && challengeId !== 0 && challengeMapId === rotationMapId(new Date())) {
 				await awardChallengeGift(c, id)
 			}
 			return c.json({
