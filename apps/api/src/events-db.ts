@@ -174,13 +174,28 @@ interface EventRow {
 }
 
 /**
- * The event as the `v2` envelope carries it: {@link PlayerEventBase} plus `Tags`, a plain
- * array of tag NAMES. (The stored tags are `{ tag, type }` pairs, which is what the v1
- * read's lowercase `tags` serves.) Defined on top of the base rather than beside it, so the
- * feed and the envelope cannot drift apart on the fields they share.
+ * A tag as the 2023 build's `v2` envelope carries it: the PascalCase form of the stored
+ * `{ tag, type }` pair. NOT the lowercase pair the v1 read serves — three casings of one
+ * tag, and the client parses each in exactly one place.
+ */
+export interface PlayerEventEnvelopeTag {
+	Tag: string
+	Type: number
+}
+
+/**
+ * The event as the `v2` envelope carries it: {@link PlayerEventBase} plus `Tags`. Defined
+ * on top of the base rather than beside it, so the feed and the envelope cannot drift
+ * apart on the fields they share.
+ *
+ * `Tags` is the one field whose shape depends on the caller's BUILD, because Rec Room
+ * changed it under the same unversioned path rather than minting a `v3`: the 2023 build
+ * parses `[{ Tag, Type }]` and the 2025 build parses `["celebration"]`. Serving either
+ * one to the other build leaves the event's tag chips empty — the decoder drops what it
+ * can't read rather than erroring. {@link toEventResult} picks; nothing else should.
  */
 export interface PlayerEventEnvelope extends PlayerEventBase {
-	Tags: string[]
+	Tags: string[] | PlayerEventEnvelopeTag[]
 }
 
 /**
@@ -199,14 +214,23 @@ export interface PlayerEventResult {
 }
 
 /**
- * Wrap a stored event and its tags in the `v2` envelope. `tags` are the event's stored tag
- * names — pass what `getEventTags` returns, so the answer reflects what was actually
+ * Wrap a stored event and its tags in the `v2` envelope. `tags` are the event's stored
+ * tags — pass what `getEventTags` returns, so the answer reflects what was actually
  * written rather than what was asked for.
+ *
+ * `legacyTags` picks the shape of `PlayerEvent.Tags` for the caller's build (see
+ * {@link PlayerEventEnvelope}): the 2023 pairs when set, the 2025 names when not. It
+ * changes nothing else — `TagModifyResult.Tags` is a name list to both builds.
  */
-export function toEventResult(event: PlayerEvent, tags: EventTag[] = []): PlayerEventResult {
+export function toEventResult(
+	event: PlayerEvent,
+	tags: EventTag[] = [],
+	legacyTags = false
+): PlayerEventResult {
 	const names = tags.map((t) => t.tag)
+	const carried = legacyTags ? tags.map((t) => ({ Tag: t.tag, Type: t.type })) : names
 	return {
-		PlayerEvent: { Tags: names, ...toEventBase(event) },
+		PlayerEvent: { Tags: carried, ...toEventBase(event) },
 		Result: 0,
 		TagModifyResult: { Result: 0, Tags: names },
 	}

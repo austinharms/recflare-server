@@ -704,11 +704,21 @@ export const PlayerEventBaseDto = PlayerEventDto.omit({ State: true, ImageName: 
 
 /**
  * The event as the v2 envelope carries it: the stored record MINUS `State`, PLUS `Tags`
- * (tag names, not the `{ tag, type }` pairs the v1 read's lowercase `tags` serves) and
- * `BroadcastingRoomInstanceId`. `ImageName` is `""` rather than null when there is no image.
+ * and `BroadcastingRoomInstanceId`. `ImageName` is `""` rather than null when there is no
+ * image.
+ *
+ * `Tags` has two shapes, picked from the caller's build: Rec Room reshaped it without
+ * minting a new path, so a build newer than `20230414` gets the tag NAMES and every older
+ * one (and any caller whose token names no build) gets the `{ Tag, Type }` pairs. Neither
+ * is the lowercase `{ tag, type }` the v1 read serves.
  */
 export const PlayerEventEnvelopeDto = PlayerEventBaseDto.extend({
-	Tags: z.array(z.string()).describe('The event’s tag names'),
+	Tags: z
+		.union([z.array(z.string()), z.array(z.object({ Tag: z.string(), Type: z.int() }))])
+		.describe(
+			'The event’s tags: names for a build newer than 20230414, `{ Tag, Type }` pairs for ' +
+				'that build and older'
+		),
 })
 
 /**

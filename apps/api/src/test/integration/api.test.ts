@@ -3871,13 +3871,63 @@ describe('player events', () => {
 		const body = (await res.json()) as PlayerEventResult
 		expect(body.Result).toBe(0)
 		expect(body.PlayerEvent.Name).toBe('Enveloped')
-		// The tags ride inline on the event AND in TagModifyResult, as NAMES — not the
-		// `{ tag, type }` pairs the v1 read's lowercase `tags` serves.
-		expect(body.PlayerEvent.Tags).toEqual(['music'])
+		// The tags ride inline on the event AND in TagModifyResult. Inline they take the
+		// caller's build shape — this token names no build, so the 2023 `{ Tag, Type }` pairs
+		// (PascalCase: not the lowercase pairs the v1 read's `tags` serves). TagModifyResult
+		// is names to every build.
+		expect(body.PlayerEvent.Tags).toEqual([{ Tag: 'music', Type: 0 }])
 		expect(body.TagModifyResult).toEqual({ Result: 0, Tags: ['music'] })
 		// No `State`, and the broadcast instance is present and null.
 		expect(body.PlayerEvent).not.toHaveProperty('State')
 		expect(body.PlayerEvent.BroadcastingRoomInstanceId).toBeNull()
+	})
+
+	test('the v2 envelope shapes PlayerEvent.Tags per the caller’s build', async () => {
+		// Rec Room reshaped this field without minting a new path, so one endpoint owes two
+		// shapes: the 2023 build parses `{ Tag, Type }` pairs, the 2025 build bare names.
+		// Serving either to the wrong build empties the event's chips instead of erroring.
+		// A tag of this test's own: the `#tag` search tests assert exact result sets, and the
+		// four events below would join any set they share a tag with.
+		const PAIRS = [{ Tag: 'buildversions', Type: 0 }]
+		const NAMES = ['buildversions']
+
+		const created = async (version?: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/playerevents/v2`, {
+				method: 'POST',
+				headers: {
+					...(await bearer('42', undefined, version)),
+					'content-type': 'application/json',
+				},
+				body: JSON.stringify({ Name: 'Versioned', RoomId: 3, Tags: NAMES }),
+			})
+			expect(res.status).toBe(200)
+			return (await res.json()) as PlayerEventResult
+		}
+
+		// Newer than 20230414 is the 2025 client; that build, an older one, and a token naming
+		// no build at all are all the 2023 client. Builds are date-stamped, so they compare as
+		// strings.
+		expect((await created('20250718.01')).PlayerEvent.Tags).toEqual(NAMES)
+		expect((await created('20230414')).PlayerEvent.Tags).toEqual(PAIRS)
+		expect((await created('20220101')).PlayerEvent.Tags).toEqual(PAIRS)
+		const legacy = await created()
+		expect(legacy.PlayerEvent.Tags).toEqual(PAIRS)
+		// Only the inline field moves: TagModifyResult carries names to both builds.
+		expect(legacy.TagModifyResult).toEqual({ Result: 0, Tags: NAMES })
+
+		// The gate is on the ENVELOPE, not on the create: the read and the field edits answer
+		// the same shape, so a client that made an event and one opening it cold agree.
+		const eventId = legacy.PlayerEvent.PlayerEventId
+		const read = async (version?: string) =>
+			(
+				(await (
+					await exports.default.fetch(`${ORIGIN}/api/playerevents/v2/${eventId}`, {
+						headers: await bearer('42', undefined, version),
+					})
+				).json()) as PlayerEventResult
+			).PlayerEvent.Tags
+		expect(await read('20250718.01')).toEqual(NAMES)
+		expect(await read()).toEqual(PAIRS)
 	})
 
 	test('GET /api/playerevents/v2/:eventId serves the same envelope as the write', async () => {
@@ -4758,7 +4808,10 @@ describe('player events', () => {
 
 		// A bare JSON array, not an object — and a replace, not a merge, so `meetup` goes.
 		const tagged = await edited(await putJson(path, ['tag1', '#Class']))
-		expect(tagged.Tags).toEqual(['class', 'tag1'])
+		expect(tagged.Tags).toEqual([
+			{ Tag: 'class', Type: 0 },
+			{ Tag: 'tag1', Type: 0 },
+		])
 		// The envelope's TagModifyResult reports the same set the client redraws chips from.
 		const body = (await (await putJson(path, ['workshops'])).json()) as PlayerEventResult
 		expect(body.TagModifyResult).toEqual({ Result: 0, Tags: ['workshops'] })

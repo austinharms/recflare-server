@@ -1,8 +1,9 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { Accessibility } from '@repo/domain'
+import { Accessibility, GAME_VERSION } from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
+import { validateAndGetVersion } from '@repo/jwt'
 
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported
 // as a value — the enum has no runtime dependencies.
@@ -146,6 +147,26 @@ async function notifyInvited(
 }
 
 /**
+ * Wrap an event in the v2 envelope for THIS caller's build.
+ *
+ * Rec Room reshaped `PlayerEvent.Tags` without minting a new path, so the same endpoint
+ * owes the 2023 build `[{ Tag, Type }]` and the 2025 build `["celebration"]`. The build
+ * comes off the token's `rn.ver` claim — the request carries no version of its own — and
+ * the split is the one `/api/gameconfigs/v1/all` already makes: anything NEWER than
+ * `GAME_VERSION` (20230414) is the 2025 client; that build, anything older, and a request
+ * with no readable token version all get the 2023 shape. Builds are date-stamped, so they
+ * order as strings.
+ *
+ * Like the other version gates here the claim is unverified — a client that lies about its
+ * build only empties its own tag chips.
+ */
+async function eventResult(c: Context<App>, event: PlayerEvent, tags: EventTag[]) {
+	const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+	const isModernBuild = version !== null && version > GAME_VERSION
+	return toEventResult(event, tags, !isModernBuild)
+}
+
+/**
  * The shared front half of the single-field event edits (`PUT …/v2/{id}/{field}`):
  * authenticate, load the event, check the caller created it, then apply whatever patch
  * `parse` reads out of the body and answer the same `{ Result, TagModifyResult,
@@ -177,7 +198,7 @@ function editEventField(
 		if (input === null) return c.body(null, 400)
 		const updated = await updateEvent(c.env.DB, eventId, input)
 		// updateEvent only returns null when the row vanished, which the read above rules out.
-		return c.json(toEventResult(updated!, await getEventTags(c.env.DB, eventId)))
+		return c.json(await eventResult(c, updated!, await getEventTags(c.env.DB, eventId)))
 	}
 }
 
@@ -499,7 +520,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 
 			const updated = await setEventResponse(c.env.DB, eventId, id, type)
 			if (updated === null) return c.body(null, 404)
-			return c.json(toEventResult(updated, await getEventTags(c.env.DB, eventId)))
+			return c.json(await eventResult(c, updated, await getEventTags(c.env.DB, eventId)))
 		}
 	)
 
@@ -630,7 +651,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			const result = await inviteToEvent(c.env.DB, eventId, invited)
 			// inviteToEvent only returns null when the row vanished, which the read above rules out.
 			await notifyInvited(c, result!.event, result!.added)
-			return c.json(toEventResult(result!.event, await getEventTags(c.env.DB, eventId)))
+			return c.json(await eventResult(c, result!.event, await getEventTags(c.env.DB, eventId)))
 		}
 	)
 
@@ -683,7 +704,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			await notifyEventCreated(c, event, input.tags ?? [])
 			// Read the tags back rather than echoing what was posted: the envelope reports what
 			// the event now carries, which is what the client redraws its chips from.
-			return c.json(toEventResult(event, await getEventTags(c.env.DB, event.PlayerEventId)))
+			return c.json(await eventResult(c, event, await getEventTags(c.env.DB, event.PlayerEventId)))
 		}
 	)
 
@@ -766,7 +787,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			const eventId = Number.parseInt(c.req.param('eventId'), 10)
 			const event = await getEventById(c.env.DB, eventId)
 			if (event === null) return c.body(null, 404)
-			return c.json(toEventResult(event, await getEventTags(c.env.DB, eventId)))
+			return c.json(await eventResult(c, event, await getEventTags(c.env.DB, eventId)))
 		}
 	)
 
@@ -818,7 +839,7 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			if (eventInputRejection(input, existing) !== null) return c.body(null, 400)
 			const updated = await updateEvent(c.env.DB, eventId, input)
 			// updateEvent only returns null when the row vanished, which the read above rules out.
-			return c.json(toEventResult(updated!, await getEventTags(c.env.DB, eventId)))
+			return c.json(await eventResult(c, updated!, await getEventTags(c.env.DB, eventId)))
 		}
 	)
 
