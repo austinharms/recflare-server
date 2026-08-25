@@ -248,10 +248,11 @@ rotation to differ.
 | `FallbackGiftName`     | `"4-Star Box"`                 | Shown when the client can't resolve `Gift` into a name.                                                                      |
 | `ChallengeThemeString` | a designer quote               | Free text carried through from the captured rotation; a theme note, not a rendered UI string as far as we can tell.          |
 
-**The frozen clock:** `ServerTime` (Mar 31) sits _inside_ `StartAt`…`EndAt` (Mar 25 → Apr 1),
-about a day before the end, and the file is static — so the client always sees an active
-rotation with a ~1-day countdown rather than an expired one. If you edit the window, move
-`ServerTime` inside the new one too, or the challenges may render as already over.
+**The frozen clock:** `ServerTime` sits _inside_ `StartAt`…`EndAt`, about a day before the
+end, and the file is static — so the client always sees an active rotation with a ~1-day
+countdown rather than an expired one (the captured week: Mar 31 inside Mar 25 → Apr 1). If
+you edit the window, move `ServerTime` inside the new one too, or the challenges may render
+as already over.
 
 ### A challenge entry
 
@@ -279,10 +280,10 @@ scene allow-list (`ct: 7`, subroom `UnitySceneId`s) or a session variable (`ct: 
 `won`). The server never evaluates any of it — the client does, and posts the tree back with
 its own count written in.
 
-**Reading or writing one? See `.agents/weekly-challenge-config/SKILL.md`** — the full
-grammar, the two idioms the file uses, how to resolve a scene guid to a room, the shared
-scenes that make a challenge complete in more rooms than you meant (`Soccer` and `Stadium`
-are one scene), and an authoring checklist.
+**Reading or writing one? See `.agents/skills/weekly-challenge-config/SKILL.md`** — the full
+node-type enum, the event types and session variables a predicate can match, the named scene
+constants (including the shared scenes that make a challenge complete in more rooms than you
+meant — `Soccer` and `Stadium` are one scene), the three idioms, and an authoring checklist.
 
 ### The `Gift` block
 

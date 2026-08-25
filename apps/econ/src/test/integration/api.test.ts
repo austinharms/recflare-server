@@ -1985,9 +1985,9 @@ describe('econ endpoints', () => {
 	test('completing enough of the rotation grants its gift, once', async () => {
 		// The live rotation, so this follows whatever static/weekly-challenge.json holds.
 		const { ids, report } = await finishTheRotation('74')
-		// The whole point of the threshold: the gift lands before the set is finished (the
-		// published week is five challenges for three).
-		expect(REQUIRED_FOR_GIFT).toBeLessThan(ids.length)
+		// The threshold can't ask for more than the week publishes: a five-challenge week asks
+		// for three, and a rotation of three or fewer asks for all of them.
+		expect(REQUIRED_FOR_GIFT).toBeLessThanOrEqual(ids.length)
 		for (const id of ids.slice(0, REQUIRED_FOR_GIFT - 1)) {
 			expect((await report(id)).status).toBe(200)
 		}
