@@ -61,6 +61,7 @@ import {
 	ExclusiveLoginResponse,
 	form,
 	InProgressRequest,
+	InstanceIdResponse,
 	InviteRequest,
 	InviteResponse,
 	JoinModeRequest,
@@ -612,7 +613,6 @@ function nextLiveMessageId(): number {
 	return Date.now()
 }
 
-
 /**
  * Deliver a game invite from `fromId` to `toId` for a room instance — a `MessageReceived`
  * frame carrying a game-invite `Message` the client renders the join prompt from. `data`
@@ -661,6 +661,13 @@ async function sendGameInvite(
  * bounces the new player to the dorm.
  */
 const ORIENTATION_INSTANCE_ID = -2
+
+/**
+ * What `/tachyon` answers for a player who is not in an instance. A stored
+ * `room_instance` id is never 0 — the table is AUTOINCREMENT from 1 — so the sentinel can't
+ * be mistaken for a real instance, and the body stays a number the way the caller reads it.
+ */
+const NO_INSTANCE = 0
 
 /**
  * Instance-relevant fields pulled from a stored room (scene, name, capacity, …).
@@ -1386,6 +1393,56 @@ const app = new Hono<App>()
 				roomInstanceId: parseId(body.RoomInstanceId),
 			})
 			return c.body(null, 200)
+		}
+	)
+
+	// Which room instance a player is in, as a bare number (`/tachyon?id=123`). The whole
+	// presence blob is what `/player` serves; this answers the one field out of it, for a
+	// caller that only needs to know where someone is.
+	//
+	// UNGATED, unlike the rest of this worker's presence surface: it takes the player id from
+	// the query rather than from a token, so anyone can ask about anyone. What it discloses
+	// is an instance id and nothing else — no room, no name, no status — and `/player` is
+	// already ungated on the same rows.
+	//
+	// 0 for "not in an instance": the body is a number, so absence has to be one too, and a
+	// real instance id is never 0 (the `room_instance` table is AUTOINCREMENT from 1). The
+	// synthetic negatives ARE real answers and pass through — -2 is the Orientation seed.
+	.get(
+		'/tachyon',
+		describeRoute({
+			tags: ['Presence'],
+			summary: 'The room instance a player is in',
+			description: [
+				'The `roomInstanceId` from a player’s live presence (`?id=123`), as a BARE NUMBER —',
+				'the whole body is the id, not an object around it. The single field out of what',
+				'`/player` serves whole.',
+				'',
+				'0 means not in an instance: no live presence, an expired row, or no usable `id`. A',
+				'real instance id is never 0, so the sentinel can’t collide with one. Synthetic ids',
+				'pass through as they stand — -2 is the Orientation presence the `auth` worker seeds',
+				'a brand-new player with.',
+				'',
+				'Ungated: the player is named by the query rather than by a token, so anyone may ask',
+				'about anyone. It discloses an instance id and nothing else.',
+			].join(' '),
+			parameters: [
+				{
+					name: 'id',
+					in: 'query',
+					required: false,
+					description: 'The account to look up. Absent or unparseable answers 0',
+					schema: { type: 'integer' },
+				},
+			],
+			responses: { 200: json(InstanceIdResponse, 'The instance id, or 0') },
+		}),
+		async (c) => {
+			const playerId = Number.parseInt(c.req.query('id') ?? '', 10)
+			if (!Number.isInteger(playerId)) return c.json(NO_INSTANCE)
+
+			const presence = await getPresence<RoomInstance>(c.env.DB, playerId)
+			return c.json(presence?.roomInstance?.roomInstanceId ?? NO_INSTANCE)
 		}
 	)
 

@@ -332,6 +332,71 @@ describe('public endpoints', () => {
 		])
 	})
 
+	test('GET /tachyon?id=N answers the bare instance id the player is in', async () => {
+		// Ungated — no bearer token anywhere in this test. The player is named by the query.
+		const tachyon = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/tachyon${query}`)
+			expect(res.status).toBe(200)
+			return res.json()
+		}
+
+		// Nobody has presence for 4242, so they are in nothing. 0 rather than null: the body
+		// is a number, and a real instance id is never 0.
+		expect(await tachyon('?id=4242')).toBe(0)
+
+		// Put someone in a room the ordinary way, and the id is the one the matchmake handed
+		// them — the same field `/player` serves inside the whole presence blob.
+		const matchmake = await exports.default.fetch(`${ORIGIN}/matchmake/room/2`, {
+			method: 'POST',
+			headers: { ...(await bearer('4243')), 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({ JoinMode: '2' }).toString(),
+		})
+		const { roomInstance } = (await matchmake.json()) as {
+			roomInstance: { roomInstanceId: number } | null
+		}
+		expect(roomInstance).not.toBeNull()
+		expect(await tachyon('?id=4243')).toBe(roomInstance!.roomInstanceId)
+
+		// A synthetic instance id is a real answer and passes through — -2 is the Orientation
+		// presence `auth` seeds a new player with.
+		await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 4244,
+					roomInstance: { roomInstanceId: -2 },
+					statusVisibility: 0,
+					deviceClass: 0,
+					vrMovementMode: 1,
+					platform: 0,
+					appVersion: GAME_VERSION,
+					expiresAt: Math.floor(Date.now() / 1000) + 900,
+				})
+			)
+			.run()
+		expect(await tachyon('?id=4244')).toBe(-2)
+
+		// An expired row is not presence, so its player is in nothing.
+		await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 4245,
+					roomInstance: { roomInstanceId: 987 },
+					statusVisibility: 0,
+					deviceClass: 0,
+					vrMovementMode: 1,
+					platform: 0,
+					appVersion: GAME_VERSION,
+					expiresAt: Math.floor(Date.now() / 1000) - 60,
+				})
+			)
+			.run()
+		expect(await tachyon('?id=4245')).toBe(0)
+
+		// No id, and an unparseable one, answer the same 0 rather than erroring.
+		expect(await tachyon('')).toBe(0)
+		expect(await tachyon('?id=notanumber')).toBe(0)
+	})
+
 	test('GET /player?id=&id= returns one payload per id, in order', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/player?id=1070&id=1380`)
 		const players = (await res.json()) as Array<{ playerId: number; isOnline: boolean }>
@@ -2654,6 +2719,7 @@ describe('auth-gated endpoints', () => {
 			'GET /room/{roomId}/instances',
 			'GET /rooms/requiring/developer',
 			'GET /rooms/requiring/rrplus',
+			'GET /tachyon',
 			'POST /invite',
 			'POST /matchmake/club/{clubId}',
 			'POST /matchmake/dorm',

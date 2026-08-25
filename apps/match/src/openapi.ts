@@ -401,3 +401,15 @@ export const InviteResponse = z.object({
 		.nullable()
 		.describe('The room the invite points at; null when the room instance didn’t resolve'),
 })
+
+/**
+ * `GET /tachyon?id=…` — the room instance a player is in, as a BARE NUMBER: the whole body
+ * is the id, with no object around it.
+ *
+ * 0 means "not in one" — no live presence for that account, an expired row, or no `id`
+ * given. Presence rows carry synthetic ids too, which are passed through as they stand:
+ * -2 is the Orientation seed the `auth` worker writes for a brand-new player.
+ */
+export const InstanceIdResponse = z
+	.int()
+	.describe('The player’s room instance id, or 0 when they are not in one')
