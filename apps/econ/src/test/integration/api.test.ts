@@ -31,7 +31,7 @@ import { CHALLENGE_GIFT_SCHEMA_DDL, CHALLENGE_STATUS_SCHEMA_DDL } from '../../ch
 // The live weekly rotation, generated the same way the worker generates it, so the challenge
 // tests exercise whatever this week actually holds instead of ids from a rotation that has
 // since rolled over.
-import { buildRotation, rotationIndex } from '../../challenge-rotation'
+import { buildRotation, rotationIndex, withWeeklyGift } from '../../challenge-rotation'
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import { EQUIPMENT_SCHEMA_DDL, grantEquipment } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
@@ -1910,6 +1910,45 @@ describe('econ endpoints', () => {
 		expect(rotationIndex(nextWeek)).toBe(rotationIndex(at) + 1)
 		expect(buildRotation(nextWeek).ChallengeMapId).toBe(buildRotation(at).ChallengeMapId + 1)
 		expect(buildRotation(nextWeek).StartAt).toBe(buildRotation(at).EndAt)
+	})
+
+	test('the week is themed on the name of the item it rolls', async () => {
+		// `ChallengeThemeString` is the reward's catalog FriendlyName. The static file ships it
+		// empty on purpose — a generated week's gift isn't known until it is rolled — so the
+		// theming happens where the pick does.
+		const pool = [
+			{
+				GiftDropId: 11,
+				EquipmentPrefabName: '[ShareCamera]',
+				EquipmentModificationGuid: 'guid-a',
+				Rarity: 30,
+				FriendlyName: 'Camera Skin (Comic)',
+			},
+			{
+				GiftDropId: 12,
+				EquipmentPrefabName: '[Boombox]',
+				EquipmentModificationGuid: 'guid-b',
+				Rarity: 20,
+				FriendlyName: 'Boombox (Neon)',
+			},
+		]
+		const at = new Date('2026-08-25T12:00:00Z')
+		const themed = withWeeklyGift(buildRotation(at), pool)
+		const rolled = pool.find((p) => p.GiftDropId === themed.Gift.GiftDropId)
+		expect(rolled).toBeDefined()
+		expect(themed.ChallengeThemeString).toBe(rolled!.FriendlyName)
+
+		// An empty pool (the catalog didn't load) leaves the rotation as it was rather than
+		// theming the week on nothing.
+		expect(withWeeklyGift(buildRotation(at), []).ChallengeThemeString).toBe(
+			buildRotation(at).ChallengeThemeString
+		)
+
+		// And over the live catalog the route serves a real name, not the placeholder.
+		const served = (await (
+			await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`)
+		).json()) as { ChallengeThemeString: string }
+		expect(served.ChallengeThemeString).not.toBe('')
 	})
 
 	test('every generated week is five valid, distinct challenges', async () => {

@@ -325,6 +325,12 @@ export interface WeeklyChallengeRotation {
 	Challenges: RotationChallenge[]
 	Gift: ChallengeGiftBlock
 	FallbackGiftName: string
+	/**
+	 * What the week is themed on — the FriendlyName of the item its `Gift` hands over, set
+	 * by {@link withWeeklyGift} once the catalog has named the roll. The static file's value
+	 * is only a placeholder: a generated week's reward isn't known until it is rolled. A
+	 * PINNED rotation keeps whatever string it ships.
+	 */
 	ChallengeThemeString: string
 }
 
@@ -334,6 +340,8 @@ export interface EquipmentGift {
 	EquipmentPrefabName: string
 	EquipmentModificationGuid: string
 	Rarity: number
+	/** The catalog's display name for the item — what the week is themed on. */
+	FriendlyName: string
 }
 
 /** Whether the shipped file pins the week, in which case nothing here is generated. */
@@ -564,22 +572,31 @@ function pickChallenges(random: () => number): RotationChallenge[] {
  * Null when the pool is empty (the catalog didn't load), and the caller keeps the static
  * file's block so the reward preview is still something rather than nothing.
  */
-function pickWeeklyGift(mapId: number, pool: EquipmentGift[]): ChallengeGiftBlock | null {
+function pickWeeklyGift(
+	mapId: number,
+	pool: EquipmentGift[]
+): { gift: ChallengeGiftBlock; friendlyName: string } | null {
 	if (pool.length === 0) return null
 	const random = mulberry32(seedFor(mapId, 0x9e3779b9))
 	const gift = pool[Math.floor(random() * pool.length)] as EquipmentGift
+	// The name comes back alongside rather than on the block: the block is the wire shape,
+	// whose display strings are optional and left unset here so `toChallengeGiftDrop` keeps
+	// resolving them from the catalog entry that sells the item.
 	return {
-		GiftDropId: gift.GiftDropId,
-		AvatarItemDesc: '',
-		AvatarItemType: 0,
-		ConsumableItemDesc: '',
-		EquipmentPrefabName: gift.EquipmentPrefabName,
-		EquipmentModificationGuid: gift.EquipmentModificationGuid,
-		StorefrontType: 0,
-		Xp: 0,
-		Level: 0,
-		GiftContext: 0,
-		GiftRarity: gift.Rarity,
+		friendlyName: gift.FriendlyName,
+		gift: {
+			GiftDropId: gift.GiftDropId,
+			AvatarItemDesc: '',
+			AvatarItemType: 0,
+			ConsumableItemDesc: '',
+			EquipmentPrefabName: gift.EquipmentPrefabName,
+			EquipmentModificationGuid: gift.EquipmentModificationGuid,
+			StorefrontType: 0,
+			Xp: 0,
+			Level: 0,
+			GiftContext: 0,
+			GiftRarity: gift.Rarity,
+		},
 	}
 }
 
@@ -631,6 +648,11 @@ export function withWeeklyGift(
 	pool: EquipmentGift[]
 ): WeeklyChallengeRotation {
 	if (pinnedRotation() !== null) return rotation
-	const gift = pickWeeklyGift(rotation.ChallengeMapId, pool)
-	return gift === null ? rotation : { ...rotation, Gift: gift }
+	const picked = pickWeeklyGift(rotation.ChallengeMapId, pool)
+	if (picked === null) return rotation
+	// The week is themed on its reward: `ChallengeThemeString` is the item's catalog name,
+	// which is the same string `toChallengeGiftDrop` resolves for the grant, so the heading
+	// and the thing handed over read as one. The static file's value is a placeholder — it
+	// can't name an item that is rolled per week.
+	return { ...rotation, Gift: picked.gift, ChallengeThemeString: picked.friendlyName }
 }

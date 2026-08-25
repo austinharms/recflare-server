@@ -701,6 +701,9 @@ function toEquipmentGiftPool(catalog: StoreItem[]): EquipmentGift[] {
 			EquipmentPrefabName: item.GiftDrop.EquipmentPrefabName,
 			EquipmentModificationGuid: item.GiftDrop.EquipmentModificationGuid,
 			Rarity: item.GiftDrop.Rarity,
+			// Carried so the rotation can theme the week on the item it rolled; the grant path
+			// resolves the same name from this entry when it hands the item over.
+			FriendlyName: item.GiftDrop.FriendlyName,
 		}))
 }
 
