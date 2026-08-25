@@ -10,6 +10,7 @@ import { NotificationType } from '../../../notify/src/notification-types'
 import {
 	createEvent,
 	deleteEvent,
+	EVENT_DELETED_RESULT,
 	eventInputRejection,
 	getEventAttendees,
 	getEventById,
@@ -45,6 +46,7 @@ import {
 	PlayerEventAccessibilityRequest,
 	PlayerEventBaseDto,
 	PlayerEventBulkInviteRequest,
+	PlayerEventDeletedDto,
 	PlayerEventDescriptionRequest,
 	PlayerEventDetailsDto,
 	PlayerEventDto,
@@ -693,8 +695,9 @@ export const eventRoutes = new Hono<App>({ strict: false })
 	// which is how the reference exposes it, and a client that reaches for the HTTP verb
 	// instead should not get a 404 for being right.
 	//
-	// Answers the v2 envelope carrying the event as it WAS, so the caller can report what it
-	// removed; an unknown event is 404, and someone else's is 403.
+	// Answers the v2 envelope with both payload fields nulled —
+	// `{ PlayerEvent: null, Result: 0, TagModifyResult: null }`, which is what the reference
+	// sends: there is nothing left to redraw. An unknown event is 404, and someone else's 403.
 	.on(
 		['POST', 'DELETE'],
 		'/api/playerevents/v2/delete/:eventId{[0-9]+}',
@@ -706,12 +709,14 @@ export const eventRoutes = new Hono<App>({ strict: false })
 				'whose attendee rows outlived it would still be counted, and its tags would still ' +
 				'answer `#tag` searches.\n\n' +
 				'Creator only: anyone else gets 403, and an unknown event 404. Answers the v2 ' +
-				'envelope carrying the event as it was just before it went. Both POST and DELETE ' +
-				'reach it — the path names the verb, which is the form the client uses.',
+				'envelope with `PlayerEvent` and `TagModifyResult` both null — the event is gone, ' +
+				'so there is nothing for the client to redraw from, and it reads only `Result`. ' +
+				'Both POST and DELETE reach it — the path names the verb, which is the form the ' +
+				'client uses.',
 			security: AUTHED,
 			parameters: [idParam('eventId', 'Event id')],
 			responses: {
-				200: json(PlayerEventResultDto, 'The event that was deleted'),
+				200: json(PlayerEventDeletedDto, 'The nulled envelope a delete answers with'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: { description: 'Not the event’s creator (empty body)' },
 				404: { description: 'No such event (empty body)' },
@@ -726,12 +731,10 @@ export const eventRoutes = new Hono<App>({ strict: false })
 			if (existing === null) return c.body(null, 404)
 			if (existing.CreatorPlayerId !== id) return c.body(null, 403)
 
-			// Read the tags before the delete takes them, so the envelope can still report what
-			// the event carried.
-			const tags = await getEventTags(c.env.DB, eventId)
-			const deleted = await deleteEvent(c.env.DB, eventId)
-			// deleteEvent only answers null when the row vanished, which the read above rules out.
-			return c.json(toEventResult(deleted!, tags))
+			await deleteEvent(c.env.DB, eventId)
+			// Both payload fields are null here — the delete envelope is not the one the other
+			// v2 routes answer with. Nothing is left to redraw, and the client reads `Result`.
+			return c.json(EVENT_DELETED_RESULT)
 		}
 	)
 

@@ -213,6 +213,25 @@ export function toEventResult(event: PlayerEvent, tags: EventTag[] = []): Player
 }
 
 /**
+ * The envelope a DELETE answers with. Both payload fields are null: the reference reports
+ * only that the delete happened, and the client reads nothing but `Result` — there is no
+ * event left to redraw. Deliberately NOT {@link toEventResult}'s shape, even though both
+ * are the v2 envelope.
+ */
+export interface PlayerEventDeletedResult {
+	PlayerEvent: null
+	Result: number
+	TagModifyResult: null
+}
+
+/** The one value {@link PlayerEventDeletedResult} ever takes: a successful delete. */
+export const EVENT_DELETED_RESULT: PlayerEventDeletedResult = {
+	PlayerEvent: null,
+	Result: 0,
+	TagModifyResult: null,
+}
+
+/**
  * The projection of an event carried on a hub notification frame (`PlayerEventCreated`
  * and its siblings). Deliberately NOT the stored record, in three ways — don't unify
  * them:

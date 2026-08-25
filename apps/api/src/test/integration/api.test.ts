@@ -4603,12 +4603,9 @@ describe('player events', () => {
 
 		const res = await post(`/api/playerevents/v2/delete/${eventId}`, {})
 		expect(res.status).toBe(200)
-		// The envelope carries the event as it was, tags included — the caller can report
-		// what it removed.
-		const body = (await res.json()) as PlayerEventResult
-		expect(body.Result).toBe(0)
-		expect(body.PlayerEvent.PlayerEventId).toBe(eventId)
-		expect(body.PlayerEvent.Tags).toEqual(['meetup'])
+		// Both payload fields are null: the event is gone, so the envelope reports only that
+		// the delete succeeded. NOT the shape the other v2 routes answer with.
+		expect(await res.json()).toEqual({ PlayerEvent: null, Result: 0, TagModifyResult: null })
 
 		// Gone, and nothing left hanging off it: orphan RSVPs would keep being counted and
 		// orphan tags would keep answering `#tag` searches.
