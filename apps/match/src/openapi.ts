@@ -205,8 +205,9 @@ export const ConnectionExperiments = z.object({
  * `{ success, value, error }` envelope. The applications and region are fixed for
  * recflare; what varies per caller is `photonAuthToken` (minted for them on the spot)
  * and `photonRoomId`, the Photon room of the instance their presence says they're in
- * — the same name every other player in that instance is handed. There's no separate
- * voice server, so both voice fields are null. `photonRegion` matches the one stamped
+ * — the same name every other player in that instance is handed. The voice fields name
+ * the Tachyon voice server (`TACHYON_HOST_PORT`/`TACHYON_NAME` vars), empty when none
+ * is configured. `photonRegion` matches the one stamped
  * on every room instance, so the two can't disagree.
  */
 export const ConnectionInfo = z.object({
@@ -216,8 +217,10 @@ export const ConnectionInfo = z.object({
 	photonChatAppId: z.string().describe('Photon Chat application id'),
 	photonRegion: z.string().describe('Region id, matching a room instance’s `photonRegion`'),
 	photonRoomId: z.string().describe('The caller’s current instance; empty when they’re in none'),
-	voiceConnectionInfo: z.literal('').describe('Empty — no separate voice server'),
-	voiceServerId: z.literal('').describe('Empty — no separate voice server'),
+	voiceConnectionInfo: z
+		.string()
+		.describe('The Tachyon voice server, `host:port`; empty when none is configured'),
+	voiceServerId: z.string().describe('The Tachyon voice server id; empty when none is configured'),
 	experiments: ConnectionExperiments,
 })
 

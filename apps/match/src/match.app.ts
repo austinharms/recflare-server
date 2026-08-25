@@ -2150,8 +2150,9 @@ const app = new Hono<App>()
 				'The realtime (Photon) credentials the caller should connect with, in a',
 				'`{ success, value, error }` envelope: a freshly minted `photonAuthToken`, the',
 				'Photon application ids, and the `photonRoomId` of the instance the caller is in',
-				'(from their presence, falling back to the `roomInstanceId` query param). There is',
-				'no separate voice server, so the voice fields are null. `experiments` carries the',
+				'(from their presence, falling back to the `roomInstanceId` query param). The voice',
+				'fields carry the Tachyon voice server (`TACHYON_HOST_PORT`/`TACHYON_NAME`),',
+				'empty when none is configured. `experiments` carries the',
 				'client’s networking flags.',
 			].join(' '),
 			security: AUTHED,
@@ -2205,12 +2206,13 @@ const app = new Hono<App>()
 					photonAuthToken,
 					...apps,
 					photonRoomId,
-					// Empty strings rather than null: there's no separate voice server either
-					// way, and the client's decoder is likelier to accept a missing-value string
-					// than a null on a string field. The presence payload's
-					// NULL_CONNECTION_INFO keeps its nulls — that one never carries credentials.
-					voiceConnectionInfo: '',
-					voiceServerId: '',
+					// The Tachyon voice server, from the operator's vars — empty strings when
+					// unset (no separate voice server). Empty rather than null: the client's
+					// decoder is likelier to accept a missing-value string than a null on a
+					// string field. The presence payload's NULL_CONNECTION_INFO keeps its
+					// nulls — that one never carries credentials.
+					voiceConnectionInfo: varOr(c.env.TACHYON_HOST_PORT, ''),
+					voiceServerId: varOr(c.env.TACHYON_NAME, ''),
 					experiments: PHOTON_EXPERIMENTS,
 				},
 				error: null,
