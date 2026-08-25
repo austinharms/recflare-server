@@ -2584,6 +2584,181 @@ describe('rooms endpoints', () => {
 		expect(tagsIn(byCoOwner)).toContain('spooky')
 	})
 
+	it('PUT /rooms/:id/tags sets the primary genre from primaryGenreTag', async () => {
+		type TagResult = {
+			success: boolean
+			error: string
+			value: { Tags?: Array<{ Tag: string; Type: number; IsPrimaryGenre?: boolean }> } | null
+		}
+		const tags = async (res: Response) => ((await res.json()) as TagResult).value?.Tags ?? []
+		const genre = (list: Awaited<ReturnType<typeof tags>>) =>
+			list.filter((t) => t.IsPrimaryGenre).map((t) => t.Tag)
+
+		// Same gates as the toggle body — the second shape doesn't open a second door.
+		expect((await putForm('/rooms/4/tags', { primaryGenreTag: 'social' })).status).toBe(401)
+		expect((await putForm('/rooms/4/tags', { primaryGenreTag: 'social' }, '999')).status).toBe(403)
+		// A blank value is a malformed post, not "unset the genre".
+		expect(
+			await (await putForm('/rooms/4/tags', { primaryGenreTag: '  ' }, '1')).json()
+		).toMatchObject({ success: false, error: 'You must provide a tag!' })
+
+		// Room 4 is seeded with the auto-derived `rro` (Type 2); add an ordinary tag too, so
+		// the genre can be seen not to disturb either of them.
+		await putForm('/rooms/4/tags', { tag: 'puzzle' }, '1')
+
+		// The genre tag is ADDED when the room lacks it — a Type 0 tag, flagged.
+		const set = await tags(await putForm('/rooms/4/tags', { primaryGenreTag: 'social' }, '1'))
+		expect(set).toContainEqual({ Tag: 'social', Type: 0, IsPrimaryGenre: true })
+		// …and the key is absent on the others rather than false.
+		expect(set).toContainEqual({ Tag: 'puzzle', Type: 0 })
+
+		// Choosing another genre MOVES the flag. Unlike the old five-way radio it does not
+		// remove the tag it displaced: `social` stays on the room, just no longer the genre.
+		const moved = await tags(await putForm('/rooms/4/tags', { primaryGenreTag: 'horror' }, '1'))
+		expect(genre(moved)).toEqual(['horror'])
+		expect(moved.map((t) => t.Tag).sort()).toEqual(['horror', 'puzzle', 'rro', 'social'])
+
+		// A tag the room already carries keeps its Type and simply becomes the genre — the
+		// seeded `rro` is Type 2 and stays Type 2.
+		const promoted = await tags(await putForm('/rooms/4/tags', { primaryGenreTag: 'rro' }, '1'))
+		expect(promoted).toContainEqual({ Tag: 'rro', Type: 2, IsPrimaryGenre: true })
+		expect(genre(promoted)).toEqual(['rro'])
+
+		// Stored on the row, so a cold read says the same thing.
+		expect(
+			await env.DB.prepare(
+				'SELECT tag, is_primary_genre FROM room_tag WHERE room_id = 4 AND is_primary_genre = 1'
+			).all<{ tag: string; is_primary_genre: number }>()
+		).toMatchObject({ results: [{ tag: 'rro', is_primary_genre: 1 }] })
+		const read = (await (await SELF.fetch(`${ORIGIN}/rooms/4`)).json()) as {
+			Tags: Array<{ Tag: string; IsPrimaryGenre?: boolean }>
+		}
+		expect(read.Tags.filter((t) => t.IsPrimaryGenre).map((t) => t.Tag)).toEqual(['rro'])
+
+		// The toggle body still works on the same room, and toggling the flagged tag off
+		// takes the genre with it — the room's genre WAS that tag.
+		const toggledOff = await tags(await putForm('/rooms/4/tags', { tag: 'rro' }, '1'))
+		expect(toggledOff.map((t) => t.Tag)).not.toContain('rro')
+		expect(genre(toggledOff)).toEqual([])
+		// …while toggling an unrelated tag leaves a genre alone.
+		await putForm('/rooms/4/tags', { primaryGenreTag: 'social' }, '1')
+		const other = await tags(await putForm('/rooms/4/tags', { tag: 'campfire' }, '1'))
+		expect(genre(other)).toEqual(['social'])
+
+		// A `tag` alongside the genre is a whole-state save, NOT a toggle: `campfire` stays
+		// rather than being toggled back off. (The set semantics themselves are next.)
+		const both = await tags(
+			await putForm('/rooms/4/tags', { tag: 'campfire', primaryGenreTag: 'puzzle' }, '1')
+		)
+		expect(genre(both)).toEqual(['puzzle'])
+		expect(both.map((t) => t.Tag)).toContain('campfire')
+
+		// Put room 4 back the way it was seeded — its `rro` tag is what the rro feeds count.
+		await env.DB.batch([
+			env.DB.prepare('DELETE FROM room_tag WHERE room_id = 4'),
+			env.DB.prepare(
+				"INSERT INTO room_tag (room_id, tag, type, is_primary_genre) VALUES (4, 'rro', 2, 0)"
+			),
+		])
+	})
+
+	it('PUT /rooms/:id/tags takes the whole-state save: repeated tag, autoTag, genre', async () => {
+		type Tag = { Tag: string; Type: number; IsPrimaryGenre?: boolean }
+		// A room of this test's own: the whole-state save REPLACES the user tags, and doing
+		// that to a seeded room would strip tags the feeds above are asserted on.
+		const ROOM = 9700
+		await env.DB.prepare('INSERT INTO room (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					RoomId: ROOM,
+					Name: 'TagSaveRoom',
+					CreatorAccountId: 1,
+					IsDorm: false,
+					Accessibility: 1,
+					SubRooms: [],
+				})
+			)
+			.run()
+
+		const save = async (query: string, sub = '1') => {
+			const res = await SELF.fetch(`${ORIGIN}/rooms/${ROOM}/tags`, {
+				method: 'PUT',
+				headers: {
+					...(await bearer(sub)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: query,
+			})
+			expect(res.status).toBe(200)
+			const body = (await res.json()) as { success: boolean; value: { Tags?: Tag[] } | null }
+			expect(body.success).toBe(true)
+			return [...(body.value?.Tags ?? [])].sort((a, b) => a.Tag.localeCompare(b.Tag))
+		}
+
+		// The form room settings posts. `tag` repeats — without `all: true` on the parse only
+		// the last would arrive, and a three-tag save would land as one.
+		const saved = await save(
+			'autoTag=limitsv2&tag=roleplay&tag=social&tag=sports&primaryGenreTag=roleplay'
+		)
+		expect(saved).toEqual([
+			{ Tag: 'limitsv2', Type: 1 },
+			{ Tag: 'roleplay', Type: 0, IsPrimaryGenre: true },
+			{ Tag: 'social', Type: 0 },
+			{ Tag: 'sports', Type: 0 },
+		])
+
+		// Idempotent — the same save twice is the same room. This is why a lone `tag` toggles
+		// but a `tag` in company does not: toggling here would clear the room on every save.
+		expect(
+			await save('autoTag=limitsv2&tag=roleplay&tag=social&tag=sports&primaryGenreTag=roleplay')
+		).toEqual(saved)
+
+		// `tag` is the COMPLETE user set: dropping one removes it. The auto tag is NOT the
+		// client's to send here and survives a save that never mentions it.
+		expect(await save('tag=roleplay&primaryGenreTag=roleplay')).toEqual([
+			{ Tag: 'limitsv2', Type: 1 },
+			{ Tag: 'roleplay', Type: 0, IsPrimaryGenre: true },
+		])
+
+		// autoTag is additive and repeatable, and re-categorises a tag the room already has
+		// rather than duplicating it — `tag` is the table's key, so there is one row per name.
+		expect(await save('autoTag=beta&autoTag=roleplay')).toEqual([
+			{ Tag: 'beta', Type: 1 },
+			{ Tag: 'limitsv2', Type: 1 },
+			// Was a Type 0 user tag; posting it as an auto tag moves its category, and the
+			// genre flag rides along with the row.
+			{ Tag: 'roleplay', Type: 1, IsPrimaryGenre: true },
+		])
+
+		// An autoTag alone is a valid request — it names no `tag`, and must not be refused
+		// for it.
+		const bare = await save('autoTag=limitsv2')
+		expect(bare.map((t) => t.Tag)).toContain('limitsv2')
+
+		// A save that names no user tags at all clears them, leaving the derived ones.
+		expect((await save('tag=&autoTag=limitsv2')).map((t) => t.Tag)).toEqual([
+			'beta',
+			'limitsv2',
+			'roleplay',
+		])
+
+		// Same gates as every other body.
+		expect(
+			(
+				await SELF.fetch(`${ORIGIN}/rooms/${ROOM}/tags`, {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+					body: 'autoTag=limitsv2',
+				})
+			).status
+		).toBe(401)
+
+		await env.DB.batch([
+			env.DB.prepare('DELETE FROM room_tag WHERE room_id = ?1').bind(ROOM),
+			env.DB.prepare('DELETE FROM room WHERE room_id = ?1').bind(ROOM),
+		])
+	})
+
 	// Tags live in `room_tag`, not in the room blob (migration 0013). These pin the
 	// invariant that makes that safe: the table is the only copy, and the DTO is rebuilt
 	// from it on read.

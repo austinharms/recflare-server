@@ -200,8 +200,9 @@ const CuratedListFields = {
 	Description: z.string().nullable(),
 	ImageName: z
 		.string()
+		.nullable()
 		.describe(
-			'Must be a STRING — the client reads it straight into a string field. `DefaultRoomImage.jpg` where nothing set one; empty or null renders a blank tile.'
+			'A STRING on any list the client draws a tile for — it reads this straight into a string field, and empty or null renders that tile blank. `DefaultRoomImage.jpg` where nothing set one. Null only on a list with no tile to draw, like the `RoomGenreTags` capture, whose items are genre names rather than rooms.'
 		),
 	Type: z.int().describe('The `ListEntityType` — what the `ItemIds` are'),
 	ItemIds: z

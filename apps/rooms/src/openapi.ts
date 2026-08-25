@@ -132,10 +132,20 @@ export const RoomRoleDto = z.object({
 	InvitedRole: z.int(),
 })
 
-/** A tag on a room. `Type` 0 = set by the owner, 2 = auto-derived (e.g. `rro`). */
+/**
+ * A tag on a room. `Type` 0 = set by the owner, 2 = auto-derived (e.g. `rro`).
+ *
+ * `IsPrimaryGenre` marks the one tag that is the room's genre, and is PRESENT ONLY on
+ * that tag — the key is absent on the others rather than sent as false. It is orthogonal
+ * to `Type`: the flagged tag is an ordinary owner-set tag that happens to be the genre.
+ */
 export const RoomTagDto = z.object({
 	Tag: z.string(),
-	Type: z.int().describe('0 = owner-set, 2 = auto'),
+	Type: z.int().describe('0 = owner-set, 1 = client-derived (`autoTag`), 2 = server-derived'),
+	IsPrimaryGenre: z
+		.literal(true)
+		.optional()
+		.describe('Present only on the room’s primary genre tag; absent, never false, on the rest'),
 })
 
 /**
@@ -524,9 +534,33 @@ export const NameRequest = z.object({
 	name: z.string().describe('Non-empty, and not already taken by another room'),
 })
 
-/** `PUT /rooms/{roomId}/tags` — a toggle, not a set. */
+/**
+ * `PUT /rooms/{roomId}/tags` — one route, two bodies, told apart by their FIELDS.
+ *
+ * A lone `tag` is the 2023 toggle: added when absent, removed when present. A `tag`
+ * alongside anything else is part of a whole-state save, where nothing toggles — `tag`
+ * repeats and is the complete user-tag set, `autoTag` adds a derived (Type 1) tag, and
+ * `primaryGenreTag` flags the genre. They compose into one write.
+ */
 export const TagRequest = z.object({
-	tag: z.string().describe('Added when absent, removed when present'),
+	tag: z
+		.union([z.string(), z.array(z.string())])
+		.optional()
+		.describe(
+			'Alone: toggled (added when absent, removed when present). Alongside any other field, or repeated: the COMPLETE set of user (Type 0) tags — an omitted one is removed'
+		),
+	autoTag: z
+		.union([z.string(), z.array(z.string())])
+		.optional()
+		.describe(
+			'A derived tag to add at Type 1 (`limitsv2`, `beta`). Repeatable and additive — never removes one'
+		),
+	primaryGenreTag: z
+		.string()
+		.optional()
+		.describe(
+			'Set as the room’s primary genre. Added as a Type 0 tag if the room lacks it; every other tag keeps its place and loses the flag'
+		),
 })
 
 /** `PUT /rooms/{roomId}/image`. */

@@ -4,6 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
 	Accessibility,
+	applyRoomTagEdit,
 	areFriends,
 	autocompleteRoomSearch,
 	banPlayerFromRoom,
@@ -51,7 +52,6 @@ import {
 	setSubRoomPermissions,
 	toggleCheer,
 	toggleFavorite,
-	toggleRoomTag,
 	unbanPlayerFromRoom,
 	updateRoomFields,
 } from '@repo/domain'
@@ -1687,25 +1687,54 @@ const app = new Hono<App>()
 		}
 	)
 
-	// Toggle a tag on a room. Auth-gated (401) and owner/co-owner-only (403). Body is
-	// the `tag` form field. There's no delete/patch endpoint, so this call toggles: it
-	// adds the tag (Type 0) if absent and removes it if present. The "main" tags
-	// (#pvp/#quest/#game/#hangout/#art) are radio buttons — setting one clears the
-	// others. Returns the `{ success, error, value }` envelope with the updated
-	// room as `value`; business failures are 200 with success:false.
+	// Change a room's tags. Auth-gated (401) and owner/co-owner-only (403). Returns the
+	// `{ success, error, value }` envelope with the updated room as `value`; business
+	// failures are 200 with success:false.
+	//
+	// TWO BODIES reach this one path — Rec Room reshaped the request rather than minting a
+	// second route, so the fields, not the URL, say which one this is:
+	//
+	//  - `tag=<name>` ALONE is the 2023 toggle. There is no delete/patch counterpart, so
+	//    the same call adds the tag (Type 0) when absent and removes it when present, and
+	//    the five "main" tags (pvp/quest/game/hangout/art) act as radio buttons.
+	//  - Anything else is the whole-state save both clients send from room settings:
+	//    `autoTag=limitsv2&tag=roleplay&tag=social&tag=sports&primaryGenreTag=roleplay`.
+	//    `tag` repeats and is the complete set of USER tags, `autoTag` adds a derived one
+	//    (Type 1), and `primaryGenreTag` flags the genre. All three compose into one write.
+	//
+	// The discriminator is deliberately "is there more than a lone `tag`": a save that
+	// happens to carry one selected tag must not TOGGLE it back off, which is what made
+	// this worth spelling out rather than counting `tag` alone.
 	.put(
 		'/rooms/:roomId{[0-9]+}/tags',
 		describeRoute({
 			tags: ['Room settings'],
 			summary: 'Toggle a tag on a room',
 			description: [
-				'Owner or co-owner only (403 otherwise). There is no delete/patch counterpart, so',
-				'this call TOGGLES: it adds the tag (Type 0) when absent and removes it when',
-				'present. The “main” tags (`pvp`/`quest`/`game`/`hangout`/`art`) behave as radio',
-				'buttons — setting one clears the others. Answers the lowercase envelope with the',
-				'updated room, which the client re-renders from, and pushes a `RoomUpdate` to the',
-				'owner for their other sessions.',
-			].join(' '),
+				'Owner or co-owner only (403 otherwise). Two bodies reach this one path, and the',
+				'FIELDS say which — not the URL.',
+				'',
+				'**A lone `tag=<name>` TOGGLES** (the 2023 form): there is no delete/patch',
+				'counterpart, so the same call adds the tag (Type 0) when absent and removes it when',
+				'present, and the “main” tags (`pvp`/`quest`/`game`/`hangout`/`art`) behave as radio',
+				'buttons among themselves.',
+				'',
+				'**Anything else is a whole-state save** — the form room settings posts, e.g.',
+				'`autoTag=limitsv2&tag=roleplay&tag=social&tag=sports&primaryGenreTag=roleplay`.',
+				'Nothing toggles here; the three fields compose into one write:',
+				'',
+				'- `tag` repeats and is the COMPLETE set of user (Type 0) tags — one the body omits',
+				'is removed. Derived tags are not the client’s to send and are left alone.',
+				'- `autoTag` repeats and adds a derived tag at **Type 1** (`limitsv2`, `beta`). It is',
+				'additive: it never removes one, since the client posts what it wants rather than the',
+				'full set. A tag already on the room is re-categorised rather than duplicated.',
+				'- `primaryGenreTag` flags the room’s genre. The tag is added as a Type 0 tag when',
+				'the room lacks it and left as it stands when it has it; `IsPrimaryGenre: true` moves',
+				'onto it, and every OTHER tag loses the flag but KEEPS its place.',
+				'',
+				'Answers the lowercase envelope with the updated room, which the client re-renders',
+				'from, and pushes a `RoomUpdate` to the owner for their other sessions.',
+			].join('\n'),
 			security: AUTHED,
 			parameters: [roomIdParam],
 			requestBody: form(TagRequest, 'The tag to toggle'),
@@ -1726,11 +1755,34 @@ const app = new Hono<App>()
 			// already returned 401 for a missing/invalid token).
 			if (!canManageRoom(room, accountId)) return c.body(null, 403)
 
-			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
-			const tag = typeof body.tag === 'string' ? body.tag.trim() : ''
-			if (tag === '') return roomEnvelope(c, null, 'You must provide a tag!')
+			// `all: true` because `tag` REPEATS on the whole-state save; without it Hono keeps
+			// only the last value and a three-tag save would land as one tag.
+			const body: Record<string, unknown> = await c.req.parseBody({ all: true }).catch(() => ({}))
+			// An empty value is the same nothing as an absent field. There is no "clear the
+			// genre" request, so a blank `primaryGenreTag` is a malformed post rather than an
+			// instruction to unset — and a blank `tag` can't name what to toggle.
+			const values = (name: string): string[] =>
+				(Array.isArray(body[name]) ? body[name] : [body[name]])
+					.filter((v): v is string => typeof v === 'string')
+					.map((v) => v.trim())
+					.filter((v) => v !== '')
 
-			const updated = await toggleRoomTag(c.env.DB, roomId, room, tag)
+			const tags = values('tag')
+			const autoTags = values('autoTag')
+			const primaryGenre = values('primaryGenreTag')[0]
+			if (tags.length === 0 && autoTags.length === 0 && primaryGenre === undefined) {
+				return roomEnvelope(c, null, 'You must provide a tag!')
+			}
+
+			// A LONE tag is the 2023 toggle; a tag alongside anything else — another tag, an
+			// auto tag, a genre — is part of a whole-state save, where nothing toggles.
+			const isToggle = tags.length === 1 && autoTags.length === 0 && primaryGenre === undefined
+			const updated = await applyRoomTagEdit(c.env.DB, roomId, room, {
+				toggle: isToggle ? tags[0] : undefined,
+				tags: isToggle ? undefined : tags.length > 0 ? tags : undefined,
+				autoTags,
+				primaryGenre,
+			})
 			// This one DOES answer the updated room, so the caller's own client redraws from
 			// the response; the push is for their other sessions, as on every mutation below.
 			await pushRoomUpdate(c, accountId, updated)

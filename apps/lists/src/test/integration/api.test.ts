@@ -9,6 +9,8 @@ import {
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
+import curatedLists from '../../../static/curated-lists.json'
+
 import type { Env } from '../../context'
 
 declare module 'cloudflare:test' {
@@ -240,38 +242,52 @@ it('serves one curated list object, not a collection', async () => {
 })
 
 it('serves every capture in static/curated-lists.json by name', async () => {
-	// One array holds every list, and each entry must be reachable by the keys the client
-	// asks with. `ImageName` must be a string even when empty — the client parses it into
-	// one — while `Description` may be null. The ids the client caches against have to be
-	// unique and reach it with their digits intact.
-	const names = [
-		'Discovery.PageSource.PlayExplore',
-		'Discovery.PageSource.PlayLibrary',
-		'RoomCategories.MoodPlaylists.AlgoEndpoint.FeelingLucky',
-	]
+	// Driven by the file itself, so a capture added to it is a capture this covers: each
+	// entry must be reachable by the three keys the client asks with, and come back as
+	// itself. The ids the client caches against have to be unique and reach it with their
+	// digits intact.
+	expect(curatedLists.length).toBeGreaterThan(0)
 	const seen = new Set<string>()
-	for (const name of names) {
-		const res = await SELF.fetch(`${ORIGIN}/curatedlists?creatorAccountId=1&type=7&name=${name}`)
+	for (const capture of curatedLists) {
+		const res = await SELF.fetch(
+			`${ORIGIN}/curatedlists?creatorAccountId=${capture.CreatorAccountId}` +
+				`&type=${capture.Type}&name=${capture.Name}`
+		)
 		expect(res.status).toBe(200)
 		const body = await res.text()
 		// Never a quoted id: the client's field is a number.
 		expect(body).toMatch(/"ListId":\d+,/)
-		const list = JSON.parse(body) as {
-			ListId: number
-			Type: number
-			Name: string
-			ItemIds: string[]
-			Description: string | null
-			ImageName: string
-		}
-		expect(list.Name).toBe(name)
-		expect(list.Type).toBe(7)
-		expect(list.ItemIds.length).toBeGreaterThan(0)
-		expect(typeof list.ImageName).toBe('string')
+		const { ListId: _id, ...rest } = JSON.parse(body) as Record<string, unknown>
+		const { ListId: _captured, ...expected } = capture as Record<string, unknown>
+		expect(rest).toEqual(expected)
+		expect((capture.ItemIds as string[]).length).toBeGreaterThan(0)
 		const id = /"ListId":(\d+),/.exec(body)?.[1]
+		expect(id).toBe(capture.ListId)
 		expect(seen.has(id!)).toBe(false)
 		seen.add(id!)
 	}
+})
+
+it('serves the RoomGenreTags capture with its tag names', async () => {
+	// Genre NAMES, not room or section ids — and the one capture with a null `ImageName`,
+	// since the client draws no tile for it. Served under type 5, where the other captures
+	// are type 7.
+	const res = await SELF.fetch(
+		`${ORIGIN}/curatedlists?creatorAccountId=1&type=5&name=RoomGenreTags`
+	)
+	expect(res.status).toBe(200)
+	const body = await res.text()
+	expect(body).toContain('"ListId":1')
+	expect(JSON.parse(body)).toEqual({
+		ListId: 1,
+		CreatorAccountId: 1,
+		Name: 'RoomGenreTags',
+		Description: '',
+		ImageName: null,
+		Type: 5,
+		ItemIds: ['quest', 'battle', 'roleplay', 'horror', 'hangout', 'casual', 'explore'],
+		CreatedAt: '2026-01-01T00:00:00Z',
+	})
 })
 
 it('matches the name case-insensitively and prefers it over the type', async () => {
