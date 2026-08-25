@@ -413,3 +413,16 @@ export const InviteResponse = z.object({
 export const InstanceIdResponse = z
 	.int()
 	.describe('The player’s room instance id, or 0 when they are not in one')
+
+/**
+ * `GET /clubhousesearch/mostactivenow` — one row per clubhouse someone is standing in
+ * right now, busiest first.
+ *
+ * A bare array, and only the clubs with players in them: an empty clubhouse is absent
+ * rather than listed with a `PlayerCount` of 0, so a quiet server answers `[]`.
+ */
+export const ActiveClubhouseDto = z.object({
+	RoomId: z.int().describe('The club’s clubhouse room'),
+	ClubId: z.int().describe('The club that clubhouse belongs to'),
+	PlayerCount: z.int().describe('How many players are in the room this second'),
+})

@@ -2464,6 +2464,47 @@ export async function getRecommendedRooms(
 	)
 }
 
+/**
+ * Trending ("rising") rooms — the listable rooms someone is standing in RIGHT NOW, busiest
+ * first. What the `rising` carousel is filled from.
+ *
+ * This is the one feed where live presence FILTERS rather than merely ranks: the hot feed
+ * sorts by head-count but still lists the empty rooms underneath it, and a carousel of
+ * rooms nobody is in is not trending. So a quiet server serves an EMPTY carousel rather
+ * than falling back to stored engagement — a room with no one in it has not risen.
+ *
+ * Ties break the way the hot feed's do (stored engagement, then RoomId), so equally busy
+ * rooms page stably.
+ */
+export async function getTrendingRooms(
+	db: D1Database,
+	skip: number,
+	take: number
+): Promise<{ Results: Room[]; TotalResults: number }> {
+	const players = await countPlayersByRoom(db)
+	// Nobody anywhere: nothing can be trending, and the room table needn't be read at all.
+	if (players.size === 0) return { Results: [], TotalResults: 0 }
+
+	const { results } = await db
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${LISTABLE_WHERE}`)
+		.all<RoomRow>()
+	const stats = await getRoomStats(db)
+	const playerCount = (r: Room): number => players.get(roomIdOf(r)) ?? 0
+	const rooms = parseAll(results)
+		.filter((r) => isListable(r) && playerCount(r) > 0)
+		.sort(
+			(a, b) =>
+				playerCount(b) - playerCount(a) ||
+				hotScore(b, stats) - hotScore(a, stats) ||
+				roomIdOf(a) - roomIdOf(b)
+		)
+
+	return {
+		Results: await hydrateRooms(db, rooms.slice(skip, skip + take), stats),
+		TotalResults: rooms.length,
+	}
+}
+
 /** Compact room projection carried by a featured-room group. */
 export interface FeaturedRoom {
 	RoomId: number

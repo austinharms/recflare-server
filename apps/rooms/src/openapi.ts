@@ -816,6 +816,15 @@ export const RoomExperiencePlayer = z
 	.describe('Always empty — no per-room experience is tracked')
 
 /**
+ * `GET /rooms/curated_playlists` — the curated room playlists the discovery pages'
+ * playlist sections draw from. Nothing curates one on this server, so the list is always
+ * empty and the element shape is unknown until something fills it.
+ */
+export const CuratedPlaylists = z
+	.array(z.unknown())
+	.describe('Always empty — nothing curates a room playlist yet')
+
+/**
  * `GET /publishState/configs` — the limits the client enforces on republishing a room:
  * how many updates are allowed in the rolling window, and the cooldown/expiry around
  * them. Served as fixed values from the reference server.

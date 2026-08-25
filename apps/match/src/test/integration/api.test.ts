@@ -143,7 +143,8 @@ beforeAll(async () => {
 	await env.DB.prepare(
 		`CREATE TABLE IF NOT EXISTS club (
 			data TEXT NOT NULL,
-			club_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.ClubId')) VIRTUAL
+			club_id INTEGER GENERATED ALWAYS AS (json_extract(data, '$.ClubId')) VIRTUAL,
+			visibility INTEGER GENERATED ALWAYS AS (json_extract(data, '$.Visibility')) VIRTUAL
 		)`
 	).run()
 	await env.DB.prepare(
@@ -157,9 +158,26 @@ beforeAll(async () => {
 	).run()
 	const insertClub = env.DB.prepare('INSERT OR IGNORE INTO club (data) VALUES (?1)')
 	await env.DB.batch([
-		// Club 4 has room 2 as its clubhouse; club 5 has none set.
-		insertClub.bind(JSON.stringify({ ClubId: 4, Name: 'Clubbers', ClubhouseRoomId: 2 })),
-		insertClub.bind(JSON.stringify({ ClubId: 5, Name: 'Homeless', ClubhouseRoomId: null })),
+		// Club 4 has room 2 as its clubhouse; club 5 has none set. Both public and ordinary
+		// (`ClubType` 0), which is what the clubhouse search lists.
+		insertClub.bind(
+			JSON.stringify({
+				ClubId: 4,
+				Name: 'Clubbers',
+				ClubhouseRoomId: 2,
+				Visibility: 1,
+				ClubType: 0,
+			})
+		),
+		insertClub.bind(
+			JSON.stringify({
+				ClubId: 5,
+				Name: 'Homeless',
+				ClubhouseRoomId: null,
+				Visibility: 1,
+				ClubType: 0,
+			})
+		),
 	])
 	const insertMember = env.DB.prepare(
 		'INSERT INTO club_member (club_id, account_id, membership_type) VALUES (?1, ?2, ?3)'
@@ -330,6 +348,48 @@ describe('public endpoints', () => {
 				experiments: null,
 			},
 		])
+	})
+
+	test('GET /clubhousesearch/mostactivenow lists clubhouses with players in them', async () => {
+		// Ungated, like /tachyon — no bearer token anywhere in this test.
+		const busiest = async () => {
+			const res = await exports.default.fetch(`${ORIGIN}/clubhousesearch/mostactivenow`)
+			expect(res.status).toBe(200)
+			return (await res.json()) as Array<{ RoomId: number; ClubId: number; PlayerCount: number }>
+		}
+
+		// Nobody is in club 4's clubhouse (room 2) yet, and an empty clubhouse is absent
+		// rather than listed at zero — so a quiet server answers [].
+		expect(await busiest()).toEqual([])
+
+		const at = (accountId: number, roomId: number | null, ttl = 900) =>
+			JSON.stringify({
+				accountId,
+				roomInstance: roomId === null ? null : { roomInstanceId: 1000000 + accountId, roomId },
+				expiresAt: Math.floor(Date.now() / 1000) + ttl,
+			})
+		const seed = env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+		await env.DB.batch([
+			seed.bind(at(7001, 2)),
+			seed.bind(at(7002, 2)),
+			// Room 3 is nobody's clubhouse, and a lobby presence is in no room at all: neither
+			// can put a club in the list.
+			seed.bind(at(7003, 3)),
+			seed.bind(at(7004, null)),
+		])
+
+		expect(await busiest()).toEqual([{ RoomId: 2, ClubId: 4, PlayerCount: 2 }])
+
+		// Expired presence is nobody standing there.
+		await env.DB.prepare(
+			`UPDATE presence SET data = json_set(data, '$.expiresAt', ?1)
+			 WHERE account_id BETWEEN 7001 AND 7004`
+		)
+			.bind(Math.floor(Date.now() / 1000) - 60)
+			.run()
+		expect(await busiest()).toEqual([])
+
+		await env.DB.prepare('DELETE FROM presence WHERE account_id BETWEEN 7001 AND 7004').run()
 	})
 
 	test('GET /tachyon?id=N answers the bare instance id the player is in', async () => {
@@ -2712,6 +2772,7 @@ describe('auth-gated endpoints', () => {
 			)
 		)
 		expect([...documented].sort()).toEqual([
+			'GET /clubhousesearch/mostactivenow',
 			'GET /player',
 			'GET /player/avoidjuniors',
 			'GET /player/connection-info',

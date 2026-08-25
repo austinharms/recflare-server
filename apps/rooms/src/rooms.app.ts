@@ -34,6 +34,7 @@ import {
 	getSubRoomPermissions,
 	getSubRoomSaveById,
 	getSubRoomSaves,
+	getTrendingRooms,
 	getVisitedRooms,
 	isPlayerBannedFromRoom,
 	modifySubRoom,
@@ -76,6 +77,7 @@ import {
 	CloneRoomRequest,
 	CloningRequest,
 	CreateSubRoomRequest,
+	CuratedPlaylists,
 	DescriptionRequest,
 	DormRoomId,
 	FeaturedRoomGroupDto,
@@ -861,6 +863,58 @@ const app = new Hono<App>()
 			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
 			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
 			return c.json(await getHotRooms(c.env.DB, tag, skip, take))
+		}
+	)
+
+	// Curated room playlists — the editorially grouped room lists the discovery pages'
+	// `PlaylistById` sections draw from. Nothing curates one yet, so this is an empty array:
+	// the client reads that as "no playlists" and simply draws no playlist rows, where a 404
+	// leaves it retrying a feed that isn't coming.
+	.get(
+		'/rooms/curated_playlists',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'Curated room playlists',
+			description: [
+				'The curated room playlists the discovery pages’ playlist sections draw from. There',
+				'is no editorial curation on this server yet, so this is always an empty array —',
+				'which the client reads as “no playlists” and draws nothing, rather than the 404 it',
+				'would keep retrying.',
+			].join(' '),
+			responses: { 200: json(CuratedPlaylists, 'Always an empty list') },
+		}),
+		(c) => c.json([])
+	)
+
+	// The `rising` carousel — the discovery pages fill a `CarouselEndpoint` section by
+	// slug, and this is the one the client asks for by name. Trending means someone is IN
+	// the room right now: unlike the hot feed, which ranks by head-count but still lists
+	// the empty rooms underneath, this one FILTERS on live presence, so a quiet server
+	// serves an empty carousel rather than a stale one.
+	//
+	// Paged like the hot feed (`skip`/`take`, take defaults to 100) and answers the same
+	// `{ Results, TotalResults }` envelope its sibling feeds do. Only `rising` is served —
+	// the other slugs in the discovery catalogue (`foryou`, `staffpicks`, the
+	// `*_algoendpoint` rows) keep 404ing until each is given a feed of its own.
+	.get(
+		'/rooms/carousel/rising',
+		describeRoute({
+			tags: ['Discovery'],
+			summary: 'The “rising” rooms carousel',
+			description: [
+				'The rooms players are in RIGHT NOW, busiest first — the trending carousel. Live',
+				'presence is a filter here, not just a sort: a room nobody is standing in is absent',
+				'entirely, so this is empty when the server is quiet rather than falling back to',
+				'stored engagement the way `/rooms/hot` does. Ties break on engagement and then',
+				'RoomId, so equally busy rooms page stably. Public, non-dorm, listable rooms only.',
+			].join(' '),
+			parameters: pageParams(100),
+			responses: { 200: json(PagedRooms, 'The carousel page') },
+		}),
+		async (c) => {
+			const skip = Number.parseInt(c.req.query('skip') ?? '0', 10) || 0
+			const take = Number.parseInt(c.req.query('take') ?? '100', 10) || 100
+			return c.json(await getTrendingRooms(c.env.DB, skip, take))
 		}
 	)
 

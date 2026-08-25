@@ -17,6 +17,7 @@ import {
 	getExpiredPresenceInstanceIds,
 	getFriendIds,
 	getJoinableInstance,
+	getMostActiveClubhouses,
 	getOrCreateDormRoom,
 	getPresence,
 	getPresences,
@@ -30,6 +31,7 @@ import {
 	isPlayerBannedFromRoom,
 	MatchmakingErrorCode,
 	MessageType,
+	MOST_ACTIVE_CLUBHOUSE_LIMIT,
 	recordRoomVisit,
 	refreshInstanceFullness,
 	RoomInstanceType,
@@ -52,6 +54,7 @@ import { getEventById, getEventResponse } from '../../api/src/events-db'
 // deps), so /invite sends a typed MessageReceived frame instead of a magic number.
 import { NotificationType } from '../../notify/src/notification-types'
 import {
+	ActiveClubhouseDto,
 	AUTHED,
 	AvoidJuniorsRequest,
 	AvoidJuniorsResponse,
@@ -1444,6 +1447,36 @@ const app = new Hono<App>()
 			const presence = await getPresence<RoomInstance>(c.env.DB, playerId)
 			return c.json(presence?.roomInstance?.roomInstanceId ?? NO_INSTANCE)
 		}
+	)
+
+	// The busiest clubhouses right now — a bare array of `{ RoomId, ClubId, PlayerCount }`,
+	// which is why it lives here rather than in `clubs`: the answer is live presence, and
+	// presence is this worker's. Active means someone is THERE, so an empty clubhouse is
+	// absent rather than listed at zero and a quiet server answers `[]`.
+	//
+	// Ungated, like `/tachyon`: nothing in it is per-caller, and it names only public clubs
+	// and how busy they are.
+	.get(
+		'/clubhousesearch/mostactivenow',
+		describeRoute({
+			tags: ['Presence'],
+			summary: 'The busiest clubhouses right now',
+			description: [
+				'One row per clubhouse with players in it this second, busiest first — a bare array',
+				'of `{ RoomId, ClubId, PlayerCount }`.',
+				'',
+				'Live presence FILTERS here rather than merely ranking: a club whose clubhouse is',
+				'empty is absent rather than listed with a `PlayerCount` of 0, and a club with no',
+				'clubhouse can never appear at all, so this is `[]` when nobody is anywhere. Public,',
+				'non-subscription clubs only — the same eligibility `clubs` `/club/search` applies,',
+				`since this is a search too. Ties break on ClubId, and at most ${MOST_ACTIVE_CLUBHOUSE_LIMIT} rows`,
+				'come back: it fills a carousel, not a directory.',
+				'',
+				'Ungated — nothing in the answer is per-caller.',
+			].join(' '),
+			responses: { 200: json(ActiveClubhouseDto.array(), 'The busiest clubhouses, or []') },
+		}),
+		async (c) => c.json(await getMostActiveClubhouses(c.env.DB))
 	)
 
 	.get(

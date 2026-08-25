@@ -890,6 +890,68 @@ describe('rooms endpoints', () => {
 		).run()
 	})
 
+	it('GET /rooms/curated_playlists is an empty list, not a 404', async () => {
+		const res = await SELF.fetch(`${ORIGIN}/rooms/curated_playlists`)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([])
+	})
+
+	it('GET /rooms/carousel/rising serves only rooms players are in, busiest first', async () => {
+		const rising = async (qs = '?skip=0&take=100') =>
+			(await (await SELF.fetch(`${ORIGIN}/rooms/carousel/rising${qs}`)).json()) as {
+				Results: Array<{ RoomId: number; IsDorm?: boolean }>
+				TotalResults: number
+			}
+
+		// Nobody is anywhere in the fixture, and an empty carousel is the honest answer —
+		// this feed does NOT fall back to engagement the way /rooms/hot does.
+		expect(await rising()).toEqual({ Results: [], TotalResults: 0 })
+
+		// Pick from the tail of the hot feed so the order below can only come from presence.
+		const hot = (
+			(await (await SELF.fetch(`${ORIGIN}/rooms/hot?skip=0&take=100`)).json()) as {
+				Results: Array<{ RoomId: number }>
+			}
+		).Results.map((r) => r.RoomId)
+		const busiest = hot[hot.length - 1]
+		const quieter = hot[hot.length - 2]
+
+		const expiresAt = Math.floor(Date.now() / 1000) + 900
+		const seed = env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+		await env.DB.batch(
+			[
+				{ accountId: 90101, roomInstance: { roomInstanceId: 1001001, roomId: busiest } },
+				{ accountId: 90102, roomInstance: { roomInstanceId: 1001002, roomId: busiest } },
+				{ accountId: 90103, roomInstance: { roomInstanceId: 1001003, roomId: quieter } },
+				// The dorm nobody may list, and a lobby presence in no room at all: neither
+				// puts a room in the carousel.
+				{ accountId: 90104, roomInstance: { roomInstanceId: 1001004, roomId: 1 } },
+				{ accountId: 90105, roomInstance: null },
+			].map((p) => seed.bind(JSON.stringify({ ...p, expiresAt })))
+		)
+
+		const busy = await rising()
+		expect(busy.Results.map((r) => r.RoomId)).toEqual([busiest, quieter])
+		expect(busy.TotalResults).toBe(2)
+		expect(busy.Results.some((r) => r.RoomId === 1 || r.IsDorm === true)).toBe(false)
+
+		// Paged like its sibling feeds: TotalResults stays the full count.
+		expect(await rising('?skip=0&take=1')).toMatchObject({ TotalResults: 2 })
+		expect((await rising('?skip=0&take=1')).Results.map((r) => r.RoomId)).toEqual([busiest])
+		expect((await rising('?skip=1&take=100')).Results.map((r) => r.RoomId)).toEqual([quieter])
+
+		// Presence that has expired is nobody standing there.
+		await env.DB.prepare(
+			`UPDATE presence SET data = json_set(data, '$.expiresAt', ?1)
+			 WHERE account_id BETWEEN 90101 AND 90105`
+		)
+			.bind(Math.floor(Date.now() / 1000) - 1)
+			.run()
+		expect(await rising()).toEqual({ Results: [], TotalResults: 0 })
+
+		await env.DB.prepare('DELETE FROM presence WHERE account_id BETWEEN 90101 AND 90105').run()
+	})
+
 	it('GET /rooms/hot aliases #recroomoriginal to the rro tag', async () => {
 		const aliased = (await (
 			await SELF.fetch(`${ORIGIN}/rooms/hot?tag=recroomoriginal`)
@@ -3746,8 +3808,10 @@ describe('rooms endpoints', () => {
 			'GET /rooms/autocomplete_search',
 			'GET /rooms/base',
 			'GET /rooms/bulk',
+			'GET /rooms/carousel/rising',
 			'GET /rooms/contributedby/me',
 			'GET /rooms/createdby/me',
+			'GET /rooms/curated_playlists',
 			'GET /rooms/favoritedby/me',
 			'GET /rooms/hot',
 			'GET /rooms/ownedby/me',
