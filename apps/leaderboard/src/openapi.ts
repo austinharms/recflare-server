@@ -9,8 +9,9 @@ import type { OpenAPIV3_1 } from 'openapi-types'
  * IMPORTANT: these are DESCRIPTIVE ONLY. They are passed to `describeRoute` to generate
  * the spec and are never wired into `hono-openapi`'s `validator()`. Same rationale as the
  * auth/accounts/econ/match workers: a reverse-engineered protocol, lenient handlers, no
- * runtime validation. Here it matters more than usual — the handlers do not parse their
- * bodies at all yet, so a body that contradicts the schema below is still answered.
+ * runtime validation. Here it matters more than usual — three of the four handlers do not
+ * parse their bodies at all, and the fourth reads one field, so a body that contradicts the
+ * schema below is still answered.
  *
  * Do NOT add `.meta({ id })` to these schemas — with this hono-openapi + zod v4 setup a
  * meta'd schema used in a response emits a `$ref` the framework doesn't always hoist into
@@ -34,7 +35,7 @@ function toOpenApiSchema(schema: z.ZodType): OpenAPIV3_1.SchemaObject {
 	return jsonSchema as OpenAPIV3_1.SchemaObject
 }
 
-/** An `application/json` request body — what the client posts to both reads. */
+/** An `application/json` request body — every leaderboard route takes one. */
 export function jsonBody(schema: z.ZodType, description: string): OpenAPIV3_1.RequestBodyObject {
 	return { description, content: { 'application/json': { schema: toOpenApiSchema(schema) } } }
 }
@@ -58,6 +59,32 @@ export const LeaderboardRows = z.object({
 		.describe('The board’s rows. Always empty — nothing is scored or stored yet.'),
 })
 
+/**
+ * `POST /leaderboard/GetPlayerRank` — one player's standing on one board, e.g.
+ * `{"PlayerId":205,"Score":4200,"Rank":17}`.
+ *
+ * Three fields only: none of the board selectors the request names are echoed back, so the
+ * client matches the answer to the question by having asked it. Nothing is scored here yet,
+ * so `Rank` is a constant sentinel and `Score` is zero — see the route for why that pairing
+ * rather than a rank of 0, which would read as "first place".
+ */
+export const PlayerRank = z.object({
+	PlayerId: z.int().describe('Echoed from the request — whose rank this is'),
+	Score: z.int().describe('The stat value behind the rank. Always 0 — nothing is scored yet'),
+	Rank: z.int().describe('1-based position on the board. Always 99999 — an unranked sentinel'),
+})
+
+/**
+ * `POST /leaderboard/CheckAndSetStat` — a BARE JSON number, not an envelope and not a
+ * `{ value }` wrapper. The whole body is `0`.
+ *
+ * What the number means beyond "not an error" hasn't been recovered from the client; `0` is
+ * what the live service answers, so it is what this answers.
+ */
+export const CheckAndSetStatResponse = z
+	.literal(0)
+	.describe('Always the bare number 0 — the result code the live service returns')
+
 // ---- Request schemas -------------------------------------------------------
 
 /**
@@ -74,8 +101,41 @@ export const GetRanksBody = z.object({
 	PlayerId: z.int().describe('The player reading the board'),
 	StatChannel: z.int().describe('Which of the room’s tracked stats to rank on'),
 	RoomId: z.int().describe('The room whose board is being read'),
-	FilterType: z.int().describe('Client-side filter selector; its members aren’t known yet'),
+	FilterType: z.int().describe('Who the board counts: 0 Global, 1 Friends'),
 	SortAscending: z.boolean().describe('false ranks highest-first, the usual leaderboard'),
+})
+
+/**
+ * The body the client posts to `GetPlayerRank`, e.g.
+ * `{"PlayerId":205,"StatChannel":2,"RoomId":14,"FilterType":0,"SortAscending":false}`.
+ *
+ * The same board selectors {@link GetRanksBody} carries, minus the slice — this asks about
+ * one player rather than a page. Only `PlayerId` is read today, to echo it back.
+ */
+export const GetPlayerRankBody = z.object({
+	PlayerId: z.int().describe('The player whose rank is being asked for'),
+	StatChannel: z.int().describe('Which of the room’s tracked stats to rank on'),
+	RoomId: z.int().describe('The room whose board is being read'),
+	FilterType: z.int().describe('Who the board counts: 0 Global, 1 Friends'),
+	SortAscending: z.boolean().describe('false ranks highest-first, the usual leaderboard'),
+})
+
+/**
+ * The body the client posts to `CheckAndSetStat`, e.g.
+ * `{"StatChannel":2,"RoomId":14,"StatValue":1,"CurrentStatValue":null}`.
+ *
+ * A compare-and-set: `CurrentStatValue` is what the client believes is already stored (null
+ * when it believes nothing is), and `StatValue` is what it wants stored. There is no
+ * `PlayerId` — the stat belongs to whoever is calling.
+ */
+export const CheckAndSetStatBody = z.object({
+	StatChannel: z.int().describe('Which of the room’s tracked stats is being written'),
+	RoomId: z.int().describe('The room the stat belongs to'),
+	StatValue: z.number().describe('The value to store'),
+	CurrentStatValue: z
+		.number()
+		.nullable()
+		.describe('What the client believes is stored now; null when it believes nothing is'),
 })
 
 /**
