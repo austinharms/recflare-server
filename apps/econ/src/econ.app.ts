@@ -2070,11 +2070,17 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// Favourite/un-favourite owned equipment. [Authorize]. The client PUTs the entries
-	// it wants changed (one request can carry several) and reads nothing back. Only
+	// Favourite/un-favourite owned equipment. [Authorize]. The client sends the entries it
+	// wants changed (one request can carry several) and reads nothing back. Only
 	// `Favorited` is written — the rest of each entry is the client echoing what it was
 	// served, and a guid the caller doesn't own matches no row and is dropped.
-	.put(
+	//
+	// PUT or POST: the client uses both spellings for this one call, with an identical body
+	// either way, so they are the same route rather than two handlers. A 404 on the POST
+	// leaves the star drawn on the item the client already redrew, and the favourite
+	// silently doesn't stick.
+	.on(
+		['PUT', 'POST'],
 		'/api/equipment/v1/update',
 		describeRoute({
 			tags: ['Equipment'],
@@ -2082,7 +2088,8 @@ const app = new Hono<App>({ strict: false })
 			description: [
 				'Applies the posted `Favorited` flags to the caller’s owned equipment, matched by',
 				'`ModificationGuid`. Everything else in each entry is ignored, and a guid the caller',
-				'doesn’t own is silently skipped. Empty body on success.',
+				'doesn’t own is silently skipped. Empty body on success. Accepts PUT or POST — the',
+				'client uses both, with the same body.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: jsonBody(EquipmentUpdateRequest, 'The entries to update'),

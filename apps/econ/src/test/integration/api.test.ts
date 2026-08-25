@@ -1094,9 +1094,9 @@ describe('econ endpoints', () => {
 		expect(await unlocked()).toHaveLength(1)
 
 		// Favouriting sticks.
-		const update = async (favorited: boolean) =>
+		const update = async (favorited: boolean, method: 'PUT' | 'POST' = 'PUT') =>
 			exports.default.fetch(`${ORIGIN}/api/equipment/v1/update`, {
-				method: 'PUT',
+				method,
 				headers: { ...(await bearer('31')), 'Content-Type': 'application/json' },
 				body: JSON.stringify([
 					{ PrefabName: '[DiscGolfDisc]', ModificationGuid: guid, Favorited: favorited },
@@ -1113,22 +1113,75 @@ describe('econ endpoints', () => {
 		expect((await update(false)).status).toBe(200)
 		after = await unlocked()
 		expect(after[0].Favorited).toBe(false)
+
+		// The client sends this as a POST too, with the same body — same effect.
+		expect((await update(true, 'POST')).status).toBe(200)
+		expect((await unlocked())[0]?.Favorited).toBe(true)
+		expect((await update(false, 'POST')).status).toBe(200)
+		expect((await unlocked())[0]?.Favorited).toBe(false)
 	})
 
-	test('PUT /api/equipment/v1/update 401s without a token, 400s on a non-array body', async () => {
-		const anon = await exports.default.fetch(`${ORIGIN}/api/equipment/v1/update`, {
-			method: 'PUT',
-			headers: { 'Content-Type': 'application/json' },
-			body: '[]',
-		})
-		expect(anon.status).toBe(401)
+	test('POST /api/equipment/v1/update favourites from the client’s own body', async () => {
+		// The body verbatim as the client sends it — a full echo of the entry it was served,
+		// of which only `Favorited` is read.
+		const post = async (favorited: boolean, sub = '33') =>
+			exports.default.fetch(`${ORIGIN}/api/equipment/v1/update`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
+				body: JSON.stringify([
+					{
+						PrefabName: '[ShareCamera]',
+						ModificationGuid: 'g5u0weNLmkCLeUXFUVn74Q',
+						FriendlyName: 'Camera Skin (Comic)',
+						Tooltip: 'ShareCamera Comic Debug: 2121',
+						Rarity: 5,
+						Favorited: favorited,
+					},
+				]),
+			})
 
-		const bad = await exports.default.fetch(`${ORIGIN}/api/equipment/v1/update`, {
-			method: 'PUT',
-			headers: { ...(await bearer('32')), 'Content-Type': 'application/json' },
-			body: '{}',
+		// Nothing owned yet: the guid matches no row, so this is a silent no-op, not an error.
+		expect((await post(true)).status).toBe(200)
+
+		await grantEquipment(env.DB, 33, {
+			PrefabName: '[ShareCamera]',
+			ModificationGuid: 'g5u0weNLmkCLeUXFUVn74Q',
+			FriendlyName: 'Camera Skin (Comic)',
+			Tooltip: 'ShareCamera Comic Debug: 2121',
+			Rarity: 5,
+			PlatformMask: -1,
+			Favorited: false,
 		})
-		expect(bad.status).toBe(400)
+		const owned = async () => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/equipment/v2/getUnlocked`, {
+				headers: await bearer('33'),
+			})
+			return (await res.json()) as Array<{ ModificationGuid: string; Favorited: boolean }>
+		}
+		expect((await owned())[0]?.Favorited).toBe(false)
+
+		expect((await post(true)).status).toBe(200)
+		expect((await owned())[0]?.Favorited).toBe(true)
+		expect((await post(false)).status).toBe(200)
+		expect((await owned())[0]?.Favorited).toBe(false)
+	})
+
+	test('equipment/v1/update 401s without a token, 400s on a non-array body (PUT and POST)', async () => {
+		for (const method of ['PUT', 'POST'] as const) {
+			const anon = await exports.default.fetch(`${ORIGIN}/api/equipment/v1/update`, {
+				method,
+				headers: { 'Content-Type': 'application/json' },
+				body: '[]',
+			})
+			expect(anon.status).toBe(401)
+
+			const bad = await exports.default.fetch(`${ORIGIN}/api/equipment/v1/update`, {
+				method,
+				headers: { ...(await bearer('32')), 'Content-Type': 'application/json' },
+				body: '{}',
+			})
+			expect(bad.status).toBe(400)
+		}
 	})
 
 	test('POST /api/storefronts/v2/buyItem 409s when the sent price no longer matches', async () => {
@@ -2770,6 +2823,7 @@ describe('econ endpoints', () => {
 			'POST /api/checklist/v1/complete',
 			'POST /api/checklist/v2/complete',
 			'POST /api/consumables/v1/consume',
+			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
 			'POST /api/items/bulkpurchase',
 			'POST /api/objectives/v1/cleargroup',
