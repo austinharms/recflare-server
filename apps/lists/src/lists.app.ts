@@ -1,4 +1,5 @@
 import { Hono } from 'hono'
+import { describeRoute, openAPIRouteHandler } from 'hono-openapi'
 import { useWorkersLogger } from 'workers-tagged-logger'
 
 import {
@@ -10,10 +11,30 @@ import {
 	getRecentlyUpdatedRooms,
 	getVisitedRooms,
 } from '@repo/domain'
-import { withNotFound, withOnError } from '@repo/hono-helpers'
+import { withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
 import { resolveCuratedList, serializeCuratedList } from './curated-lists'
+import {
+	ALGORITHMIC_LIST_PARAM,
+	ALGORITHMIC_TYPE_PARAM,
+	AlgorithmicList,
+	AUTHED,
+	ContextualFeaturesAck,
+	CREATOR_ACCOUNT_ID_PARAM,
+	CuratedListRead,
+	CuratedListSaved,
+	CuratedListsBulk,
+	form,
+	ITEM_ID_PARAM,
+	json,
+	LIST_IDS_PARAM,
+	LIST_NAME_PARAM,
+	LIST_TYPE_PARAM,
+	SAVE_LIST_NAME_PARAM,
+	SaveItemBody,
+	UNAUTHORIZED_RESPONSE,
+} from './openapi'
 
 import type { Context } from 'hono'
 import type { CuratedList, Room } from '@repo/domain'
@@ -305,29 +326,62 @@ const app = new Hono<App>()
 	.onError(withOnError())
 	.notFound(withNotFound())
 
-	.get('/', async (c) => {
-		return c.text('hello, world!')
-	})
+	// Root health check.
+	.get(
+		'/',
+		describeRoute({
+			tags: ['Service'],
+			summary: 'Health check',
+			description: 'Liveness probe for the lists worker. No auth; the body is plain text.',
+			responses: {
+				200: {
+					description: 'Service is up',
+					content: { 'text/plain': { schema: { type: 'string', example: 'hello, world!' } } },
+				},
+			},
+		}),
+		async (c) => {
+			return c.text('hello, world!')
+		}
+	)
 
 	// Bulk curated-list lookup — the client asks for a set of lists by repeating `?id=`.
 	// Nothing curates lists here yet, so this serves one canned list: `ItemIds` are strings
 	// (not numbers) and `Description` may be null, but `ImageName` has to be a string — the
 	// client's parser reads it straight into a string field. A 404 shows as a failed load
 	// instead, so an unknown id still answers 200.
-	.get('/curatedlists/bulk', async (c) => {
-		return c.json([
-			{
-				ListId: 17859340,
-				CreatorAccountId: 1,
-				Name: 'My List',
-				Description: null,
-				ImageName: '',
-				Type: ListEntityType.Rooms,
-				ItemIds: ['123', '456'],
-				CreatedAt: '2025-07-18T00:00:00Z',
-			},
-		])
-	})
+	.get(
+		'/curatedlists/bulk',
+		describeRoute({
+			tags: ['Lists', '2025'],
+			summary: 'Curated lists by id',
+			description: [
+				'A set of curated lists, asked for by repeating `?id=`. Nothing curates lists here yet,',
+				'so this serves ONE canned list whatever is asked for — an unknown id included, because',
+				'a 404 shows as a row that failed to load rather than one the client hides.',
+				'',
+				'The canned list is shaped the way the client parses one: `ItemIds` are strings rather',
+				'than numbers, `Description` may be null, and `ImageName` has to be a string — the',
+				'client reads it straight into a string field.',
+			].join('\n'),
+			parameters: [LIST_IDS_PARAM],
+			responses: { 200: json(CuratedListsBulk, 'The canned list, as a one-element array') },
+		}),
+		async (c) => {
+			return c.json([
+				{
+					ListId: 17859340,
+					CreatorAccountId: 1,
+					Name: 'My List',
+					Description: null,
+					ImageName: '',
+					Type: ListEntityType.Rooms,
+					ItemIds: ['123', '456'],
+					CreatedAt: '2025-07-18T00:00:00Z',
+				},
+			])
+		}
+	)
 
 	// One curated list (`GET /curatedlists?creatorAccountId=&type=&name=`). The client reads
 	// back ONE list object — not a collection — and asks for two different things through the
@@ -350,21 +404,57 @@ const app = new Hono<App>()
 	// page's heading, which reads as real content rather than as a missing list. The
 	// exceptions are the client's own reserved playlists and a request naming no list at all;
 	// both are real answers, not misses (see `resolveCuratedList`).
-	.get('/curatedlists', async (c) => {
-		const creatorAccountId = c.req.query('creatorAccountId')
-		const type = c.req.query('type')
-		const name = c.req.query('name')
+	.get(
+		'/curatedlists',
+		describeRoute({
+			tags: ['Lists', '2025'],
+			summary: 'One curated list',
+			description: [
+				'ONE list object — not a collection — asked for with the same three parameters whether',
+				'the client wants a discovery PAGE’s row set or a PLAYER’s own playlist:',
+				'',
+				'- A page’s rows are a static capture in `static/curated-lists.json`, whose `ItemIds`',
+				'  are the discovery section keys the page is built from (not room ids).',
+				'- A player’s playlist lives in D1, in the `list` / `list_item` tables this worker owns.',
+				'  `__SavedForLater_Rooms` is the one the client creates for itself — the Play menu’s',
+				'  “Saved for Later” row, asked for with the player’s own id and `type=1` (Rooms), so its',
+				'  `ItemIds` are room ids.',
+				'',
+				'D1 is asked FIRST, so a player’s own list wins over a capture that happens to share its',
+				'name: the captures are this server’s fixtures and a player’s list is their data.',
+				'',
+				'Not auth-gated — the client names the owner rather than proving it, `Accessibility` is a',
+				'property of the list rather than of the reader, and the answer is only ever ids the',
+				'client then resolves itself.',
+				'',
+				'A name matching NEITHER 404s: answering it with an unrelated capture puts one page’s',
+				'rows under another page’s heading, which reads as real content rather than as a missing',
+				'list. The two exceptions are real answers rather than misses — a reserved `__` playlist',
+				'nobody owns yet comes back EMPTY, and a request naming no list at all gets the page',
+				'default for its `type`.',
+			].join('\n'),
+			parameters: [CREATOR_ACCOUNT_ID_PARAM, LIST_TYPE_PARAM, LIST_NAME_PARAM],
+			responses: {
+				200: json(CuratedListRead, 'The list'),
+				404: { description: 'No list of that name, and it is not a reserved playlist' },
+			},
+		}),
+		async (c) => {
+			const creatorAccountId = c.req.query('creatorAccountId')
+			const type = c.req.query('type')
+			const name = c.req.query('name')
 
-		const list =
-			(await ownedList(c, creatorAccountId, type, name)) ??
-			resolveCuratedList(creatorAccountId, type, name)
-		if (list === undefined) return c.notFound()
+			const list =
+				(await ownedList(c, creatorAccountId, type, name)) ??
+				resolveCuratedList(creatorAccountId, type, name)
+			if (list === undefined) return c.notFound()
 
-		// Serialized by hand rather than through `c.json`: the reference's `ListId`s are
-		// 64-bit and are carried as strings so their digits survive being parsed — see
-		// `serializeCuratedList`, which puts them back on the wire as numbers.
-		return c.body(serializeCuratedList(list), 200, { 'content-type': 'application/json' })
-	})
+			// Serialized by hand rather than through `c.json`: the reference's `ListId`s are
+			// 64-bit and are carried as strings so their digits survive being parsed — see
+			// `serializeCuratedList`, which puts them back on the wire as numbers.
+			return c.body(serializeCuratedList(list), 200, { 'content-type': 'application/json' })
+		}
+	)
 
 	// Save an item into one of the caller's own lists, creating the list if they don't have
 	// it yet (`PUT /curatedlists/:name/items/:itemId/createlistifneeded`) — what the client
@@ -378,37 +468,69 @@ const app = new Hono<App>()
 	//
 	// Answers the list as it now stands rather than an acknowledgement, so the row the client
 	// re-renders is the one this call just changed.
-	.put('/curatedlists/:name/items/:itemId/createlistifneeded', async (c) => {
-		const accountId = await authedId(c)
-		if (accountId === null) return unauthorized(c)
-
-		const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
-		const list = await addPlayerListItem(
-			c.env.DB,
-			{
-				creatorAccountId: accountId,
-				name: c.req.param('name'),
-				// The `ListEntityType`, saying what the item ids in this list ARE. Rooms when the
-				// body names none: every list the client creates this way is a room list, and the
-				// type is part of the list's identity, so guessing another would strand the list
-				// where the client's own read (`?type=1`) can't find it.
-				type: intField(body, c, 'type', ListEntityType.Rooms),
-				// PRIVATE by default. A list a player builds for themselves is theirs to see;
-				// the client sends `accessibility=0` and this only applies on creation anyway.
-				accessibility: intField(body, c, 'accessibility', Accessibility.Private),
+	.put(
+		'/curatedlists/:name/items/:itemId/createlistifneeded',
+		describeRoute({
+			tags: ['Lists', '2025'],
+			summary: 'Save an item into the caller’s list',
+			description: [
+				'Saves an item into one of the caller’s own lists, creating the list when they have none',
+				'by that name — what the client calls when someone saves a room for later. The path names',
+				'the list and the item; the form body carries `accessibility` and `type`, both of which',
+				'apply only on creation.',
+				'',
+				'AUTH-GATED, and the owner is the TOKEN’s account: unlike the read, this call names no',
+				'`creatorAccountId`, so the only account it could mean is the caller’s — and taking an',
+				'owner from the client would let anyone write into anyone’s list.',
+				'',
+				'Answers the list as it now stands rather than an acknowledgement, so the row the client',
+				're-renders is the one this call just changed. Saving the same item twice leaves it in',
+				'the list once.',
+				'',
+				'The response drops `Accessibility`, which the read keeps. That is a real difference in',
+				'what the client is sent, not an oversight — every other key, and their order, is the',
+				'read’s.',
+			].join('\n'),
+			security: AUTHED,
+			parameters: [SAVE_LIST_NAME_PARAM, ITEM_ID_PARAM],
+			requestBody: form(SaveItemBody, 'Applied only when the list is created'),
+			responses: {
+				200: json(CuratedListSaved, 'The list as it now stands, without `Accessibility`'),
+				401: UNAUTHORIZED_RESPONSE,
 			},
-			c.req.param('itemId')
-		)
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
 
-		// The SAVE's projection of a list drops `Accessibility`; the read's keeps it. That is a
-		// real difference in what the client is sent, not an oversight — don't unify them.
-		// Every other key, and their order, is the read's.
-		const { Accessibility: _accessibility, ...saved } = list
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const list = await addPlayerListItem(
+				c.env.DB,
+				{
+					creatorAccountId: accountId,
+					name: c.req.param('name'),
+					// The `ListEntityType`, saying what the item ids in this list ARE. Rooms when the
+					// body names none: every list the client creates this way is a room list, and the
+					// type is part of the list's identity, so guessing another would strand the list
+					// where the client's own read (`?type=1`) can't find it.
+					type: intField(body, c, 'type', ListEntityType.Rooms),
+					// PRIVATE by default. A list a player builds for themselves is theirs to see;
+					// the client sends `accessibility=0` and this only applies on creation anyway.
+					accessibility: intField(body, c, 'accessibility', Accessibility.Private),
+				},
+				c.req.param('itemId')
+			)
 
-		// Serialized by hand for the same reason the read is: the 64-bit `ListId` has to reach
-		// the client unquoted with every digit intact.
-		return c.body(serializeCuratedList(saved), 200, { 'content-type': 'application/json' })
-	})
+			// The SAVE's projection of a list drops `Accessibility`; the read's keeps it. That is a
+			// real difference in what the client is sent, not an oversight — don't unify them.
+			// Every other key, and their order, is the read's.
+			const { Accessibility: _accessibility, ...saved } = list
+
+			// Serialized by hand for the same reason the read is: the 64-bit `ListId` has to reach
+			// the client unquoted with every digit intact.
+			return c.body(serializeCuratedList(saved), 200, { 'content-type': 'application/json' })
+		}
+	)
 
 	// One discovery ROW's contents (`GET /algorithmiclists/:list?type=1`). `:list` is the row
 	// key the curated page above lists in its `ItemIds` (e.g.
@@ -422,54 +544,151 @@ const app = new Hono<App>()
 	// instead of one it hides. `Type` is echoed back from the query: it
 	// tells the client what the `Id`s ARE (rooms, players, …), so answering with a type the
 	// caller didn't ask for would have it resolve the ids against the wrong service.
-	.get('/algorithmiclists/:list', async (c) => {
-		// Echoed, but only when it fits the byte the client reads it back into — anything
-		// outside 0–255 can't round-trip, so a nonsense `?type=` gets the default instead of a
-		// number that would break the response on the way in.
-		const type = Number.parseInt(c.req.query('type') ?? '', 10)
-		const echoed = type >= 0 && type <= MAX_LIST_ENTITY_TYPE ? type : DEFAULT_ALGORITHMIC_LIST_TYPE
+	.get(
+		'/algorithmiclists/:list',
+		describeRoute({
+			tags: ['Lists', '2025'],
+			summary: 'One discovery row’s contents',
+			description: [
+				'The entities that fill one discovery row. `{list}` is the row key a curated page lists',
+				'in its `ItemIds` (e.g. `Rooms_Battle_AlgoEndpoint_PlayHighlight_TabsTest_Explore`), and',
+				'only the IDS travel — the client resolves each room or item itself.',
+				'',
+				'`HotList`, `recentlyupdated` and `new` are ranked live off the same room tables the',
+				'`rooms` worker’s browse feeds read, so a row and its feed can’t disagree. The',
+				'`*_algoendpoint` category rows serve the public rooms carrying one tag, busiest first.',
+				'`recentlyvisited` is per-caller and is the one row that reads the token; without one it',
+				'answers EMPTY rather than 401ing, since canned rooms would claim the caller visited',
+				'rooms they never did — and an empty carousel is what a brand-new account legitimately',
+				'has. A couple of store rows are hand-picked id lists.',
+				'',
+				'Every other row — an unknown key included — answers an EMPTY 200 rather than a 404,',
+				'which the client renders as a row that failed to load instead of one it hides.',
+			].join('\n'),
+			parameters: [ALGORITHMIC_LIST_PARAM, ALGORITHMIC_TYPE_PARAM],
+			responses: { 200: json(AlgorithmicList, 'The row’s entities, possibly none') },
+		}),
+		async (c) => {
+			// Echoed, but only when it fits the byte the client reads it back into — anything
+			// outside 0–255 can't round-trip, so a nonsense `?type=` gets the default instead of a
+			// number that would break the response on the way in.
+			const type = Number.parseInt(c.req.query('type') ?? '', 10)
+			const echoed =
+				type >= 0 && type <= MAX_LIST_ENTITY_TYPE ? type : DEFAULT_ALGORITHMIC_LIST_TYPE
 
-		const key = c.req.param('list').toLowerCase()
+			const key = c.req.param('list').toLowerCase()
 
-		// A per-caller row needs to know who is asking, so it is the one kind of row that
-		// reads the token. No token — or one that doesn't resolve — answers an EMPTY row
-		// rather than 401ing or falling through to the canned entities: this is a row about
-		// what the caller has done, and canned rooms would claim they visited rooms they
-		// never did. An empty carousel is also what a brand-new account legitimately has.
-		const personal = PERSONAL_ROW_FEEDS[key]
-		if (personal !== undefined) {
-			const accountId = await authedId(c)
-			const rooms = accountId === null ? [] : await personal(c.env.DB, accountId)
-			return c.json({ Type: echoed, Entities: toEntities(rooms) })
+			// A per-caller row needs to know who is asking, so it is the one kind of row that
+			// reads the token. No token — or one that doesn't resolve — answers an EMPTY row
+			// rather than 401ing or falling through to the canned entities: this is a row about
+			// what the caller has done, and canned rooms would claim they visited rooms they
+			// never did. An empty carousel is also what a brand-new account legitimately has.
+			const personal = PERSONAL_ROW_FEEDS[key]
+			if (personal !== undefined) {
+				const accountId = await authedId(c)
+				const rooms = accountId === null ? [] : await personal(c.env.DB, accountId)
+				return c.json({ Type: echoed, Entities: toEntities(rooms) })
+			}
+
+			// A row with a live feed behind it serves that; everything else gets the canned
+			// entities. Only the ids travel — the client resolves each room itself — so the
+			// ranking is read for its order and the room blobs are thrown away.
+			const feed = ROW_FEEDS[key]
+			if (feed !== undefined) {
+				return c.json({ Type: echoed, Entities: toEntities(await feed(c.env.DB)) })
+			}
+
+			// Then the hand-picked rows, which are already entities: the ids are the answer.
+			const canned = STATIC_ROW_ENTITIES[key]
+			if (canned !== undefined) {
+				return c.json({ Type: echoed, Entities: canned })
+			}
+
+			return c.json({ Type: echoed, Entities: ALGORITHMIC_LIST_ENTITIES })
 		}
-
-		// A row with a live feed behind it serves that; everything else gets the canned
-		// entities. Only the ids travel — the client resolves each room itself — so the
-		// ranking is read for its order and the room blobs are thrown away.
-		const feed = ROW_FEEDS[key]
-		if (feed !== undefined) {
-			return c.json({ Type: echoed, Entities: toEntities(await feed(c.env.DB)) })
-		}
-
-		// Then the hand-picked rows, which are already entities: the ids are the answer.
-		const canned = STATIC_ROW_ENTITIES[key]
-		if (canned !== undefined) {
-			return c.json({ Type: echoed, Entities: canned })
-		}
-
-		return c.json({ Type: echoed, Entities: ALGORITHMIC_LIST_ENTITIES })
-	})
+	)
 
 	// Contextual features — the client posts the context it's in and reads back whether the
 	// call was accepted. Auth-gated, and the answer is a bare `{ success, error_id, error }`
 	// with no payload: the reference server acknowledges the post and carries nothing back,
 	// so there is nothing here to serve statically beyond the acknowledgement itself. The
 	// body is read for the log only.
-	.post('/contextualfeatures', async (c) => {
-		const id = await authedId(c)
-		if (id === null) return unauthorized(c)
+	.post(
+		'/contextualfeatures',
+		describeRoute({
+			tags: ['Lists', '2025'],
+			summary: 'Acknowledge a contextual-features post',
+			description: [
+				'The client posts the context it is in and reads back whether the call was accepted.',
+				'Auth-gated, and the answer is a bare `{ success, error_id, error }` with no payload:',
+				'the reference server acknowledges the post and carries nothing back, so there is',
+				'nothing here to serve beyond the acknowledgement itself. The body is read for the log',
+				'only.',
+			].join('\n'),
+			security: AUTHED,
+			responses: {
+				200: json(ContextualFeaturesAck, 'Accepted'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
 
-		return c.json({ success: true, error_id: null, error: null })
-	})
+			return c.json({ success: true, error_id: null, error: null })
+		}
+	)
+
+// The generated spec. Documentation only — no request is validated against it (see
+// openapi.ts). `hide: true` keeps this route out of its own output.
+app.get(
+	'/openapi.json',
+	describeRoute({ hide: true }),
+	withCleanSpec(
+		openAPIRouteHandler(app, {
+			documentation: {
+				info: {
+					title: 'recflare lists',
+					version: '1.0.0',
+					description: [
+						'Curated and algorithmic lists for recflare, a private-server reimplementation of the',
+						'Rec Room backend. A discovery page is built from these: the `discovery` worker says',
+						'which carousels a page has, and this worker says what is in them.',
+						'',
+						'Two kinds of list. A CURATED list is named — either a static capture of a page’s row',
+						'set, or a player’s own playlist in D1 (`__SavedForLater_Rooms`, the Play menu’s',
+						'“Saved for Later”). An ALGORITHMIC list is a ranking asked for by row slug: the hot,',
+						'recently-updated and new feeds, the room categories, and the caller’s own recently',
+						'visited rooms.',
+						'',
+						'Only IDS travel. Every list answers ids the client resolves against the `rooms` and',
+						'`commerce` workers itself, which is why a list carries a `Type` saying what its ids',
+						'ARE — answering with a type the caller didn’t ask for would have it look the ids up',
+						'against the wrong service.',
+						'',
+						'A row with nothing behind it answers an empty 200 rather than a 404: the client',
+						'renders a failed row for an error and hides an empty one, and an empty carousel is',
+						'the honest answer for a ranking this server has nothing for.',
+						'',
+						'Reads are unauthenticated — the client names the owner rather than proving it, and a',
+						'list is only ever ids. Writing needs a token, since the list written into is the',
+						'caller’s own.',
+					].join('\n'),
+				},
+				servers: [{ url: 'https://lists.recflare.net', description: 'Production' }],
+				components: {
+					securitySchemes: {
+						bearerAuth: {
+							type: 'http',
+							scheme: 'bearer',
+							bearerFormat: 'JWT',
+							description: 'An `access_token` from the auth worker’s `POST /connect/token`.',
+						},
+					},
+				},
+			},
+		})
+	)
+)
 
 export default app

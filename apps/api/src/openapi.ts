@@ -729,6 +729,17 @@ export const PlayerEventResultDto = z.object({
 })
 
 /**
+ * The envelope a delete answers with. Same three keys as {@link PlayerEventResultDto},
+ * but both payload fields are null — the event is gone, so there is nothing to redraw
+ * and the client reads only `Result`.
+ */
+export const PlayerEventDeletedDto = z.object({
+	PlayerEvent: z.null(),
+	Result: z.int().describe('0 = success'),
+	TagModifyResult: z.null(),
+})
+
+/**
  * The JSON body of an event create / update. Every field is optional: create defaults
  * what's missing, update leaves anything absent at its stored value. The fields may be
  * posted at the top level or nested under `PlayerEvent` — the client posts back the

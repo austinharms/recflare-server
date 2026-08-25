@@ -936,3 +936,21 @@ it('serves the rows when there are more rooms than D1 allows bound parameters', 
 	await env.DB.prepare('DELETE FROM room WHERE room_id >= ?1').bind(FIRST).run()
 	await env.DB.prepare('DELETE FROM room_tag WHERE room_id >= ?1').bind(FIRST).run()
 })
+
+it('generates a spec with no dangling $refs', async () => {
+	const res = await SELF.fetch(`${ORIGIN}/openapi.json`)
+	expect(res.status).toBe(200)
+	const spec = (await res.json()) as { paths: Record<string, unknown> }
+	expect(Object.keys(spec.paths)).toEqual(
+		expect.arrayContaining([
+			'/curatedlists',
+			'/curatedlists/bulk',
+			'/curatedlists/{name}/items/{itemId}/createlistifneeded',
+			'/algorithmiclists/{list}',
+			'/contextualfeatures',
+		])
+	)
+	// The spec route keeps itself out of its own output.
+	expect(Object.keys(spec.paths)).not.toContain('/openapi.json')
+	expect(JSON.stringify(spec).match(/\$ref/g)).toBeNull()
+})

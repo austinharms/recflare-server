@@ -331,7 +331,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	.get(
 		'/outfits/me',
 		describeRoute({
-			tags: ['Avatar'],
+			tags: ['Avatar', '2025'],
 			summary: 'The caller’s outfit',
 			description:
 				'The newer outfit read, on a bare un-prefixed path. Served from slot 0 of the shared ' +
@@ -374,7 +374,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	.put(
 		'/outfits/me',
 		describeRoute({
-			tags: ['Avatar'],
+			tags: ['Avatar', '2025'],
 			summary: 'Save the caller’s outfit',
 			description:
 				'Saves into the shared `outfit` table, in the slot the body names — slot 0 being the ' +
@@ -479,7 +479,7 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 	.get(
 		'/outfits/me/saved',
 		describeRoute({
-			tags: ['Avatar'],
+			tags: ['Avatar', '2025'],
 			summary: 'The caller’s saved outfits',
 			description:
 				'The wardrobe behind the newer outfit screen. Empty for now: the outfits saved ' +
