@@ -755,6 +755,91 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
+	test('POST /outfits/bulk serves each account’s worn outfit, keyed by id', async () => {
+		const bulk = async (body: unknown, sub?: string) =>
+			exports.default.fetch(`${ORIGIN}/outfits/bulk`, {
+				method: 'POST',
+				headers: {
+					...(sub === undefined ? {} : await bearer(sub)),
+					'content-type': 'application/json',
+				},
+				body: JSON.stringify(body),
+			})
+
+		// Two accounts with a saved outfit, and one with none.
+		const outfitFor = (skin: string) => ({
+			DataVersion: 2,
+			LegacyData: {
+				SelectionsV1: '193a3bf9-abc0-4d78-8d63-92046908b1c5,,0',
+				SelectionsV2: '{"selections":[]}',
+				FaceFeatures: '{"ver":7}',
+				SkinColor: skin,
+				HairColor: 'UAT0OaWEkUG-mWDIyiX1Kg',
+			},
+			CustomizationSettings: '{"AvatarVersion":2,"AvatarBodyType":0}',
+			Selections: [],
+			Slot: 0,
+			Name: '',
+			Accessibility: 1,
+			ThumbnailFileName: null,
+		})
+		const saved = new Map([
+			[187, outfitFor('skin-187')],
+			[220, outfitFor('skin-220')],
+		])
+		for (const [accountId, outfit] of saved) {
+			const res = await exports.default.fetch(`${ORIGIN}/outfits/me`, {
+				method: 'PUT',
+				headers: { ...(await bearer(String(accountId))), 'content-type': 'application/json' },
+				body: JSON.stringify(outfit),
+			})
+			expect(res.status).toBe(200)
+		}
+
+		expect((await bulk({ AccountIds: [187] })).status).toBe(401)
+
+		const res = await bulk(
+			{ AccountIds: [187, 220], UnityAssetTarget: null, UnityAssetVersion: null },
+			'42'
+		)
+		expect(res.status).toBe(200)
+		// A map keyed by the account id as a STRING, each value the outfit exactly as saved —
+		// the JSON-in-a-string fields are still strings.
+		expect(await res.json()).toEqual({
+			OutfitsByAccountId: {
+				'187': saved.get(187),
+				'220': saved.get(220),
+			},
+		})
+
+		// An account with nothing saved is ABSENT rather than carrying a null, and a repeated
+		// id collapses instead of appearing twice.
+		const sparse = await bulk({ AccountIds: [187, 999888, 187] }, '42')
+		expect(await sparse.json()).toEqual({ OutfitsByAccountId: { '187': saved.get(187) } })
+
+		// No ids is an empty map, not every outfit on the server.
+		expect(await (await bulk({ AccountIds: [] }, '42')).json()).toEqual({ OutfitsByAccountId: {} })
+
+		// 99 distinct accounts is the most one request may name — one query, one round trip.
+		const atCap = [...Array.from({ length: 98 }, (_, i) => 500000 + i), 220]
+		expect(await (await bulk({ AccountIds: atCap }, '42')).json()).toEqual({
+			OutfitsByAccountId: { '220': saved.get(220) },
+		})
+		// One more is refused rather than answered in part, which would read as "those
+		// accounts have no outfit". Duplicates don't count against the cap.
+		expect((await bulk({ AccountIds: [...atCap, 500999] }, '42')).status).toBe(400)
+		expect((await bulk({ AccountIds: [...atCap, ...atCap] }, '42')).status).toBe(200)
+
+		// An unparseable body is a 400, like the save's. (A body that parses but isn't an
+		// object — a bare string, say — names no accounts and so answers an empty map.)
+		const bad = await exports.default.fetch(`${ORIGIN}/outfits/bulk`, {
+			method: 'POST',
+			headers: { ...(await bearer('42')), 'content-type': 'application/json' },
+			body: 'not json',
+		})
+		expect(bad.status).toBe(400)
+	})
+
 	test('PUT /outfits/me 400s on an unparseable body', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/outfits/me`, {
 			method: 'PUT',
@@ -4915,6 +5000,7 @@ describe('openapi', () => {
 			'POST /api/sanitize/v1',
 			'POST /api/sanitize/v1/isPure',
 			'POST /api/v1/progression/bulk',
+			'POST /outfits/bulk',
 			'POST /statsigUserProperties',
 			'PUT /api/playerevents/v2/{eventId}/accessibility',
 			'PUT /api/playerevents/v2/{eventId}/description',

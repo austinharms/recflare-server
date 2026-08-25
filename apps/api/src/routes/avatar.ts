@@ -4,9 +4,11 @@ import { describeRoute } from 'hono-openapi'
 import {
 	CURRENT_OUTFIT_SLOT,
 	getOutfit,
+	getOutfitsByAccounts,
 	inventionDescriptionRejection,
 	inventionNameRejection,
 	inventionTagRejection,
+	MAX_BULK_OUTFIT_ACCOUNTS,
 	setOutfit,
 } from '@repo/domain'
 
@@ -52,6 +54,8 @@ import {
 	jsonBody,
 	LegacyAvatarItemSaves,
 	OutfitSaveResponse,
+	OutfitsBulkRequest,
+	OutfitsBulkResponse,
 	OutfitsMeRequest,
 	OutfitsMeResponse,
 	pageParams,
@@ -403,6 +407,68 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			}
 			await setOutfit(c.env.DB, id, outfit)
 			return c.json({ Success: true, Error: null, error_id: null })
+		}
+	)
+
+	// Several players' worn outfits at once — what the client calls to dress everyone in a
+	// room rather than asking per player. POST because the account list rides in the body.
+	//
+	// The answer is a MAP keyed by account id, not a list: the client looks each player up by
+	// id, and a list would make it match up the order itself. An account with nothing saved is
+	// left out of the map — see `getOutfitsByAccounts`.
+	//
+	// `UnityAssetTarget` / `UnityAssetVersion` name the baked-asset build the client would
+	// like the outfits for. Nothing here bakes assets, so both are accepted and ignored.
+	.post(
+		'/outfits/bulk',
+		describeRoute({
+			tags: ['Avatar'],
+			summary: 'Several players’ outfits',
+			description:
+				'The worn outfit (slot 0) of each account in `AccountIds`, keyed by account id — the ' +
+				'call the client makes to dress a room full of players in one request.\n\n' +
+				'A MAP rather than a list: the client looks each player up by id. The key is the id ' +
+				'as a string, and the value is the same stored outfit `GET /outfits/me` serves, ' +
+				'handed back exactly as it was saved. An account with nothing saved in slot 0 is ' +
+				'ABSENT from the map rather than carrying a null — a map says “no outfit” by not ' +
+				'having the key, and inventing one for a player who has never saved would dress them ' +
+				'in something they never chose.\n\n' +
+				'Repeated ids collapse, and at most 99 distinct accounts may be named — one query, ' +
+				'one round trip, and a room holds nothing like that many players. A longer list is ' +
+				'a 400 rather than a partial answer, which would read as “those players have no ' +
+				'outfit”. `UnityAssetTarget` / `UnityAssetVersion` name a baked-asset build and are ' +
+				'accepted and ignored: nothing here bakes assets.',
+			security: AUTHED,
+			requestBody: jsonBody(OutfitsBulkRequest, 'The accounts whose outfits are wanted'),
+			responses: {
+				200: json(OutfitsBulkResponse, 'The outfits that exist, keyed by account id'),
+				400: json(ErrorResponse, 'Unparseable body, or more than 99 accounts'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (body === null) return c.json({ error: 'Invalid request body' }, 400)
+
+			// Only the integers survive: the field is the client's, and a malformed entry is
+			// dropped rather than turned into a NaN lookup that can never match a row.
+			const accountIds = Array.isArray(body.AccountIds)
+				? body.AccountIds.filter((v): v is number => Number.isInteger(v))
+				: []
+			// One query, one round trip — so the list has to fit D1's parameter cap. A room
+			// holds nothing like this many players; a longer list is refused rather than
+			// quietly answered in part, which would look like those accounts have no outfit.
+			if (new Set(accountIds).size > MAX_BULK_OUTFIT_ACCOUNTS) {
+				return c.json({ error: `At most ${MAX_BULK_OUTFIT_ACCOUNTS} accounts per request` }, 400)
+			}
+
+			const outfits = await getOutfitsByAccounts(c.env.DB, accountIds, CURRENT_OUTFIT_SLOT)
+			const OutfitsByAccountId: Record<string, unknown> = {}
+			for (const [accountId, outfit] of outfits) OutfitsByAccountId[String(accountId)] = outfit
+			return c.json({ OutfitsByAccountId })
 		}
 	)
 

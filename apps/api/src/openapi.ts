@@ -554,6 +554,36 @@ export const OutfitsMeRequest = z.object({
 })
 
 /**
+ * `POST /outfits/bulk` JSON body — whose outfits to fetch. The client sends the accounts it
+ * needs to dress (a room's roster, typically), and the two `UnityAsset*` fields name the
+ * baked-asset build it would like them for.
+ */
+export const OutfitsBulkRequest = z.object({
+	AccountIds: z.array(z.int()).describe('The accounts whose worn outfit is wanted'),
+	UnityAssetTarget: z
+		.string()
+		.nullable()
+		.describe('Baked-asset platform. Accepted and ignored — nothing bakes assets here'),
+	UnityAssetVersion: z
+		.string()
+		.nullable()
+		.describe('Baked-asset version. Accepted and ignored, like its sibling'),
+})
+
+/**
+ * `POST /outfits/bulk` — the worn outfit of each account asked for, keyed by account id.
+ *
+ * The key is the id as a STRING (a JSON object key always is) and the value is the same
+ * stored outfit `GET /outfits/me` serves. An account with nothing saved is ABSENT from the
+ * map rather than present with a null — a map expresses "no outfit" by not carrying the key.
+ */
+export const OutfitsBulkResponse = z.object({
+	OutfitsByAccountId: z
+		.record(z.string(), StoredOutfit)
+		.describe('Keyed by account id as a string. Accounts with no saved outfit are omitted'),
+})
+
+/**
  * `PUT /outfits/me` — the base envelope, with NO `Value` key: three keys and that is the
  * whole body. The save answers only whether it worked; the client keeps the outfit it just
  * sent rather than re-rendering from a response, so nothing here echoes the outfit back.
