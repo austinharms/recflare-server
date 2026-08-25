@@ -16,6 +16,7 @@ import {
 import { NotificationType } from '../../../../notify/src/notification-types'
 import importRooms from '../../../static/ImportRooms.json'
 
+import type { Room } from '@repo/domain'
 import type { Env } from '../../context'
 
 declare module 'cloudflare:test' {
@@ -2677,8 +2678,68 @@ describe('rooms endpoints', () => {
 		expect(await bodyOf(ok)).toMatchObject({ Success: true })
 		const room = (await (await SELF.fetch(`${ORIGIN}/rooms?name=RenamedCenter`)).json()) as {
 			RoomId: number
+			FriendlyName: string
 		}
 		expect(room.RoomId).toBe(2)
+		// The DISPLAY name follows the rename. It is otherwise only defaulted to `Name` on
+		// read, so a room that had ever stored one would keep labelling itself with the old
+		// name while every name-keyed lookup used the new one.
+		expect(room.FriendlyName).toBe('RenamedCenter')
+	})
+
+	/** The hub stub records every notifyPlayer call — see vitest.config.ts. */
+	type SentUpdate = { playerId: number; notificationType: string | number; data: Room }
+	const notifyHub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	const resetNotifications = () => notifyHub().fetch('http://do/all', { method: 'DELETE' })
+	const sentNotifications = async (): Promise<SentUpdate[]> =>
+		(await (await notifyHub().fetch('http://do/all')).json()) as SentUpdate[]
+
+	it('a rename pushes a RoomUpdate to the owner carrying the new name', async () => {
+		// The rename answers a bare `{ Success }` with no room in it, so the push is the only
+		// thing that tells the client to redraw — without it the old name stays on screen.
+		await resetNotifications()
+		expect(
+			await bodyOf(await putForm('/rooms/2/name', { name: 'PushedRename' }, '1'))
+		).toMatchObject({ Success: true })
+
+		const sent = await sentNotifications()
+		expect(sent).toHaveLength(1)
+		// RoomUpdate, to the OWNER, carrying the room as it now stands — both names.
+		expect(sent[0].playerId).toBe(1)
+		expect(sent[0].notificationType).toBe(NotificationType.SubscriptionUpdateRoom)
+		expect(sent[0].data).toMatchObject({
+			RoomId: 2,
+			Name: 'PushedRename',
+			FriendlyName: 'PushedRename',
+		})
+
+		// Put it back for the tests that read room 2 by name.
+		await putForm('/rooms/2/name', { name: 'RenamedCenter' }, '1')
+	})
+
+	it('a description edit and a tag toggle push a RoomUpdate too', async () => {
+		// Same reason for the description: its envelope carries no room either.
+		await resetNotifications()
+		await putForm('/rooms/2/description', { description: 'Pushed description' }, '1')
+		const afterDescription = await sentNotifications()
+		expect(afterDescription).toHaveLength(1)
+		expect(afterDescription[0].data).toMatchObject({
+			RoomId: 2,
+			Description: 'Pushed description',
+		})
+
+		// The tag toggle DOES answer the updated room, so its push is for the owner's other
+		// sessions rather than for the caller's own redraw.
+		await resetNotifications()
+		await putForm('/rooms/2/tags', { tag: 'pushedtag' }, '1')
+		const afterTag = await sentNotifications()
+		expect(afterTag).toHaveLength(1)
+		expect(afterTag[0].playerId).toBe(1)
+		const tags = afterTag[0].data.Tags as Array<{ Tag: string }>
+		expect(tags.map((t) => t.Tag)).toContain('pushedtag')
+
+		// Toggle it back off — the same call removes it.
+		await putForm('/rooms/2/tags', { tag: 'pushedtag' }, '1')
 	})
 
 	it('room_instance: create + read round-trips and hides JsonIgnore fields', async () => {

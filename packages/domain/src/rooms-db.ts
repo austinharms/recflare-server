@@ -361,10 +361,23 @@ export async function setRoomDescription(
 		.run()
 }
 
-/** Set a room's Name in place (the caller checks ownership + name uniqueness first). */
+/**
+ * Set a room's Name in place (the caller checks ownership + name uniqueness first).
+ *
+ * Writes `FriendlyName` to the same string. That is the DISPLAY name — what the client
+ * labels the room with — and it is only defaulted to `Name` on read
+ * ({@link attachRoomDtoDefaults}), with `??=`, so a room whose blob has ever carried one
+ * keeps it. Renaming without this leaves that room displaying its old name forever while
+ * every name-keyed lookup uses the new one.
+ *
+ * The reference lets a creator set a display name apart from the unique `Name`; nothing
+ * here exposes that, so the two are kept in step rather than allowed to diverge silently.
+ */
 export async function setRoomName(db: D1Database, roomId: number, name: string): Promise<void> {
 	await db
-		.prepare("UPDATE room SET data = json_set(data, '$.Name', ?2) WHERE room_id = ?1")
+		.prepare(
+			"UPDATE room SET data = json_set(data, '$.Name', ?2, '$.FriendlyName', ?2) WHERE room_id = ?1"
+		)
 		.bind(roomId, name)
 		.run()
 }

@@ -1507,7 +1507,9 @@ const app = new Hono<App>()
 			description: [
 				'Owner-only (the room’s `CreatorAccountId` — co-owners cannot). An unknown room or a',
 				'non-owner is HTTP 200 with `Success: false` and an `ErrorId`; only a missing token is',
-				'a real 401. An absent `description` field clears the description.',
+				'a real 401. An absent `description` field clears the description. Pushes a',
+				'`RoomUpdate` to the owner — this envelope carries no room, so the push is the only',
+				'thing that tells their client to redraw.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [roomIdParam],
@@ -1541,6 +1543,9 @@ const app = new Hono<App>()
 			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
 			const description = typeof body.description === 'string' ? body.description : ''
 			await setRoomDescription(c.env.DB, roomId, description)
+			// Same reason as the rename below: the envelope carries no room, so without this
+			// the client redraws the room from what it already had — the old description.
+			await pushRoomUpdate(c, accountId, { ...room, Description: description })
 			return roomResult(c, { Success: true })
 		}
 	)
@@ -1617,7 +1622,13 @@ const app = new Hono<App>()
 				})
 			}
 
+			// Writes `FriendlyName` too — see `setRoomName`. The two are the same string here,
+			// and the client labels the room from the display one.
 			await setRoomName(c.env.DB, roomId, name)
+			// The rename answers a bare `{ Success }` with no room in it, so the client has
+			// nothing to re-render from and kept showing the old name until the push arrived.
+			// Built from the room already in hand rather than re-read, like the image route's.
+			await pushRoomUpdate(c, accountId, { ...room, Name: name, FriendlyName: name })
 			return roomResult(c, { Success: true })
 		}
 	)
@@ -1638,7 +1649,8 @@ const app = new Hono<App>()
 				'this call TOGGLES: it adds the tag (Type 0) when absent and removes it when',
 				'present. The “main” tags (`pvp`/`quest`/`game`/`hangout`/`art`) behave as radio',
 				'buttons — setting one clears the others. Answers the lowercase envelope with the',
-				'updated room, which the client re-renders from.',
+				'updated room, which the client re-renders from, and pushes a `RoomUpdate` to the',
+				'owner for their other sessions.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [roomIdParam],
@@ -1665,6 +1677,9 @@ const app = new Hono<App>()
 			if (tag === '') return roomEnvelope(c, null, 'You must provide a tag!')
 
 			const updated = await toggleRoomTag(c.env.DB, roomId, room, tag)
+			// This one DOES answer the updated room, so the caller's own client redraws from
+			// the response; the push is for their other sessions, as on every mutation below.
+			await pushRoomUpdate(c, accountId, updated)
 			return roomEnvelope(c, updated)
 		}
 	)
