@@ -269,7 +269,9 @@ export const MakerAiFreeTrialEligibilityResponse = z
 export const ChallengeProgressResponse = z.object({
 	ChallengeMapId: z.int(),
 	ChallengeId: z.int(),
-	Config: z.string().describe('Echoed back verbatim; not stored'),
+	Config: z
+		.string()
+		.describe('The STORED rule tree — a report carrying none keeps (and echoes) the last one'),
 	Complete: z
 		.boolean()
 		.describe('The STORED completion — latches true within a rotation, so it may differ'),
@@ -484,7 +486,9 @@ export const ChallengeProgressRequest = z.object({
 	Config: z
 		.string()
 		.optional()
-		.describe('The client-evaluated rule tree, with its running count in `cc`; not stored'),
+		.describe(
+			'The client-evaluated rule tree, with its running count in `cc`; stored as the player’s progress'
+		),
 	Complete: z
 		.union([z.string(), z.boolean()])
 		.optional()

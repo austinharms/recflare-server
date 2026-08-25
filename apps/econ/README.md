@@ -370,29 +370,41 @@ the block empty and naming the tier.
 ### Progress (`challenge_status`)
 
 `POST /api/challenge/v2/updateProgress` (auth-gated) upserts one row per (account,
-challenge) into `challenge_status`, and `getCurrent` reads them back to stamp `Complete`.
-The body is `{ ChallengeMapId, ChallengeId, Config, Complete }` with the ids as **strings**
-and `Complete` as .NET's `"True"`/`"False"` — capitalized, so `Boolean(body.Complete)` reads
+challenge) into `challenge_status`, and `getCurrent` reads them back to stamp each
+challenge's `Complete` **and `Config`**. The body is
+`{ ChallengeMapId, ChallengeId, Config, Complete }` with the ids as **strings** and
+`Complete` as .NET's `"True"`/`"False"` — capitalized, so `Boolean(body.Complete)` reads
 "not complete" as complete (`parseBool` handles both spellings and a real JSON `true`).
 
-Only the completion is stored. `Config` is the catalog's own rule tree plus the client's
-running count, so a per-player copy would just be a staler duplicate of static data — it is
-echoed back untouched but never persisted. The response is the four posted fields, except
-`Complete` is the **stored** value rather than the posted one, because:
+**The client does the evaluating, and `Config` is its scratchpad.** It walks the rule tree
+locally and posts that tree back with its own progress written into the nodes — `cc` on a
+counter is the running count, `c` marks a satisfied node — so the posted tree is per-player
+state, not a copy of the catalog, and it is stored. `getCurrent` then serves the static
+challenge with the stored `Config` and `Complete` overwritten onto it; serving the pristine
+authored tree instead (what this used to do) threw away partial progress on every login. The
+server still evaluates none of the tree.
+
+The response is the four posted fields, except `Complete` and `Config` are the **stored**
+values rather than the posted ones, because:
 
 - **Completion latches within a rotation.** The client reports repeatedly, and a later
   report saying "not complete" (a fresh session, a retry arriving out of order) must not
   un-finish something already finished.
+- **A report carrying no `Config` keeps the stored tree.** `config` itself doesn't latch —
+  it's a tally, so the newest tree wins — but a report without one is missing data, not a
+  reset, and must not blank the progress.
 - **A new rotation resets the row.** Challenge ids are only unique within a rotation, so
-  the same id in a later week would otherwise start out already complete. A report whose
-  `ChallengeMapId` differs from the stored one replaces the row instead of latching; reads
-  are scoped to the rotation for the same reason.
+  the same id in a later week would otherwise start out already complete, and half-counted.
+  A report whose `ChallengeMapId` differs from the stored one replaces the row instead of
+  latching; reads are scoped to the rotation for the same reason.
 
 `getCurrent`'s auth is **optional** — an unauthenticated caller gets the static rotation
-with every `Complete` false rather than a 401, since the rotation is public and a failure
-on this route can stall the client's load. The overlay rebuilds the response object rather
+with every `Complete` false and every `Config` as authored, rather than a 401, since the
+rotation is public and a failure on this route can stall the client's load. A challenge the
+caller has never reported keeps its authored `Config` too (a stored `NULL`), since a client
+handed a null tree has nothing to evaluate. The overlay rebuilds the response object rather
 than stamping the imported JSON in place: that import is module state shared across every
-request an isolate serves, so mutating it would leak one player's completions to the next
+request an isolate serves, so mutating it would leak one player's progress to the next
 caller.
 
 ## Game rewards (`reward_status`)

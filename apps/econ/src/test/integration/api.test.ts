@@ -1942,6 +1942,56 @@ describe('econ endpoints', () => {
 		expect(await completeOf(await post('18', 'True'))).toBe(true)
 	})
 
+	test('the reported Config is stored and served back over the static rule tree', async () => {
+		const challenge = CURRENT_CHALLENGE
+		const bearerHeaders = await bearer('74')
+		const headers = { ...bearerHeaders, 'Content-Type': 'application/json' }
+		// The client posts the catalog's tree with its own running count written into it —
+		// `cc` on the counter — which is the progress that has to survive the session.
+		const inProgress = challenge.Config.replace(/}$/, ',"cc":1}')
+		expect(inProgress).not.toBe(challenge.Config)
+		const post = (body: Record<string, string>) =>
+			exports.default.fetch(`${ORIGIN}/api/challenge/v2/updateProgress`, {
+				method: 'POST',
+				headers,
+				body: JSON.stringify({
+					ChallengeMapId: String(weeklyChallenge.ChallengeMapId),
+					ChallengeId: String(challenge.ChallengeId),
+					...body,
+				}),
+			})
+		const reported = await post({ Config: inProgress, Complete: 'False' })
+		expect(await reported.json()).toEqual({
+			ChallengeMapId: weeklyChallenge.ChallengeMapId,
+			ChallengeId: challenge.ChallengeId,
+			Config: inProgress,
+			Complete: false,
+		})
+
+		const configOf = async () => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`, {
+				headers: bearerHeaders,
+			})
+			const body = (await res.json()) as {
+				Challenges: Array<{ ChallengeId: number; Config: string }>
+			}
+			return body.Challenges.find((ch) => ch.ChallengeId === challenge.ChallengeId)?.Config
+		}
+		expect(await configOf()).toBe(inProgress)
+
+		// A report carrying no tree is not a reset — the stored progress stays, and is echoed.
+		const noConfig = await post({ Complete: 'False' })
+		expect(((await noConfig.json()) as { Config: string }).Config).toBe(inProgress)
+		expect(await configOf()).toBe(inProgress)
+
+		// Challenges this player never reported keep the authored tree, and so does everyone else.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`)
+		const anonBody = (await anon.json()) as { Challenges: Array<{ Config: string }> }
+		expect(anonBody.Challenges.map((ch) => ch.Config)).toEqual(
+			weeklyChallenge.Challenges.map((ch) => ch.Config)
+		)
+	})
+
 	/**
 	 * How many of the rotation's challenges earn the gift — three, unless the rotation
 	 * publishes fewer or declares itself all-or-nothing (`CHALLENGES_REQUIRED_FOR_GIFT`).

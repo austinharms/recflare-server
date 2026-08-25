@@ -294,9 +294,11 @@ it: **`cc`** on a counter is the current count (`…,"t":5,"cc":1`), and **`c`**
 marks a node it now considers satisfied.
 
 Neither belongs in `weekly-challenge.json` — they are progress, not definition. The server
-echoes the posted `Config` back untouched and never persists it (`challenge_status` stores
-only the completion flag; see `apps/econ/src/challenge-db.ts`), so the running count lives
-only in the client. Don't author `cc`/`c`, and don't try to read progress out of one.
+stores the posted tree per player (`challenge_status.config`; see
+`apps/econ/src/challenge-db.ts`) and `getCurrent` serves it back in place of the authored
+tree, which is how a half-finished challenge survives a session — but it still evaluates
+none of it: the counting is the client's. Don't author `cc`/`c`, and don't try to read
+progress out of the tree you author.
 
 This is also the cheapest way to decode an unfamiliar tree: serve it, play the activity, and
 watch which node grows a `cc`.

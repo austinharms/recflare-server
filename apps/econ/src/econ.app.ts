@@ -45,11 +45,7 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
-import {
-	claimChallengeGift,
-	getCompletedChallengeIds,
-	recordChallengeProgress,
-} from './challenge-db'
+import { claimChallengeGift, getChallengeStatuses, recordChallengeProgress } from './challenge-db'
 import {
 	consumeConsumable,
 	countConsumable,
@@ -1446,12 +1442,10 @@ function challengesRequiredForGift(): number {
 async function awardChallengeGift(c: Context<App>, accountId: number): Promise<void> {
 	try {
 		if (weeklyChallenge.Challenges.length === 0) return
-		const complete = await getCompletedChallengeIds(
-			c.env.DB,
-			accountId,
-			weeklyChallenge.ChallengeMapId
-		)
-		const done = weeklyChallenge.Challenges.filter((ch) => complete.has(ch.ChallengeId)).length
+		const statuses = await getChallengeStatuses(c.env.DB, accountId, weeklyChallenge.ChallengeMapId)
+		const done = weeklyChallenge.Challenges.filter(
+			(ch) => statuses.get(ch.ChallengeId)?.complete === true
+		).length
 		if (done < challengesRequiredForGift()) return
 		// Claim first: this is what stops the next report paying out a second time.
 		const claimed = await claimChallengeGift(c.env.DB, accountId, weeklyChallenge.ChallengeMapId)
@@ -2866,8 +2860,11 @@ const app = new Hono<App>({ strict: false })
 	)
 
 	// Current weekly challenge. The rotation itself is the bundled static JSON (its format
-	// is documented in the README) but each challenge's `Complete` is per-player, so the
-	// caller's rows from `challenge_status` are stamped over the static `false`s.
+	// is documented in the README) but each challenge's state is per-player, so the caller's
+	// rows from `challenge_status` are stamped over the static ones: `Complete` over the
+	// static `false`, and `Config` over the static rule tree — the client evaluates that tree
+	// locally and reports it back with its running counts written into it (`cc`/`c`), so
+	// serving the pristine tree back is what makes partial progress reset every session.
 	// Auth is OPTIONAL: without a valid bearer the static catalog is served unchanged
 	// rather than 401, since the rotation is public information and a 404/401 on this
 	// route can stall the client's load orchestration.
@@ -2877,9 +2874,10 @@ const app = new Hono<App>({ strict: false })
 			tags: ['Econ'],
 			summary: 'Current weekly challenge',
 			description: [
-				'The bundled static rotation, with each challenge’s `Complete` stamped from the',
-				'caller’s progress rows. Auth is optional — unauthenticated callers get the static',
-				'catalog with every `Complete` false.',
+				'The bundled static rotation, with each challenge’s `Complete` and `Config` stamped',
+				'from the caller’s progress rows — the stored `Config` carries the client’s running',
+				'counts. Auth is optional — unauthenticated callers get the static catalog with every',
+				'`Complete` false and every `Config` as authored.',
 			].join(' '),
 			security: OPTIONAL_AUTHED,
 			responses: { 200: json(JsonObject, 'The current weekly challenge') },
@@ -2887,38 +2885,47 @@ const app = new Hono<App>({ strict: false })
 		async (c) => {
 			const id = await authedId(c)
 			if (id === null) return c.json(weeklyChallenge)
-			const complete = await getCompletedChallengeIds(c.env.DB, id, weeklyChallenge.ChallengeMapId)
-			if (complete.size === 0) return c.json(weeklyChallenge)
+			const statuses = await getChallengeStatuses(c.env.DB, id, weeklyChallenge.ChallengeMapId)
+			if (statuses.size === 0) return c.json(weeklyChallenge)
 			// Rebuild rather than mutate: the static import is module state shared by every
 			// request this isolate serves, so stamping it in place would leak one player's
-			// completions to the next caller.
+			// progress to the next caller.
 			return c.json({
 				...weeklyChallenge,
-				Challenges: weeklyChallenge.Challenges.map((challenge) => ({
-					...challenge,
-					Complete: complete.has(challenge.ChallengeId),
-				})),
+				Challenges: weeklyChallenge.Challenges.map((challenge) => {
+					const status = statuses.get(challenge.ChallengeId)
+					if (status === undefined) return challenge
+					// A row with no stored tree (never reported one) keeps the authored `Config`;
+					// overwriting it with null would hand the client a challenge it can't evaluate.
+					return {
+						...challenge,
+						Complete: status.complete,
+						Config: status.config ?? challenge.Config,
+					}
+				}),
 			})
 		}
 	)
 
 	// Report progress on a weekly challenge. [Authorize]. The client evaluates the
 	// challenge's rule tree locally and posts ChallengeMapId/ChallengeId, that tree in
-	// `Config`, and whether it now considers the challenge `Complete`. Only the
-	// completion is persisted (keyed by account + challenge); `Config` is the catalog's
-	// own definition plus the client's running count, so storing it would duplicate
-	// static data. Echoes the identifying fields back with the completion the row now
-	// holds — which is not always what was posted, since completion latches within a
-	// rotation.
+	// `Config`, and whether it now considers the challenge `Complete`. Both are persisted
+	// (keyed by account + challenge): the posted tree is the catalog's definition with the
+	// client's running counts written into it, so it is this player's progress, and
+	// `getCurrent` serves it back in place of the authored tree. Echoes the identifying
+	// fields back with the state the row now holds — which is not always what was posted,
+	// since completion latches within a rotation and a report with no `Config` keeps the
+	// stored tree.
 	.post(
 		'/api/challenge/v2/updateProgress',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Report weekly-challenge progress',
 			description: [
-				'Persists the reported completion into `challenge_status`, keyed by account +',
-				'challenge. `Config` is accepted and echoed but not stored. Completion latches within',
-				'a rotation, so the echoed `Complete` is the stored value, not the posted one.',
+				'Persists the reported completion and rule tree into `challenge_status`, keyed by',
+				'account + challenge, so `getCurrent` can serve the player’s own progress back.',
+				'Completion latches within a rotation and a report carrying no `Config` keeps the',
+				'stored tree, so the echoed fields are the stored values, not the posted ones.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: jsonBody(ChallengeProgressRequest, 'Challenge ids + the evaluated rule tree'),
@@ -2940,14 +2947,16 @@ const app = new Hono<App>({ strict: false })
 				.catch(() => ({}) as Record<string, never>)
 			const challengeMapId = Number(body.ChallengeMapId) || 0
 			const challengeId = Number(body.ChallengeId) || 0
+			const config = typeof body.Config === 'string' ? body.Config : null
 			// Nothing to key a row on — echo the body back rather than writing a (0, 0) row.
-			const complete =
+			const stored =
 				challengeId === 0
-					? parseBool(body.Complete)
+					? { complete: parseBool(body.Complete), config }
 					: await recordChallengeProgress(c.env.DB, id, {
 							challengeMapId,
 							challengeId,
 							complete: parseBool(body.Complete),
+							config,
 						})
 			// This report may have been the last one of the set. Only a completing report on
 			// the LIVE rotation can be — an old rotation's set can no longer be finished, and
@@ -2955,14 +2964,18 @@ const app = new Hono<App>({ strict: false })
 			// The response is unchanged whether or not a gift was won: the client learns about
 			// the box from `GET /api/avatar/v2/gifts`, and adding a field here would be
 			// inventing response shape the client never sent us.
-			if (complete && challengeId !== 0 && challengeMapId === weeklyChallenge.ChallengeMapId) {
+			if (
+				stored.complete &&
+				challengeId !== 0 &&
+				challengeMapId === weeklyChallenge.ChallengeMapId
+			) {
 				await awardChallengeGift(c, id)
 			}
 			return c.json({
 				ChallengeMapId: challengeMapId,
 				ChallengeId: challengeId,
-				Config: typeof body.Config === 'string' ? body.Config : '',
-				Complete: complete,
+				Config: stored.config ?? '',
+				Complete: stored.complete,
 			})
 		}
 	)
