@@ -30,6 +30,9 @@ import {
 	UGC_ITEM_TYPE_CUSTOM_AVATAR_ITEM,
 } from '../../api/src/custom-avatar-items-db'
 import { getInventionById, toSaveResult } from '../../api/src/inventions-db'
+// The profanity filter behind `api`'s `POST /api/sanitize/v1`, imported rather than copied
+// so a gift note is masked by the very same word list every other player-typed string is.
+import { censorSwears } from '../../api/src/sanitize'
 // The notification-type ids the hub carries, and the payload shapes recovered from the
 // client's own decoder (both owned by the `notify` worker). Imported rather than copied so
 // the frames this worker builds are typed by the shapes the client actually parses — a
@@ -648,6 +651,27 @@ const CONSUMABLE_GRANT_COUNT = 1
 
 /** The "Coach" system account — the sender a self-buy or anonymous gift is attributed to. */
 const COACH_ACCOUNT_ID = 1
+
+/** What a box says when the buyer wrote nothing — a self-purchase, or a gift sent bare. */
+const DEFAULT_GIFT_MESSAGE = 'A gift for you <3'
+
+/**
+ * The note a gift box carries, masked the way every other string a player typed is.
+ *
+ * The buyer writes this and someone ELSE reads it — off the box, out of the hub frame, and
+ * for as long as the box goes unopened — so a gift is a way to put text in front of a player
+ * who never chose to hear from you. The same filter runs in `chat` for the same reason:
+ * nothing obliges a client to have called `POST /api/sanitize/v1` first, and this is the last
+ * point before the note is stored.
+ *
+ * Masking (not refusing) matches the rest of this server: the purchase goes through, the
+ * swear comes out as asterisks, and the buyer is never told their gift was rejected. Blocked
+ * characters are deliberately left alone, as in chat — a note is emoji-carrying text, and
+ * stripping format characters would break the joiners inside a multi-person emoji.
+ */
+function giftMessage(gift: GiftRequest | null): string {
+	return typeof gift?.Message === 'string' ? censorSwears(gift.Message) : DEFAULT_GIFT_MESSAGE
+}
 
 /**
  * Build the stored gift-box content (the client's rendered "gift box") from a gift-drop.
@@ -2617,7 +2641,7 @@ const app = new Hono<App>({ strict: false })
 			// A named (non-anonymous) gift shows the sender; a self-purchase or an anonymous gift
 			// is attributed to the "Coach" system account (id 1), never a null/0 sender.
 			const fromPlayerId = gift !== null && gift.Anonymous !== true ? id : COACH_ACCOUNT_ID
-			const message = typeof gift?.Message === 'string' ? gift.Message : 'A gift for you <3'
+			const message = giftMessage(gift)
 			const giftContext = Number.isInteger(gift?.GiftContext) ? (gift?.GiftContext as number) : null
 			// A gift is paid for here and granted THERE, so an id that names nobody would take the
 			// buyer's tokens and strand the box on an account that will never read it. The client
@@ -2841,7 +2865,7 @@ const app = new Hono<App>({ strict: false })
 					? (gift?.ToPlayerId as number)
 					: id
 				const fromPlayerId = gift !== null && gift.Anonymous !== true ? id : COACH_ACCOUNT_ID
-				const message = typeof gift?.Message === 'string' ? gift.Message : 'A gift for you <3'
+				const message = giftMessage(gift)
 				const giftContext = Number.isInteger(gift?.GiftContext)
 					? (gift?.GiftContext as number)
 					: null

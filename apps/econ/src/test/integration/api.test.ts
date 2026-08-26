@@ -1464,6 +1464,31 @@ describe('econ endpoints', () => {
 		expect(received?.payload).toMatchObject({ FromPlayerId: 1 })
 	})
 
+	test('POST /api/storefronts/v2/buyItem masks swears in the gift message', async () => {
+		await seedAccount(208, 'MaskedReceiver')
+		await drainFrames()
+		const res = await giftBackpack('334', {
+			ToPlayerId: 208,
+			Message: 'happy birthday you shit',
+			Anonymous: false,
+			GiftContext: 500,
+		})
+		expect(res.status).toBe(200)
+		// The buyer writes it and someone else reads it, so it is filtered like any other
+		// player-typed string — masked per character, never refused.
+		const masked = 'happy birthday you ****'
+		expect(
+			((await res.json()) as { BalanceUpdates: Array<{ Data: Array<{ Message: string }> }> })
+				.BalanceUpdates[0]?.Data[0]?.Message
+		).toBe(masked)
+		const [gift] = await pendingGifts('208')
+		expect(gift?.Message).toBe(masked)
+		const received = (await drainFrames()).find(
+			(f) => f.notificationType === NotificationType.GiftPackageReceivedImmediate
+		)
+		expect(received?.payload).toMatchObject({ Message: masked })
+	})
+
 	test('POST /api/storefronts/v2/buyItem 404s a gift to a player that does not exist', async () => {
 		await drainFrames()
 		const res = await giftBackpack('332', { ToPlayerId: 999999, Message: 'hi', Anonymous: false })
