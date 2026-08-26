@@ -1266,7 +1266,8 @@ describe('econ endpoints', () => {
 	})
 
 	// sf300's item 2263 is 95 tokens in `Prices` and 85 in `SubscriberPrices`. A subscriber's
-	// client renders and posts the 85, so the check has to read the list the buyer sees.
+	// client applies the Plus discount itself, but not to every item, so the server takes any
+	// price in the band [85, 95] from a subscriber and charges what they asked to pay.
 	const buy2263 = async (headers: Record<string, string>, RequestedPrice: number) =>
 		exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
@@ -1292,9 +1293,9 @@ describe('econ endpoints', () => {
 		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 - 85 }])
 	})
 
-	test('POST /api/storefronts/v2/buyItem derives the subscriber price when the catalog lists none', async () => {
-		// sf3's item 2184 is 95 in BOTH lists (captured through a non-subscriber's view), but a
-		// subscriber's client still posts floor(95 * 0.9) = 85.
+	test('POST /api/storefronts/v2/buyItem takes 10% off from a subscriber when the catalog lists no discount', async () => {
+		// sf3's item 2184 is 95 in BOTH lists, but a subscriber's client may still post
+		// floor(95 * 0.9) = 85.
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: {
@@ -1314,9 +1315,38 @@ describe('econ endpoints', () => {
 		expect(((await res.json()) as { Balance: number }).Balance).toBe(-85)
 	})
 
-	test('POST /api/storefronts/v2/buyItem 409s a subscriber posting the regular price', async () => {
-		const res = await buy2263(await bearer('323', ['gameClient', 'developer']), 95)
+	test('POST /api/storefronts/v2/buyItem charges a subscriber the full price when their client sends it', async () => {
+		// sf3's item 2208 is 150 in both lists and the live client posts 150 for a subscriber:
+		// not every item is discounted, so the full price has to stay buyable by a subscriber.
+		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('326', ['gameClient', 'developer'])),
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: 2208,
+				CurrencyType: 2,
+				RequestedPrice: 150,
+				CouponConsumablePlayerMappingId: null,
+				Gift: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		expect(((await res.json()) as { Balance: number }).Balance).toBe(-150)
+		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
+			headers: await bearer('326'),
+		})
+		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 - 150 }])
+	})
+
+	test('POST /api/storefronts/v2/buyItem 409s a subscriber below the discount band', async () => {
+		const res = await buy2263(await bearer('323', ['gameClient', 'developer']), 84)
 		expect(res.status).toBe(409)
+		// …and above it: a made-up price is a mismatch in either direction.
+		const over = await buy2263(await bearer('323', ['gameClient', 'developer']), 96)
+		expect(over.status).toBe(409)
 	})
 
 	test('POST /api/storefronts/v2/buyItem 409s a non-subscriber posting the subscriber price', async () => {
@@ -1324,6 +1354,141 @@ describe('econ endpoints', () => {
 		expect(res.status).toBe(409)
 		const ok = await buy2263(await bearer('324'), 95)
 		expect(ok.status).toBe(200)
+	})
+
+	/** Seed a real account row, so a gift naming this player has somewhere to land. */
+	const seedAccount = async (accountId: number, username: string) => {
+		await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
+			.bind(JSON.stringify({ accountId, username, displayName: username }))
+			.run()
+	}
+
+	/** Buy sf3's item 2107 (Backpack Skin (Camo), 3500) with a `Gift` block, as the client posts it. */
+	const giftBackpack = async (sub: string, gift: Record<string, unknown> | null) =>
+		exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: 2107,
+				CurrencyType: 2,
+				RequestedPrice: 3500,
+				CouponConsumablePlayerMappingId: null,
+				Gift: gift,
+			}),
+		})
+
+	const pendingGifts = async (sub: string) => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/avatar/v2/gifts`, {
+			headers: await bearer(sub),
+		})
+		expect(res.status).toBe(200)
+		return (await res.json()) as Array<Record<string, unknown>>
+	}
+
+	const equipment = async (sub: string) => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/equipment/v2/getUnlocked`, {
+			headers: await bearer(sub),
+		})
+		expect(res.status).toBe(200)
+		return (await res.json()) as Array<{ ModificationGuid: string }>
+	}
+
+	test('POST /api/storefronts/v2/buyItem charges the buyer and hands the item to the gift’s receiver', async () => {
+		await seedAccount(205, 'GiftReceiver')
+		await drainFrames()
+		const res = await giftBackpack('330', {
+			ToPlayerId: 205,
+			Message: 'hello this is a message',
+			Anonymous: false,
+			GiftContext: 500,
+		})
+		expect(res.status).toBe(200)
+		// The buyer pays — `Balance` is their change — even though nothing lands on them.
+		expect(((await res.json()) as { Balance: number }).Balance).toBe(-3500)
+		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
+			headers: await bearer('330'),
+		})
+		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 - 3500 }])
+
+		// The item and its box are the RECEIVER's; the buyer keeps neither.
+		expect(await equipment('330')).toEqual([])
+		expect(await pendingGifts('330')).toEqual([])
+		const [box, ...rest] = await equipment('205')
+		expect(rest).toEqual([])
+		expect(box?.ModificationGuid).toBe('523e3615-4633-41a3-9b2d-17d3207a684b')
+		const [gift, ...others] = await pendingGifts('205')
+		expect(others).toEqual([])
+		// The box outlives the request, so it carries who sent it and why — the receiver may
+		// only ever meet it in this list.
+		expect(gift?.FromPlayerId).toBe(330)
+		expect(gift?.GiftContext).toBe(500)
+		expect(gift?.Message).toBe('hello this is a message')
+
+		// The receiver has no response to read, so the box is pushed to them.
+		const frames = await drainFrames()
+		const received = frames.find(
+			(f) => f.notificationType === NotificationType.GiftPackageReceivedImmediate
+		)
+		expect(received?.accountId).toBe(205)
+		expect(received?.payload).toMatchObject({
+			Id: gift?.Id,
+			FromPlayerId: 330,
+			GiftContext: 500,
+			Message: 'hello this is a message',
+			EquipmentModificationGuid: '523e3615-4633-41a3-9b2d-17d3207a684b',
+		})
+		// …and the spend frame still goes to the BUYER, who is the one who paid.
+		const spend = frames.find(
+			(f) => f.notificationType === NotificationType.StorefrontBalancePurchase
+		)
+		expect(spend?.accountId).toBe(330)
+	})
+
+	test('POST /api/storefronts/v2/buyItem attributes an anonymous gift to Coach', async () => {
+		await seedAccount(206, 'AnonReceiver')
+		await drainFrames()
+		const res = await giftBackpack('331', {
+			ToPlayerId: 206,
+			Message: 'guess who',
+			Anonymous: true,
+		})
+		expect(res.status).toBe(200)
+		// Anonymous hides the sender from the box, it does not withhold the gift: id 1 is Coach.
+		const [gift] = await pendingGifts('206')
+		expect(gift?.FromPlayerId).toBe(1)
+		expect(gift?.Message).toBe('guess who')
+		const received = (await drainFrames()).find(
+			(f) => f.notificationType === NotificationType.GiftPackageReceivedImmediate
+		)
+		expect(received?.payload).toMatchObject({ FromPlayerId: 1 })
+	})
+
+	test('POST /api/storefronts/v2/buyItem 404s a gift to a player that does not exist', async () => {
+		await drainFrames()
+		const res = await giftBackpack('332', { ToPlayerId: 999999, Message: 'hi', Anonymous: false })
+		expect(res.status).toBe(404)
+		expect(await res.json()).toEqual({ error: 'No such player to gift to' })
+		// Refused before the debit: the buyer still has every token, and nothing was pushed.
+		expect(
+			await getBalance(env.DB, 332, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(10000)
+		expect(await drainFrames()).toEqual([])
+	})
+
+	test('POST /api/storefronts/v2/buyItem gifting to yourself is just a purchase', async () => {
+		await seedAccount(333, 'SelfGifter')
+		await drainFrames()
+		const res = await giftBackpack('333', { ToPlayerId: 333, Message: 'treat', Anonymous: false })
+		expect(res.status).toBe(200)
+		const [gift] = await pendingGifts('333')
+		expect(gift?.FromPlayerId).toBe(333)
+		// No hub gift frame: the buyer read the box out of the response.
+		expect(
+			(await drainFrames()).filter(
+				(f) => f.notificationType === NotificationType.GiftPackageReceivedImmediate
+			)
+		).toEqual([])
 	})
 
 	test('POST /api/storefronts/v2/buyItem 404s for an unknown item', async () => {
@@ -1640,6 +1805,58 @@ describe('econ endpoints', () => {
 		})
 		const list = (await items.json()) as Array<{ friendlyName: string }>
 		expect(list[0].friendlyName).toBe('Babydoll Dress (Blue)')
+	})
+
+	test('POST /api/items/bulkpurchase routes a gifted line to its receiver', async () => {
+		await seedAccount(207, 'BagReceiver')
+		await drainFrames()
+		const res = await bulkPurchase('960', {
+			PurchaseItemRequests: [
+				line(10, 200),
+				line(2182, 100, {
+					Gift: { ToPlayerId: 207, Message: 'from the bag', Anonymous: false, GiftContext: 500 },
+				}),
+			],
+		})
+		const body = (await res.json()) as BulkBody
+		expect(body.Success).toBe(true)
+		// The buyer pays for both lines; only the first one lands on them.
+		expect(body.Value!.Balance).toBe(10000 - 300)
+		const [own, gifted] = body.Value!.BalanceUpdates
+		expect(own?.Data.GiftPackage).toMatchObject({ PlayerId: 960, FromPlayerId: 1 })
+		expect(gifted?.Data.GiftPackage).toMatchObject({
+			PlayerId: 207,
+			FromPlayerId: 960,
+			GiftContext: 500,
+		})
+		expect(await pendingGifts('960')).toHaveLength(1)
+		const [box] = await pendingGifts('207')
+		expect(box?.FromPlayerId).toBe(960)
+		expect(box?.GiftContext).toBe(500)
+		expect(box?.Message).toBe('from the bag')
+		// The bag's response is the buyer's; the receiver is told over the hub instead.
+		const received = (await drainFrames()).find(
+			(f) => f.notificationType === NotificationType.GiftPackageReceivedImmediate
+		)
+		expect(received?.accountId).toBe(207)
+		expect(received?.payload).toMatchObject({ Id: box?.Id, FromPlayerId: 960, GiftContext: 500 })
+	})
+
+	test('POST /api/items/bulkpurchase 404s a bag gifting to a player that does not exist', async () => {
+		const res = await bulkPurchase('970', {
+			PurchaseItemRequests: [
+				line(10, 200),
+				line(2182, 100, { Gift: { ToPlayerId: 999998, Message: 'hi', Anonymous: false } }),
+			],
+		})
+		expect(res.status).toBe(404)
+		const body = (await res.json()) as BulkBody
+		expect(body.Success).toBe(false)
+		expect(body.Error).toBe('No such player to gift to')
+		// The whole bag is refused before the debit, the good line included.
+		expect(
+			await getBalance(env.DB, 970, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).toBe(10000)
 	})
 
 	test('POST /api/items/bulkpurchase reports per line what it cannot sell', async () => {

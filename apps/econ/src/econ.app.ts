@@ -6,6 +6,7 @@ import {
 	addXp,
 	consumeGift,
 	createGift,
+	getAccount,
 	getGift,
 	getOutfits,
 	getPendingGifts,
@@ -506,47 +507,76 @@ interface StoreItem {
 	Prices: StorePrice[]
 	/**
 	 * The subscriber price list, where the catalog has one (sf300's item 2263 lists 95 tokens
-	 * in `Prices` and 85 in here). The client renders — and posts as `RequestedPrice` — the
-	 * subscriber price to a subscriber, so the price check has to read the same list or a
-	 * subscriber's every buy 409s as "Price has changed".
+	 * in `Prices` and 85 in here). A subscriber's client renders and posts this as
+	 * `RequestedPrice`, so checking their buy against `Prices` alone 409s it as "Price has
+	 * changed". Treated as a FLOOR rather than the price to expect, because the client also
+	 * posts the FULL price for items whose two lists agree (sf3's 2208, 150/150) — see
+	 * {@link priceCheck}.
 	 */
 	SubscriberPrices?: StorePrice[] | null
 	PurchasableItemId: number
 }
 
 /**
- * The Rec Room Plus discount, in percent off the regular price, floored to whole tokens.
+ * The most Rec Room Plus can take off an item, in percent of the regular price.
  *
- * The client applies this ITSELF: a subscriber's client posts `floor(Price * 0.9)` as
- * `RequestedPrice` (95 → 85, 75 → 67, 30 → 27) whatever the catalog says — the captured
- * catalogs carry a `SubscriberPrices` list, but for 1238 of 1382 items it is a verbatim copy
- * of `Prices` (they were captured through a non-subscriber's view), and every entry that does
- * differ is exactly this formula. So the catalog list can't be the source of truth for the
- * check; the formula is, and the list is only honoured where it agrees with it (i.e. is lower).
+ * The client applies the discount ITSELF and posts the result as `RequestedPrice`, but it
+ * does NOT apply it to everything: sf3's item 2208 is 150 tokens in both catalog lists and a
+ * subscriber's client posts 150, while sf300's 2263 is 95/85 and posts 85. Only 144 of the
+ * 1382 captured items carry a discounted `SubscriberPrices` at all, and whether the rest are
+ * genuinely full price for a subscriber or were merely captured through a non-subscriber's
+ * view isn't answerable from here. So the server doesn't predict the number: it accepts
+ * anything from the regular price down to this much off (see {@link priceCheck}) and charges
+ * what the client asked to pay. Deriving one exact subscriber price instead 409'd every buy
+ * the client priced the other way.
  */
 const SUBSCRIBER_DISCOUNT_PERCENT = 10
 
+/** The lowest a subscriber's client can render an item whose regular price is `regular`. */
+function subscriberFloor(regular: number): number {
+	return Math.floor((regular * (100 - SUBSCRIBER_DISCOUNT_PERCENT)) / 100)
+}
+
 /**
- * The price of an item in one currency for one buyer. A non-subscriber pays the `Prices`
- * entry. A subscriber pays the `SubscriberPrices` entry when the catalog has a genuinely
- * discounted one for that currency, else {@link SUBSCRIBER_DISCOUNT_PERCENT} off the regular
- * price — what their client rendered and posted. `undefined` when the item isn't sold in
- * that currency at all.
+ * The outcome of confirming a client's `RequestedPrice` against the catalog: the price to
+ * actually charge, or why the line can't be sold.
  */
-function priceFor(
+type PriceCheck =
+	| { charge: number }
+	/** The item isn't sold in the requested currency at all. */
+	| 'no-currency'
+	/** The catalog moved under a stale client, or the price was made up. */
+	| 'mismatch'
+
+/**
+ * Confirms what the buyer's client rendered, and answers what to charge them.
+ *
+ * A non-subscriber pays the `Prices` entry, exactly. A subscriber pays whatever they asked to
+ * pay within a BAND: the regular price at the top (their client posts it for items it doesn't
+ * discount) down to the catalog's `SubscriberPrices` entry or
+ * {@link SUBSCRIBER_DISCOUNT_PERCENT} off, whichever is lower.
+ *
+ * Charging `RequestedPrice` rather than a server-picked end of the band keeps the debit equal
+ * to the price the buyer was shown. The floor is what bounds the discount: a modified client
+ * can shave at most {@link SUBSCRIBER_DISCOUNT_PERCENT} off, and only while subscribed.
+ */
+function priceCheck(
 	item: StoreItem,
 	currencyType: number,
-	subscriber: boolean
-): StorePrice | undefined {
+	subscriber: boolean,
+	requestedPrice: unknown
+): PriceCheck {
 	const regular = item.Prices.find((p) => p.CurrencyType === currencyType)
-	if (regular === undefined || !subscriber) return regular
+	if (regular === undefined) return 'no-currency'
+	if (!Number.isInteger(requestedPrice)) return 'mismatch'
+	const requested = requestedPrice as number
+	if (requested === regular.Price) return { charge: requested }
+	if (!subscriber) return 'mismatch'
 	const listed = item.SubscriberPrices?.find((p) => p.CurrencyType === currencyType)
-	if (listed !== undefined && listed.Price < regular.Price) return listed
-	return {
-		CurrencyType: currencyType,
-		Price: Math.floor((regular.Price * (100 - SUBSCRIBER_DISCOUNT_PERCENT)) / 100),
-	}
+	const floor = Math.min(subscriberFloor(regular.Price), listed?.Price ?? regular.Price)
+	return requested >= floor && requested < regular.Price ? { charge: requested } : 'mismatch'
 }
+
 interface Storefront {
 	StoreItems: StoreItem[]
 }
@@ -619,15 +649,26 @@ const CONSUMABLE_GRANT_COUNT = 1
 /** The "Coach" system account — the sender a self-buy or anonymous gift is attributed to. */
 const COACH_ACCOUNT_ID = 1
 
-/** Build the stored gift-box content (the client's rendered "gift box") from a gift-drop. */
+/**
+ * Build the stored gift-box content (the client's rendered "gift box") from a gift-drop.
+ *
+ * `fromPlayerId` and `giftContext` are stamped on because the box outlives the request that
+ * made it: a gift's receiver may well be offline and meets it in `GET /api/avatar/v2/gifts`,
+ * with nothing but the row to say who sent it or why. They default to Coach and the drop's
+ * own context — a box the server handed over on nobody's behalf.
+ */
 function toGiftContent(
 	giftDrop: StoreGiftDrop,
 	message: string,
 	consumableCount: number,
 	consumableMappingId = 0,
-	consumablePreExistingCount = 0
+	consumablePreExistingCount = 0,
+	fromPlayerId = COACH_ACCOUNT_ID,
+	giftContext: number | null = null
 ): GiftContent {
 	return {
+		FromPlayerId: fromPlayerId,
+		GiftContext: giftContext ?? giftDrop.Context,
 		ConsumableItemDesc: giftDrop.ConsumableItemDesc,
 		ConsumableCount: consumableCount,
 		ConsumableMappingId: consumableMappingId,
@@ -671,7 +712,8 @@ async function pushGiftReceived(
 	accountId: number,
 	gift: GrantedGift,
 	message: string,
-	fromPlayerId: number
+	fromPlayerId: number,
+	giftContext: number | null = null
 ): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
@@ -693,7 +735,7 @@ async function pushGiftReceived(
 				Platform: -1,
 				PlatformsToSpawnOn: -1,
 				BalanceType: ALL_PLATFORMS,
-				GiftContext: gift.drop.Context,
+				GiftContext: giftContext ?? gift.drop.Context,
 				GiftRarity: gift.drop.Rarity,
 				Message: message,
 			}
@@ -903,6 +945,13 @@ interface GrantOptions extends RollOptions {
 	 * it is saying its own UI announces the items.
 	 */
 	skipGiftBox?: boolean
+	/**
+	 * Who the box says it is from, and why it exists — a purchase gifted to another player
+	 * carries the buyer (or Coach, when they sent it anonymously) and the `Gift` block's
+	 * `GiftContext`. Default: Coach and the drop's own context, i.e. a box from the server.
+	 */
+	fromPlayerId?: number
+	giftContext?: number | null
 }
 
 /**
@@ -989,7 +1038,15 @@ async function grantGiftDrop(
 	const { id } = await createGift(
 		db,
 		accountId,
-		toGiftContent(giftDrop, message, consumableCount, consumableMappingId, consumablePreExisting)
+		toGiftContent(
+			giftDrop,
+			message,
+			consumableCount,
+			consumableMappingId,
+			consumablePreExisting,
+			options.fromPlayerId,
+			options.giftContext
+		)
 	)
 	return { id, drop: giftDrop }
 }
@@ -1184,9 +1241,9 @@ function toPurchaseMethodId(raw: Partial<PurchaseMethodId> | null | undefined): 
  *
  * Pure — the catalog and the buyer's subscriber status are passed in — so the whole bag
  * resolves from ONE storefront read and ONE token read. The price check is buyItem's, per
- * line: `RequestedPrice` is the UNIT price the client rendered (the subscriber price, for a
- * subscriber — see {@link priceFor}), and a mismatch means the catalog moved under a stale
- * client rather than that the player agreed to today's price.
+ * line: `RequestedPrice` is the UNIT price the client rendered (for a subscriber, anywhere in
+ * the discount band — see {@link priceCheck}), and a mismatch means the catalog moved under a
+ * stale client rather than that the player agreed to today's price.
  */
 function resolveBulkLine(
 	line: PurchaseItemRequest,
@@ -1241,30 +1298,25 @@ function resolveBulkLine(
 			error: 'This item can only be bought once per line',
 		}
 	}
-	const price = priceFor(item, currencyType, subscriber)
-	if (price === undefined) {
+	const checked = priceCheck(item, currencyType, subscriber, line.RequestedPrice)
+	if (checked === 'no-currency') {
 		return {
 			method,
 			code: UpdateResponse.NoItemAvailable,
 			error: 'Currency type not available for this item',
 		}
 	}
-	if (!Number.isInteger(line.RequestedPrice)) {
+	if (checked === 'mismatch') {
 		return {
 			method,
 			code: UpdateResponse.RequestedPriceDoesNotMatch,
-			error: 'RequestedPrice is required',
-		}
-	}
-	if (line.RequestedPrice !== price.Price) {
-		return {
-			method,
-			code: UpdateResponse.RequestedPriceDoesNotMatch,
-			error: 'Price has changed',
+			error: !Number.isInteger(line.RequestedPrice)
+				? 'RequestedPrice is required'
+				: 'Price has changed',
 		}
 	}
 	const gift = typeof line.Gift === 'object' && line.Gift !== null ? line.Gift : null
-	return { method, item, price: price.Price, count, gift }
+	return { method, item, price: checked.charge, count, gift }
 }
 
 /** Whether a resolved line is buyable or is already a failure. */
@@ -2485,10 +2537,14 @@ const app = new Hono<App>({ strict: false })
 			summary: 'Buy a storefront item',
 			description: [
 				'Looks the item up in its storefront catalog, confirms the client’s `RequestedPrice`',
-				'still matches (the `SubscriberPrices` entry for a Rec Room Plus subscriber — the same',
-				'check as `UpdateAndGetSubscription` — else the `Prices` one), debits the buyer atomically, grants the item (into the inventory or',
-				'consumable table), and returns a gift box. A `Gift` block routes the item to another',
-				'player, but the caller always pays. `Balance` in the response is the CHANGE (negated',
+				'still matches the `Prices` entry — a Rec Room Plus subscriber (the same check as',
+				'`UpdateAndGetSubscription`) may pay anywhere from that down to 10% off, since their',
+				'client applies the discount itself and not to every item — debits the buyer atomically,',
+				'grants the item (into the inventory or',
+				'consumable table), and returns a gift box. A `Gift` block routes the item — and its',
+				'box — to the player it names, who is handed it over the hub as',
+				'`GiftPackageReceivedImmediate`; the caller always pays, and `Anonymous` hides them',
+				'from the box rather than withholding it. `Balance` in the response is the CHANGE (negated',
 				'price), not the new total. Pushes a StorefrontBalancePurchase socket frame that SETS the',
 				'buyer’s account-wide bucket to the RESULTING total, so the frame, this body and a',
 				'`GET /balance` re-fetch all agree (`Delta` there is display-only).',
@@ -2499,7 +2555,7 @@ const app = new Hono<App>({ strict: false })
 				200: json(BuyItemResponse, 'The purchase result (gift box + balance change)'),
 				400: json(ErrorResponse, 'Invalid body, unavailable currency, or insufficient balance'),
 				401: UNAUTHORIZED_RESPONSE,
-				404: json(ErrorResponse, 'No such item'),
+				404: json(ErrorResponse, 'No such item, or a `Gift` naming a player that does not exist'),
 				409: json(ErrorResponse, 'The price has changed since the client rendered it'),
 			},
 		}),
@@ -2533,15 +2589,21 @@ const app = new Hono<App>({ strict: false })
 			const item = await findStoreItem(c, storefrontType as number, purchasableItemId as number)
 			if (item === null) return c.json({ error: 'Item not found' }, 404)
 
-			// A subscriber is shown, and posts, the item's `SubscriberPrices` entry; checking the
-			// regular price against it 409'd every subscriber buy of a discounted item.
-			const price = priceFor(item, currencyType as number, await isSubscriber(c))
-			if (price === undefined) {
+			// A subscriber's client prices the item itself and posts the result, so the check is a
+			// band rather than one number — see `priceCheck`. `charge` is what they asked to pay.
+			const checked = priceCheck(
+				item,
+				currencyType as number,
+				await isSubscriber(c),
+				requestedPrice
+			)
+			if (checked === 'no-currency') {
 				return c.json({ error: 'Currency type not available for this item' }, 400)
 			}
-			if (price.Price !== requestedPrice) {
+			if (checked === 'mismatch') {
 				return c.json({ error: 'Price has changed' }, 409)
 			}
+			const price = checked.charge
 			// The item's currency must be an account balance we can debit (RecCenterTokens et al),
 			// not a room-scoped or non-spendable currency.
 			if (!isSpendable(currencyType as number)) {
@@ -2556,17 +2618,19 @@ const app = new Hono<App>({ strict: false })
 			// is attributed to the "Coach" system account (id 1), never a null/0 sender.
 			const fromPlayerId = gift !== null && gift.Anonymous !== true ? id : COACH_ACCOUNT_ID
 			const message = typeof gift?.Message === 'string' ? gift.Message : 'A gift for you <3'
+			const giftContext = Number.isInteger(gift?.GiftContext) ? (gift?.GiftContext as number) : null
+			// A gift is paid for here and granted THERE, so an id that names nobody would take the
+			// buyer's tokens and strand the box on an account that will never read it. The client
+			// only offers players it just looked up, so this is a tampered or stale id — refuse it
+			// before charging rather than after.
+			if (receiverId !== id && (await getAccount(c.env.DB, receiverId)) === null) {
+				return c.json({ error: 'No such player to gift to' }, 404)
+			}
 
 			const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
 			// Debit the buyer atomically; a false return means they couldn't afford it and
 			// nothing changed, so no item is granted.
-			const paid = await spendCurrency(
-				c.env.DB,
-				id,
-				currencyType as number,
-				price.Price,
-				startingTokens
-			)
+			const paid = await spendCurrency(c.env.DB, id, currencyType as number, price, startingTokens)
 			if (!paid) return c.json({ error: 'Insufficient balance' }, 400)
 
 			// Grant the item to the recipient, with the gift box that renders it. A box (an
@@ -2574,7 +2638,18 @@ const app = new Hono<App>({ strict: false })
 			// `granted.drop` is what the roll landed on — the response has to describe THAT, not
 			// the box, or a query purchase answers with every item field empty and the client
 			// draws an empty box.
-			const granted = await grantGiftDrop(c, receiverId, item.GiftDrop, message)
+			const granted = await grantGiftDrop(c, receiverId, item.GiftDrop, message, {
+				fromPlayerId,
+				giftContext,
+			})
+
+			// The buyer reads their own box out of the response below, but a gift's receiver has
+			// no response to read — they may not even be online. Hand them the box the way every
+			// other server-handed box arrives, so it pops in front of them instead of waiting for
+			// their client's next `GET /api/avatar/v2/gifts`.
+			if (receiverId !== id) {
+				await pushGiftReceived(c, receiverId, granted, message, fromPlayerId, giftContext)
+			}
 
 			// Push the spend to the buyer (`id` — the caller is who was charged) so their client
 			// updates without waiting for a `GET /balance` re-fetch. StorefrontBalancePurchase
@@ -2582,7 +2657,7 @@ const app = new Hono<App>({ strict: false })
 			// with both the response body below and any re-fetch instead of compounding with them
 			// — see the frame rule above pushBalanceUpdate. Best-effort.
 			const newBalance = await getBalance(c.env.DB, id, currencyType as number, startingTokens)
-			await pushBalancePurchase(c, id, currencyType as number, -price.Price, newBalance)
+			await pushBalancePurchase(c, id, currencyType as number, -price, newBalance)
 
 			// The response mirrors a captured real buyItem: `Balance` is the change applied (the
 			// negated price), not the resulting balance (the client reads its new total from
@@ -2591,17 +2666,10 @@ const app = new Hono<App>({ strict: false })
 				BalanceUpdates: [
 					{
 						UpdateResponse: 0,
-						Data: [
-							toBalanceUpdateData(
-								granted,
-								fromPlayerId,
-								message,
-								Number.isInteger(gift?.GiftContext) ? (gift?.GiftContext as number) : null
-							),
-						],
+						Data: [toBalanceUpdateData(granted, fromPlayerId, message, giftContext)],
 					},
 				],
-				Balance: -price.Price,
+				Balance: -price,
 				CurrencyType: currencyType,
 				BalanceType: ALL_PLATFORMS,
 			})
@@ -2646,6 +2714,7 @@ const app = new Hono<App>({ strict: false })
 				200: json(BulkPurchaseResponse, 'The bag’s result, or `Success: false` if nothing sold'),
 				400: json(BulkPurchaseResponse, 'A request that could not be evaluated at all'),
 				401: UNAUTHORIZED_RESPONSE,
+				404: json(BulkPurchaseResponse, 'A line gifts to a player that does not exist'),
 			},
 		}),
 		async (c) => {
@@ -2656,7 +2725,7 @@ const app = new Hono<App>({ strict: false })
 			// this shape never has to special-case one. A null `Value` is legal here (the client's
 			// validator only cascades into a non-null one), and it is the honest answer: nothing
 			// was bought, so there is no balance to report and nothing to render.
-			const refuse = (error: string, status: 200 | 400 = 200) =>
+			const refuse = (error: string, status: 200 | 400 | 404 = 200) =>
 				c.json({ Success: false, Error: error, error_id: null, Value: null }, status)
 
 			const body = (await c.req.json().catch(() => null)) as {
@@ -2702,6 +2771,20 @@ const app = new Hono<App>({ strict: false })
 			// client is told why by the first thing that was wrong with it.
 			const firstFailure = resolved.find((line): line is BulkLineFailure => !isBulkLine(line))
 			if (!allowPartial && firstFailure !== undefined) return refuse(firstFailure.error)
+
+			// Same as buyItem: a line gifting to an id that names nobody would charge the buyer and
+			// strand the box. One lookup per DISTINCT recipient, and the whole bag refuses — a bad
+			// recipient is a malformed request, not a line that merely didn't fit.
+			const recipients = new Set<number>()
+			for (const line of buyable) {
+				const to = line.gift?.ToPlayerId
+				if (Number.isInteger(to) && to !== id) recipients.add(to as number)
+			}
+			for (const to of recipients) {
+				if ((await getAccount(c.env.DB, to)) === null) {
+					return refuse('No such player to gift to', 404)
+				}
+			}
 
 			// Decide what the balance covers BEFORE spending: lines are taken in request order
 			// while they fit, so a bag that overruns still buys the items the player put in first.
@@ -2752,9 +2835,16 @@ const app = new Hono<App>({ strict: false })
 				// player while the caller pays, a named gift shows the sender, and a self-buy or an
 				// anonymous gift is attributed to the "Coach" system account.
 				const gift = line.gift
-				const receiverId = Number.isInteger(gift?.ToPlayerId) ? (gift?.ToPlayerId as number) : id
+				// Annotated: without it the inference of this handler's own type runs through the
+				// hub call below and back, and tsc gives up on the initializer (TS7022).
+				const receiverId: number = Number.isInteger(gift?.ToPlayerId)
+					? (gift?.ToPlayerId as number)
+					: id
 				const fromPlayerId = gift !== null && gift.Anonymous !== true ? id : COACH_ACCOUNT_ID
 				const message = typeof gift?.Message === 'string' ? gift.Message : 'A gift for you <3'
+				const giftContext = Number.isInteger(gift?.GiftContext)
+					? (gift?.GiftContext as number)
+					: null
 				// One box per requested item, holding all `count` copies — the wire has one
 				// `GiftPackage` per entry, and only a consumable can be asked for more than once
 				// (`resolveBulkLine` refuses a bigger count on anything owned once).
@@ -2762,20 +2852,22 @@ const app = new Hono<App>({ strict: false })
 					rollCatalog,
 					skipGiftBox,
 					copies: line.count,
+					fromPlayerId,
+					giftContext,
 				})
+				// The bag's own response carries only the buyer's boxes, so a gifted line is
+				// announced to its receiver the same way buyItem's is. `BypassGiftPackages` skipped
+				// the box entirely, and there is nothing to announce.
+				if (receiverId !== id && !skipGiftBox) {
+					await pushGiftReceived(c, receiverId, granted, message, fromPlayerId, giftContext)
+				}
 				packages.set(
 					line,
 					// Null under `BypassGiftPackages`, which is the flag asking for exactly that —
 					// the item is granted either way.
 					skipGiftBox
 						? null
-						: toGiftPackage(
-								granted,
-								receiverId,
-								fromPlayerId,
-								message,
-								Number.isInteger(gift?.GiftContext) ? (gift?.GiftContext as number) : null
-							)
+						: toGiftPackage(granted, receiverId, fromPlayerId, message, giftContext)
 				)
 			}
 
