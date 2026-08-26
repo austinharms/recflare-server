@@ -11,9 +11,13 @@
  * the room's tracked stats this is, and `stat_value` is what it posts as `StatValue`. What a
  * channel counts (wins, laps, a time) is the room's business; the server only orders on it.
  *
- * Ranks are 1-based and total: the board is ordered by `stat_value` (highest first unless
+ * Ranks are 0-BASED and total: the board is ordered by `stat_value` (highest first unless
  * the client asks for ascending) with ties broken on the lower `player_id`, so two players
  * with the same score never share a rank and a rank is stable between two reads.
+ *
+ * Zero-based because the client adds one before it draws — it renders `Rank` 0 as "#1", so a
+ * `Rank` of 1 shows up in the game as second place. This is the same convention the client's
+ * own `GetRanks` body uses: it asks for the first ten rows as `RankStart` 0, `RankEnd` 9.
  *
  * A board can be read through a FRIENDS filter (the client's `FilterType` 1): the same rows
  * restricted to the viewer and the people they are friends with, ranked among themselves —
@@ -42,10 +46,10 @@ export const SCHEMA_DDL: string[] = [
 ]
 
 /**
- * The rank a player who isn't on the board gets. `Rank` is 1-based: a 0 would render as
- * first place and a negative one may not render at all. A number far past the end of any
- * real board reads as last, which is what an unscored player is, and is recognisable in a
- * log or a screenshot as a sentinel rather than a real standing.
+ * The rank a player who isn't on the board gets. Ranks are 0-based, so 0 IS first place and
+ * a negative one may not render at all — the sentinel has to be a big number. One far past
+ * the end of any real board reads as last, which is what an unscored player is, and is
+ * recognisable in a log or a screenshot as a sentinel rather than a real standing.
  */
 export const UNRANKED = 99999
 
@@ -111,8 +115,9 @@ function order(sortAscending: boolean): string {
 }
 
 /**
- * A page of a board: ranks `rankStart`..`rankEnd`, both 1-based and inclusive.
- * A `rankStart` below 1 is clamped to the top; an empty or inverted range is an empty page.
+ * A page of a board: ranks `rankStart`..`rankEnd`, both 0-based and inclusive — 0..9 is the
+ * first ten rows, the slice the client actually asks for.
+ * A `rankStart` below 0 is clamped to the top; an empty or inverted range is an empty page.
  */
 export async function getRanks(
 	db: D1Database,
@@ -121,7 +126,7 @@ export async function getRanks(
 	rankEnd: number,
 	sortAscending: boolean
 ): Promise<LeaderboardEntry[]> {
-	const start = Math.max(1, rankStart)
+	const start = Math.max(0, rankStart)
 	const limit = rankEnd - start + 1
 	if (limit <= 0) return []
 	const s = scope(board)
@@ -130,17 +135,17 @@ export async function getRanks(
 			`SELECT player_id, stat_value FROM leaderboard WHERE ${s.where}
 			 ORDER BY ${order(sortAscending)} LIMIT ?${s.next} OFFSET ?${s.next + 1}`
 		)
-		.bind(...s.binds, limit, start - 1)
+		.bind(...s.binds, limit, start)
 		.all<LeaderboardRow>()
 	return results.map((r, i) => ({ PlayerId: r.player_id, Score: r.stat_value, Rank: start + i }))
 }
 
 /**
- * One player's standing on a board: their score and 1-based rank, or
+ * One player's standing on a board: their score and 0-based rank, or
  * {@link UNRANKED} with {@link NO_SCORE} when they have no row there.
  *
- * The rank is one more than the count of players placed ahead — a higher score, or the
- * same score and a lower id — so it matches the position {@link getRanks} would give.
+ * The rank is the count of players placed ahead — a higher score, or the same score and a
+ * lower id — so it matches the position {@link getRanks} would give.
  */
 export async function getPlayerRank(
 	db: D1Database,
@@ -162,7 +167,7 @@ export async function getPlayerRank(
 		.prepare(`SELECT COUNT(*) AS n FROM leaderboard WHERE ${s.where} AND ${ahead}`)
 		.bind(...s.binds, playerId, mine.stat_value)
 		.first<{ n: number }>()
-	return { PlayerId: playerId, Score: mine.stat_value, Rank: (count?.n ?? 0) + 1 }
+	return { PlayerId: playerId, Score: mine.stat_value, Rank: count?.n ?? 0 }
 }
 
 /** The most rows either side of a player `GetNearbyScores` will serve, whatever it asks. */
@@ -182,7 +187,7 @@ export async function getNearbyScores(
 ): Promise<LeaderboardEntry[]> {
 	const window = Math.min(Math.max(windowSize, 1), MAX_WINDOW)
 	const mine = await getPlayerRank(db, board, playerId, sortAscending)
-	if (mine.Rank === UNRANKED) return getRanks(db, board, 1, window * 2 + 1, sortAscending)
+	if (mine.Rank === UNRANKED) return getRanks(db, board, 0, window * 2, sortAscending)
 	return getRanks(db, board, mine.Rank - window, mine.Rank + window, sortAscending)
 }
 

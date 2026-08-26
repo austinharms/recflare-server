@@ -162,9 +162,10 @@ const app = new Hono<App>()
 	//
 	// Same answer and same rules as GetNearbyScores: `{ Rows: [...] }`, where an EMPTY
 	// `Rows` is a complete answer meaning "this leaderboard has no scores" and the key must
-	// be present. Ranks are 1-based; a `RankStart` of 0 is read as the top. `FilterType` 1
-	// ranks the viewer and their friends among themselves. An unreadable body is answered
-	// with an empty board, never an error.
+	// be present. Ranks are 0-based, as the client's own slice is (it asks for the first ten
+	// as `RankStart` 0, `RankEnd` 9) and as it renders them (it draws `Rank` 0 as "#1").
+	// `FilterType` 1 ranks the viewer and their friends among themselves. An unreadable body
+	// is answered with an empty board, never an error.
 	.post(
 		'/leaderboard/GetRanks',
 		describeRoute({
@@ -177,8 +178,8 @@ const app = new Hono<App>()
 				'`SortAscending`).',
 				'',
 				'Answers the rows ranked `RankStart`..`RankEnd` on the board `RoomId` + `StatChannel`',
-				'names (1-based; 0 is read as the top), highest value first unless `SortAscending`. An',
-				'empty `Rows` means "this leaderboard has no scores"; the key is always present.',
+				'names (0-based, so 0..9 is the first ten), highest value first unless `SortAscending`.',
+				'An empty `Rows` means "this leaderboard has no scores"; the key is always present.',
 				'`FilterType` 1 (Friends) restricts the board to `PlayerId` and their friends, ranked',
 				'among themselves.',
 			].join(' '),
@@ -192,8 +193,8 @@ const app = new Hono<App>()
 			const rows = await getRanks(
 				c.env.DB,
 				board(body),
-				int(body.RankStart, 1),
-				int(body.RankEnd, 10),
+				int(body.RankStart, 0),
+				int(body.RankEnd, 9),
 				body.SortAscending === true
 			)
 			return c.json({ Rows: rows })
@@ -223,8 +224,10 @@ const app = new Hono<App>()
 				'`FilterType`: Global 0, Friends 1).',
 				'',
 				'`Score` is the player’s value on the board `RoomId` + `StatChannel` names and `Rank`',
-				`their 1-based position on it. A player with no row there answers \`Rank\` ${UNRANKED}, a sentinel meaning`,
-				'unranked (ranks are 1-based, so a 0 would render as first place), and `Score` 0.',
+				`their 0-based position on it — the client adds one before it draws, so \`Rank\` 0 is`,
+				`shown as "#1". A player with no row there answers \`Rank\` ${UNRANKED}, a sentinel meaning`,
+				'unranked (0 being a real rank, first place, the sentinel has to be a big number), and',
+				'`Score` 0.',
 				'',
 				'`FilterType` 1 (Friends) ranks the player among their friends only.',
 				'',
@@ -329,7 +332,8 @@ app.get(
 						'',
 						'One board per (room, stat channel): `CheckAndSetStat` stores the caller’s value on',
 						'one, and the reads rank them — highest first unless `SortAscending`, ties broken on',
-						'the lower player id, ranks 1-based. `FilterType` 1 reads a board as the viewer and',
+						'the lower player id, ranks 0-based (the client adds one before it draws, so `Rank` 0',
+						'is shown as "#1"). `FilterType` 1 reads a board as the viewer and',
 						'their friends only (the `api` worker’s `relationship` table), ranked among',
 						'themselves.',
 						'',

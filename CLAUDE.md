@@ -169,6 +169,12 @@ inconsistency here without checking the client first.
 - The cheer's reply is `{ Success, Message }` — PascalCase, with `Message` NULL on success.
   That is NOT the lowercase `{ success, error: "" }` envelope the reports and warnings use;
   the two live side by side in the same worker and must not be unified.
+- Leaderboard `Rank` (`leaderboard`: `GetRanks`, `GetNearbyScores`, `GetPlayerRank`) is
+  0-BASED — the client adds one before it draws, so a `Rank` of 1 shows in game as second
+  place and the top of a board must be 0. Its own slice says the same: it asks for the first
+  ten rows as `RankStart` 0, `RankEnd` 9, both inclusive, so reading them as 1-based also
+  serves nine rows starting at the runner-up. The unranked sentinel stays a big number
+  (99999) precisely because 0 is now a real rank, first place.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

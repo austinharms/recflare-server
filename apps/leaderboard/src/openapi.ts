@@ -58,17 +58,21 @@ export const LeaderboardRows = z.object({
 
 /**
  * `POST /leaderboard/GetPlayerRank` — one player's standing on one board, e.g.
- * `{"PlayerId":205,"Score":4200,"Rank":17}`.
+ * `{"PlayerId":205,"Score":4200,"Rank":16}` for the 17th place the client draws.
  *
  * Three fields only: none of the board selectors the request names are echoed back, so the
  * client matches the answer to the question by having asked it. A player with no row gets
  * the 99999 sentinel with a zero score — see the route for why that rather than a rank of
- * 0, which would read as "first place".
+ * 0, which IS first place: the client adds one before it draws.
  */
 export const PlayerRank = z.object({
 	PlayerId: z.int().describe('Echoed from the request — whose rank this is'),
 	Score: z.int().describe('The player’s value on the board; 0 when they have no row there'),
-	Rank: z.int().describe('1-based position on the board; 99999 when the player isn’t on it'),
+	Rank: z
+		.int()
+		.describe(
+			'0-based position on the board — the client adds one to draw it, so 0 is “#1”; 99999 when the player isn’t on it'
+		),
 })
 
 /**

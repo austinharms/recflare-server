@@ -115,8 +115,8 @@ describe('an empty board', () => {
 		})
 		expect(res.status).toBe(200)
 		// Three fields, no board selectors: the client pairs the answer with its own question.
-		// Rank is 1-based, so the sentinel has to be a big number rather than 0 — which would
-		// render the unranked caller as first place.
+		// Ranks are 0-based — the client adds one to draw them — so 0 IS first place and the
+		// sentinel has to be a big number rather than 0.
 		expect(await res.json()).toEqual({ PlayerId: 205, Score: 0, Rank: 99999 })
 	})
 
@@ -205,7 +205,7 @@ describe('a scored board', () => {
 		expect(await res.json()).toEqual({ Rows: [] })
 	})
 
-	it('ranks highest value first with 1-based ranks', async () => {
+	it('ranks highest value first with 0-based ranks', async () => {
 		const res = await post('GetRanks', {
 			RankStart: 0,
 			RankEnd: 9,
@@ -217,10 +217,10 @@ describe('a scored board', () => {
 		})
 		expect(await res.json()).toEqual({
 			Rows: [
-				{ PlayerId: 2, Score: 30, Rank: 1 },
-				{ PlayerId: 3, Score: 20, Rank: 2 },
-				{ PlayerId: 4, Score: 20, Rank: 3 },
-				{ PlayerId: 1, Score: 10, Rank: 4 },
+				{ PlayerId: 2, Score: 30, Rank: 0 },
+				{ PlayerId: 3, Score: 20, Rank: 1 },
+				{ PlayerId: 4, Score: 20, Rank: 2 },
+				{ PlayerId: 1, Score: 10, Rank: 3 },
 			],
 		})
 	})
@@ -237,8 +237,8 @@ describe('a scored board', () => {
 		})
 		expect(await res.json()).toEqual({
 			Rows: [
-				{ PlayerId: 3, Score: 20, Rank: 2 },
-				{ PlayerId: 4, Score: 20, Rank: 3 },
+				{ PlayerId: 4, Score: 20, Rank: 2 },
+				{ PlayerId: 1, Score: 10, Rank: 3 },
 			],
 		})
 	})
@@ -255,8 +255,8 @@ describe('a scored board', () => {
 		})
 		expect(await res.json()).toEqual({
 			Rows: [
-				{ PlayerId: 1, Score: 10, Rank: 1 },
-				{ PlayerId: 3, Score: 20, Rank: 2 },
+				{ PlayerId: 3, Score: 20, Rank: 1 },
+				{ PlayerId: 4, Score: 20, Rank: 2 },
 			],
 		})
 	})
@@ -269,7 +269,7 @@ describe('a scored board', () => {
 			FilterType: 0,
 			SortAscending: false,
 		})
-		expect(await res.json()).toEqual({ PlayerId: 4, Score: 20, Rank: 3 })
+		expect(await res.json()).toEqual({ PlayerId: 4, Score: 20, Rank: 2 })
 	})
 
 	it('answers a player with no row in the room as unranked', async () => {
@@ -294,9 +294,9 @@ describe('a scored board', () => {
 		})
 		expect(await res.json()).toEqual({
 			Rows: [
-				{ PlayerId: 3, Score: 20, Rank: 2 },
-				{ PlayerId: 4, Score: 20, Rank: 3 },
-				{ PlayerId: 1, Score: 10, Rank: 4 },
+				{ PlayerId: 3, Score: 20, Rank: 1 },
+				{ PlayerId: 4, Score: 20, Rank: 2 },
+				{ PlayerId: 1, Score: 10, Rank: 3 },
 			],
 		})
 	})
@@ -312,9 +312,9 @@ describe('a scored board', () => {
 		})
 		expect(await res.json()).toEqual({
 			Rows: [
-				{ PlayerId: 2, Score: 30, Rank: 1 },
-				{ PlayerId: 3, Score: 20, Rank: 2 },
-				{ PlayerId: 4, Score: 20, Rank: 3 },
+				{ PlayerId: 2, Score: 30, Rank: 0 },
+				{ PlayerId: 3, Score: 20, Rank: 1 },
+				{ PlayerId: 4, Score: 20, Rank: 2 },
 			],
 		})
 	})
@@ -323,7 +323,7 @@ describe('a scored board', () => {
 describe('the friends filter', () => {
 	// Room 200, channel 2: players 11..15 score 50, 40, 30, 20, 10. Player 14 is friends
 	// with 11 (14 requested) and 15 (15 requested); 12 and 13 are strangers, and 16 is a
-	// friend with no score. Globally 14 is 4th; among friends 2nd.
+	// friend with no score. Globally 14 is 4th (`Rank` 3); among friends 2nd (`Rank` 1).
 	const ROOM = 200
 	const board = (extra: object) => ({
 		StatChannel: 2,
@@ -350,42 +350,43 @@ describe('the friends filter', () => {
 	})
 
 	it('ranks the viewer among their friends on GetRanks', async () => {
-		const res = await post('GetRanks', board({ PlayerId: 14, RankStart: 1, RankEnd: 10 }))
+		const res = await post('GetRanks', board({ PlayerId: 14, RankStart: 0, RankEnd: 9 }))
 		expect(await res.json()).toEqual({
 			Rows: [
-				{ PlayerId: 11, Score: 50, Rank: 1 },
-				{ PlayerId: 14, Score: 20, Rank: 2 },
-				{ PlayerId: 15, Score: 10, Rank: 3 },
+				{ PlayerId: 11, Score: 50, Rank: 0 },
+				{ PlayerId: 14, Score: 20, Rank: 1 },
+				{ PlayerId: 15, Score: 10, Rank: 2 },
 			],
 		})
 	})
 
 	it('gives the friends rank on GetPlayerRank', async () => {
 		const res = await post('GetPlayerRank', board({ PlayerId: 14 }))
-		expect(await res.json()).toEqual({ PlayerId: 14, Score: 20, Rank: 2 })
+		expect(await res.json()).toEqual({ PlayerId: 14, Score: 20, Rank: 1 })
 		const global = await post('GetPlayerRank', board({ PlayerId: 14, FilterType: 0 }))
-		expect(await global.json()).toEqual({ PlayerId: 14, Score: 20, Rank: 4 })
+		expect(await global.json()).toEqual({ PlayerId: 14, Score: 20, Rank: 3 })
 	})
 
 	it('centres GetNearbyScores on the viewer within their friends', async () => {
 		const res = await post('GetNearbyScores', board({ PlayerId: 14, WindowSize: 10 }))
 		expect(await res.json()).toEqual({
 			Rows: [
-				{ PlayerId: 11, Score: 50, Rank: 1 },
-				{ PlayerId: 14, Score: 20, Rank: 2 },
-				{ PlayerId: 15, Score: 10, Rank: 3 },
+				{ PlayerId: 11, Score: 50, Rank: 0 },
+				{ PlayerId: 14, Score: 20, Rank: 1 },
+				{ PlayerId: 15, Score: 10, Rank: 2 },
 			],
 		})
 	})
 
 	it('shows a player with no friends only themself', async () => {
-		const res = await post('GetRanks', board({ PlayerId: 13, RankStart: 1, RankEnd: 10 }))
-		expect(await res.json()).toEqual({ Rows: [{ PlayerId: 13, Score: 30, Rank: 1 }] })
+		const res = await post('GetRanks', board({ PlayerId: 13, RankStart: 0, RankEnd: 9 }))
+		expect(await res.json()).toEqual({ Rows: [{ PlayerId: 13, Score: 30, Rank: 0 }] })
 	})
 })
 
 describe('the nearby window', () => {
-	// Room 300: players 21..45 score 25..1, so 25 rows with player 33 in the middle (rank 13).
+	// Room 300: players 21..45 score 25..1, so 25 rows with player 33 in the middle (rank 12,
+	// the 13th row — ranks are 0-based).
 	const ROOM = 300
 	beforeAll(async () => {
 		for (let p = 21; p <= 45; p++) await setStat(p, ROOM, 46 - p)
@@ -402,8 +403,28 @@ describe('the nearby window', () => {
 		})
 		const { Rows } = (await res.json()) as { Rows: { Rank: number }[] }
 		expect(Rows).toHaveLength(21)
-		expect(Rows[0]?.Rank).toBe(3)
-		expect(Rows[20]?.Rank).toBe(23)
+		expect(Rows[0]?.Rank).toBe(2)
+		expect(Rows[20]?.Rank).toBe(22)
+	})
+
+	// The slice the client actually asks for: 0..9 is TEN rows, starting at the top. Read as
+	// 1-based this served nine rows starting at the second one.
+	it('serves ten rows for the client’s RankStart 0, RankEnd 9', async () => {
+		const res = await post('GetRanks', {
+			RankStart: 0,
+			RankEnd: 9,
+			PlayerId: 33,
+			StatChannel: 2,
+			RoomId: ROOM,
+			FilterType: 0,
+			SortAscending: false,
+		})
+		const { Rows } = (await res.json()) as {
+			Rows: Array<{ PlayerId: number; Score: number; Rank: number }>
+		}
+		expect(Rows).toHaveLength(10)
+		expect(Rows[0]).toEqual({ PlayerId: 21, Score: 25, Rank: 0 })
+		expect(Rows[9]?.Rank).toBe(9)
 	})
 
 	it('defaults WindowSize to 10 when absent', async () => {
