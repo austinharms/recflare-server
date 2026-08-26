@@ -401,6 +401,34 @@ export const BuyInventionResponse = z.object({
 })
 
 /** buyItem / buyInvention error body (`{ error }`), returned on 400/403/404/409. */
+/** The JSON body `POST /api/ugcPurchasables/v1/items/bulk` takes. */
+export const UgcPurchasableBulkRequest = z.object({
+	RoomId: z.number().int().describe('Echoed back on each item; not otherwise used'),
+	Ids: z.array(
+		z.object({
+			itemType: z.number().int().describe('3 = custom avatar item (the only type served)'),
+			itemId: z.string().describe('The `CustomAvatarItemId`'),
+		})
+	),
+})
+
+/** The client's `UgcPurchasableItem` — a store-facing view of a custom avatar item. */
+export const UgcPurchasableItemDto = z.object({
+	ItemType: z.number().int(),
+	ItemId: z.string(),
+	Name: z.string(),
+	Description: z.string(),
+	ImageName: z.string(),
+	RoomId: z.number().int(),
+	Price: z.number().int(),
+	PurchaseCurrencyId: z.string().nullable(),
+	CreatedAt: z.string(),
+	ModifiedAt: z.string(),
+})
+
+/** What the bulk lookup answers: the resolved items, unknown ids omitted. */
+export const UgcPurchasableItemList = z.array(UgcPurchasableItemDto)
+
 export const ErrorResponse = z.object({ error: z.string() })
 
 // ---- Request schemas -------------------------------------------------------

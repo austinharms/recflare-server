@@ -31,6 +31,10 @@ import '../../api.app'
 import { PLATFORM_SCHEMA_DDL } from '../../../../auth/src/platform-db'
 import { banEvasionMatch, resolveBan } from '../../bans-db'
 import {
+	createCustomAvatarItem,
+	SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL,
+} from '../../custom-avatar-items-db'
+import {
 	countGoing,
 	SCHEMA_DDL as EVENTS_SCHEMA_DDL,
 	getEventAttendees,
@@ -148,6 +152,9 @@ beforeAll(async () => {
 
 	// Reputation + cheer credit (owned by the api worker) — cheering writes both.
 	for (const stmt of REPUTATION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Custom avatar items (owned by the api worker).
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -516,7 +523,12 @@ describe('public endpoints', () => {
 		expect(allAnonymous[0]).toMatchObject({
 			playerId: 7109,
 			notificationType: 2, // NotificationType.MessageReceived
-			data: { FromPlayerId: 0, ToPlayerId: 7109, Type: MessageType.PlayerCheerAnonymous, Data: '10' },
+			data: {
+				FromPlayerId: 0,
+				ToPlayerId: 7109,
+				Type: MessageType.PlayerCheerAnonymous,
+				Data: '10',
+			},
 		})
 		const anonymous = allAnonymous.slice(1)
 		expect(anonymous[0]).toMatchObject({
@@ -571,7 +583,11 @@ describe('public endpoints', () => {
 		// reputation — all durable and all addressed: nothing was broadcast.
 		expect(frames.map((f) => f.playerId)).toEqual([7131, 7131, 7130])
 		expect(frames.some((f) => f.ephemeral)).toBe(false)
-		expect(frames[0]!.data).toMatchObject({ ToPlayerId: 7131, Type: MessageType.PlayerCheer, Data: '40' })
+		expect(frames[0]!.data).toMatchObject({
+			ToPlayerId: 7131,
+			Type: MessageType.PlayerCheer,
+			Data: '40',
+		})
 		expect(frames[1]!.data).toMatchObject({ AccountId: 7131, CheerCreative: 1 })
 	})
 
@@ -607,7 +623,9 @@ describe('public endpoints', () => {
 		// The pin survives a cheer landing on the row, and a cheer's frame carries it.
 		expect((await cheer({ PlayerIdTo: '7140', CheerCategory: '0' }, '7141')).status).toBe(200)
 		expect(await reputationOf(7140)).toMatchObject({ CheerGeneral: 1 })
-		expect(await getReputation(env.DB, 7140)).toMatchObject({ SelectedCheer: CheerCategory.GreatHost })
+		expect(await getReputation(env.DB, 7140)).toMatchObject({
+			SelectedCheer: CheerCategory.GreatHost,
+		})
 
 		// -1 (`None`) unpins, read back as 0; a made-up category is refused.
 		expect(await (await pin('-1', '7140')).json()).toEqual({ Success: true, Message: null })
@@ -616,7 +634,7 @@ describe('public endpoints', () => {
 			Success: false,
 			Message: 'CheerCategory is not a cheer category',
 		})
-		expect((await pin('0', '7140').then((r) => r.status))).toBe(200)
+		expect(await pin('0', '7140').then((r) => r.status)).toBe(200)
 		expect(
 			(
 				await exports.default.fetch(`${ORIGIN}/api/PlayerCheer/v1/SetSelectedCheer`, {
@@ -936,8 +954,55 @@ describe('public endpoints', () => {
 		expect(await res.json()).toBe(true)
 	})
 
-	test('GET /api/customAvatarItems/v1/featured returns []', async () => {
+	test('GET /api/customAvatarItems/v1/featured lists flagged, published items, newest first', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+		const older = await createCustomAvatarItem(
+			env.DB,
+			item('Older', 1),
+			new Date('2026-08-01T00:00:00Z')
+		)
+		const newer = await createCustomAvatarItem(
+			env.DB,
+			item('Newer', 1),
+			new Date('2026-08-02T00:00:00Z')
+		)
+		const unpublished = await createCustomAvatarItem(env.DB, item('Unpublished', 0))
+		const unflagged = await createCustomAvatarItem(env.DB, item('Unflagged', 1))
+		// Nothing flags items yet, so flag straight in the table — the unflagged one stays.
+		await env.DB.prepare(
+			'UPDATE custom_avatar_item SET is_featured = 1 WHERE custom_avatar_item_id != ?1'
+		)
+			.bind(unflagged.CustomAvatarItemId)
+			.run()
+
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/featured`)
+		expect(res.status).toBe(200)
+		const got = (await res.json()) as Array<{ CustomAvatarItemId: string; Name: string }>
+		expect(got.map((i) => i.CustomAvatarItemId)).toEqual([
+			newer.CustomAvatarItemId,
+			older.CustomAvatarItemId,
+		])
+		expect(got.map((i) => i.CustomAvatarItemId)).not.toContain(unpublished.CustomAvatarItemId)
+		expect(got[0]).toMatchObject({ Name: 'Newer', IsFeatured: true, CurrentSaves: [] })
+
+		function item(name: string, accessibility: number) {
+			return {
+				customAvatarItemId: crypto.randomUUID(),
+				creatorAccountId: 205,
+				name,
+				description: '',
+				price: 0,
+				baseAvatarItemId: 1,
+				baseAvatarItemColor: '#fff',
+				accessibility,
+				designFilename: 'design_x.bin',
+				thumbnailImageFilename: 'thumb_x.png',
+			}
+		}
+	})
+
+	test('GET /api/inventions/v1/featureddormskins returns []', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/featureddormskins`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual([])
 	})
@@ -948,10 +1013,70 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	test('GET /api/customAvatarItems/v2/fromCreator/:id returns an empty paginated result', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v2/fromCreator/2`)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual({ Results: [], TotalResults: 0 })
+	test('GET /api/customAvatarItems/v2/fromCreator/:id shows unpublished items only to the creator', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+		const base = {
+			description: '',
+			price: 0,
+			baseAvatarItemId: 1,
+			baseAvatarItemColor: '#fff',
+			designFilename: 'design_x.bin',
+			thumbnailImageFilename: 'thumb_x.png',
+		}
+		const pub = await createCustomAvatarItem(
+			env.DB,
+			{
+				...base,
+				customAvatarItemId: crypto.randomUUID(),
+				creatorAccountId: 205,
+				name: 'Published',
+				accessibility: 1,
+			},
+			new Date('2026-08-01T00:00:00Z')
+		)
+		const draft = await createCustomAvatarItem(
+			env.DB,
+			{
+				...base,
+				customAvatarItemId: crypto.randomUUID(),
+				creatorAccountId: 205,
+				name: 'Draft',
+				accessibility: 0,
+			},
+			new Date('2026-08-02T00:00:00Z')
+		)
+		await createCustomAvatarItem(env.DB, {
+			...base,
+			customAvatarItemId: crypto.randomUUID(),
+			creatorAccountId: 9,
+			name: 'Other',
+			accessibility: 0,
+		})
+
+		type Page = { Results: Array<{ CustomAvatarItemId: string }>; TotalResults: number }
+		const url = `${ORIGIN}/api/customAvatarItems/v2/fromCreator/205`
+
+		// Anonymous, or someone else: only the published (Accessibility != 0) item.
+		for (const headers of [{}, await bearer('9')]) {
+			const res = await exports.default.fetch(url, { headers })
+			expect(res.status).toBe(200)
+			const page = (await res.json()) as Page
+			expect(page.TotalResults).toBe(1)
+			expect(page.Results.map((i) => i.CustomAvatarItemId)).toEqual([pub.CustomAvatarItemId])
+		}
+
+		// The creator: their unpublished item too, newest first.
+		const own = (await (
+			await exports.default.fetch(url, { headers: await bearer('205') })
+		).json()) as Page
+		expect(own.TotalResults).toBe(2)
+		expect(own.Results.map((i) => i.CustomAvatarItemId)).toEqual([
+			draft.CustomAvatarItemId,
+			pub.CustomAvatarItemId,
+		])
+
+		const none = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v2/fromCreator/2`)
+		expect(await none.json()).toEqual({ Results: [], TotalResults: 0 })
 	})
 
 	// Nothing locks avatar items here, so the array is empty and the posted ids are never
@@ -2349,6 +2474,231 @@ describe('auth-gated endpoints', () => {
 	test('401 with a garbage token', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`, {
 			headers: { Authorization: 'Bearer not-a-real-token' },
+		})
+		expect(res.status).toBe(401)
+	})
+})
+
+describe('custom avatar items', () => {
+	test('minPriceForPublicItem is a bare 100', async () => {
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/minPriceForPublicItem`
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toBe(100)
+	})
+
+	test('POST creates an item from the multipart form and returns it', async () => {
+		const form = new FormData()
+		form.set(
+			'metadata',
+			JSON.stringify({
+				Name: 'custom shirt 1',
+				Description: 'custom shirt 2',
+				Price: 0,
+				BaseAvatarItemId: 2184,
+				BaseAvatarItemColor: '#F55C1A',
+				Accessibility: 0,
+			})
+		)
+		form.set(
+			'thumbnailImage',
+			new File([new Uint8Array([1, 2, 3])], 'file.bin', { type: 'image/png' })
+		)
+		form.set('design', new File([new Uint8Array([4, 5, 6])], 'file.bin', { type: 'image/png' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+			method: 'POST',
+			headers: await bearer('205'),
+			body: form,
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as {
+			Value: Record<string, unknown>
+			Success: boolean
+			Error: null
+			error_id: null
+		}
+		expect(body.Success).toBe(true)
+		expect(body.Error).toBeNull()
+		expect(body.error_id).toBeNull()
+		expect(body.Value).toMatchObject({
+			CreatorAccountId: 205,
+			Name: 'custom shirt 1',
+			Description: 'custom shirt 2',
+			Price: 0,
+			Accessibility: 0,
+			ForceCannotPublish: false,
+			IsFeatured: false,
+			IsRecRoomApproved: false,
+			BaseAvatarItemId: 2184,
+			BaseAvatarItemColor: '#F55C1A',
+			PreviewOrientation: 0,
+			RankingContext: null,
+			OutfitType: 0,
+			CurrentSaves: [],
+			PurchaseInfo: null,
+		})
+		const itemId = body.Value.CustomAvatarItemId as string
+		expect(itemId).toMatch(/^[0-9a-f-]{36}$/)
+		const date = (body.Value.CreatedAt as string).slice(0, 10)
+		expect(body.Value.ThumbnailImageFilename).toBe(`avatar-item/${date}/${itemId}-thumb.png`)
+		expect(body.Value.DesignFilename).toBe(`avatar-item/${date}/${itemId}-design.png`)
+		expect(body.Value.CreatedAt).toBe(body.Value.ModifiedAt)
+
+		// Both uploads landed in the image bucket under those keys.
+		const thumb = await env.IMAGES.get(body.Value.ThumbnailImageFilename as string)
+		expect(new Uint8Array((await thumb!.arrayBuffer()) as ArrayBuffer)).toEqual(
+			new Uint8Array([1, 2, 3])
+		)
+		expect(thumb!.httpMetadata?.contentType).toBe('image/png')
+		const design = await env.IMAGES.get(body.Value.DesignFilename as string)
+		expect(new Uint8Array((await design!.arrayBuffer()) as ArrayBuffer)).toEqual(
+			new Uint8Array([4, 5, 6])
+		)
+
+		const row = await env.DB.prepare(
+			'SELECT name, creator_account_id FROM custom_avatar_item WHERE custom_avatar_item_id = ?1'
+		)
+			.bind(body.Value.CustomAvatarItemId)
+			.first()
+		expect(row).toEqual({ name: 'custom shirt 1', creator_account_id: 205 })
+	})
+
+	test('PUT edits the creator’s item, leaving nulled fields alone', async () => {
+		const item = await createCustomAvatarItem(
+			env.DB,
+			{
+				customAvatarItemId: crypto.randomUUID(),
+				creatorAccountId: 205,
+				name: 'Visor',
+				description: 'shiny',
+				price: 0,
+				baseAvatarItemId: 1,
+				baseAvatarItemColor: '#fff',
+				accessibility: 0,
+				designFilename: 'd',
+				thumbnailImageFilename: 't',
+			},
+			new Date('2026-08-01T00:00:00Z')
+		)
+		const url = `${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}`
+		const res = await exports.default.fetch(url, {
+			method: 'PUT',
+			headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+			body: JSON.stringify({ Name: null, Description: null, Price: 100, Accessibility: 1 }),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as {
+			Value: Record<string, unknown>
+			Success: boolean
+			Error: null
+		}
+		expect(body.Success).toBe(true)
+		expect(body.Value).toMatchObject({
+			CustomAvatarItemId: item.CustomAvatarItemId,
+			Name: 'Visor',
+			Description: 'shiny',
+			Price: 100,
+			Accessibility: 1,
+			CreatedAt: '2026-08-01T00:00:00.000Z',
+		})
+		expect(body.Value.ModifiedAt).not.toBe(item.ModifiedAt)
+
+		// Someone else can't edit it; an unknown id 404s; a bad type 400s.
+		const other = await exports.default.fetch(url, {
+			method: 'PUT',
+			headers: { ...(await bearer('9')), 'content-type': 'application/json' },
+			body: JSON.stringify({ Price: 5 }),
+		})
+		expect(other.status).toBe(403)
+		const missing = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/${crypto.randomUUID()}`,
+			{
+				method: 'PUT',
+				headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+				body: JSON.stringify({ Price: 5 }),
+			}
+		)
+		expect(missing.status).toBe(404)
+		const bad = await exports.default.fetch(url, {
+			method: 'PUT',
+			headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+			body: JSON.stringify({ Price: 'lots' }),
+		})
+		expect(bad.status).toBe(400)
+		expect(await bad.json()).toMatchObject({ Success: false, Value: null })
+		expect(await (await exports.default.fetch(url, { method: 'PUT' })).status).toBe(401)
+	})
+
+	test('DELETE removes the creator’s item and its bucket objects', async () => {
+		// Create through the endpoint so the objects really exist in the bucket.
+		const form = new FormData()
+		form.set(
+			'metadata',
+			JSON.stringify({ Name: 'Gone', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
+		)
+		form.set('thumbnailImage', new File([new Uint8Array([1])], 'file.bin', { type: 'image/png' }))
+		form.set('design', new File([new Uint8Array([2])], 'file.bin', { type: 'image/png' }))
+		const created = (await (
+			await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+				method: 'POST',
+				headers: await bearer('205'),
+				body: form,
+			})
+		).json()) as {
+			Value: { CustomAvatarItemId: string; ThumbnailImageFilename: string; DesignFilename: string }
+		}
+		const { CustomAvatarItemId, ThumbnailImageFilename, DesignFilename } = created.Value
+		expect(await env.IMAGES.get(ThumbnailImageFilename)).not.toBeNull()
+		const url = `${ORIGIN}/api/customAvatarItems/v1/${CustomAvatarItemId}`
+
+		// Not the creator → 403 and nothing changes.
+		const other = await exports.default.fetch(url, { method: 'DELETE', headers: await bearer('9') })
+		expect(other.status).toBe(403)
+		expect(await env.IMAGES.get(ThumbnailImageFilename)).not.toBeNull()
+
+		const res = await exports.default.fetch(url, { method: 'DELETE', headers: await bearer('205') })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toMatchObject({
+			Success: true,
+			Error: null,
+			Value: { CustomAvatarItemId, Name: 'Gone' },
+		})
+		expect(await env.IMAGES.get(ThumbnailImageFilename)).toBeNull()
+		expect(await env.IMAGES.get(DesignFilename)).toBeNull()
+		expect(
+			await env.DB.prepare('SELECT 1 FROM custom_avatar_item WHERE custom_avatar_item_id = ?1')
+				.bind(CustomAvatarItemId)
+				.first()
+		).toBeNull()
+
+		// Gone now → 404; no token → 401.
+		const again = await exports.default.fetch(url, {
+			method: 'DELETE',
+			headers: await bearer('205'),
+		})
+		expect(again.status).toBe(404)
+		expect((await exports.default.fetch(url, { method: 'DELETE' })).status).toBe(401)
+	})
+
+	test('POST 400s without the files', async () => {
+		const form = new FormData()
+		form.set(
+			'metadata',
+			JSON.stringify({ Name: 'x', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff' })
+		)
+		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+			method: 'POST',
+			headers: await bearer(),
+			body: form,
+		})
+		expect(res.status).toBe(400)
+		expect(await res.json()).toMatchObject({ Success: false, Value: null })
+	})
+
+	test('POST 401s without a token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+			method: 'POST',
 		})
 		expect(res.status).toBe(401)
 	})
@@ -5269,6 +5619,7 @@ describe('openapi', () => {
 			)
 		)
 		expect([...documented].sort()).toEqual([
+			'DELETE /api/customAvatarItems/v1/{id}',
 			'DELETE /api/images/v1/deletesaved',
 			'DELETE /api/playerevents/v2/delete/{eventId}',
 			'GET /api/PlayerReporting/v1/moderationBlockDetails',
@@ -5286,6 +5637,7 @@ describe('openapi', () => {
 			'GET /api/customAvatarItems/v1/isCreationAllowedForAccount',
 			'GET /api/customAvatarItems/v1/isCreationEnabled',
 			'GET /api/customAvatarItems/v1/isRenderingEnabled',
+			'GET /api/customAvatarItems/v1/minPriceForPublicItem',
 			'GET /api/customAvatarItems/v2/fromCreator/{accountId}',
 			'GET /api/equipment/v2/getUnlocked',
 			'GET /api/gameconfigs/v1/all',
@@ -5301,6 +5653,7 @@ describe('openapi', () => {
 			'GET /api/inventions/v1',
 			'GET /api/inventions/v1/details',
 			'GET /api/inventions/v1/featured',
+			'GET /api/inventions/v1/featureddormskins',
 			'GET /api/inventions/v1/fromcreators',
 			'GET /api/inventions/v1/fulllineageowner',
 			'GET /api/inventions/v1/personaldetails/{inventionId}',
@@ -5369,6 +5722,7 @@ describe('openapi', () => {
 			'POST /api/avatar/v1/lockeditems/bulk',
 			'POST /api/avatar/v2/gifts/generate',
 			'POST /api/customAvatarItems/GetCustomAvatarItemCurrentSavesForLegacyAvatarItems',
+			'POST /api/customAvatarItems/v1',
 			'POST /api/customAvatarItems/v1/bulk',
 			'POST /api/gamesight/event',
 			'POST /api/images/v1/cheer',
@@ -5409,6 +5763,7 @@ describe('openapi', () => {
 			'POST /api/v1/progression/bulk',
 			'POST /outfits/bulk',
 			'POST /statsigUserProperties',
+			'PUT /api/customAvatarItems/v1/{id}',
 			'PUT /api/playerevents/v2/{eventId}/accessibility',
 			'PUT /api/playerevents/v2/{eventId}/description',
 			'PUT /api/playerevents/v2/{eventId}/name',

@@ -15,6 +15,10 @@ import {
 
 // The `invention` table belongs to the `api` worker; buyInvention reads it, so its DDL
 // is built here too (see the same cross-worker import in econ.app.ts).
+import {
+	createCustomAvatarItem,
+	SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL,
+} from '../../../../api/src/custom-avatar-items-db'
 import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventions-db'
 // The notification-type ids the hub carries, from the worker that owns them — asserting
 // against the enum rather than a copied number is what keeps these frames honest.
@@ -69,6 +73,7 @@ beforeAll(async () => {
 	for (const stmt of RECEIVED_GIFT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTORY_INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 		.bind(JSON.stringify({ accountId: 42, username: 'Tester', displayName: 'Tester' }))
 		.run()
@@ -673,6 +678,63 @@ describe('econ endpoints', () => {
 			expect(res.status, path).toBe(200)
 			expect(await res.json(), path).toEqual([])
 		}
+	})
+
+	test('POST /api/ugcPurchasables/v1/items/bulk resolves custom avatar items, echoing RoomId', async () => {
+		const item = await createCustomAvatarItem(env.DB, {
+			customAvatarItemId: crypto.randomUUID(),
+			creatorAccountId: 205,
+			name: 'Neon Visor',
+			description: '',
+			price: 250,
+			baseAvatarItemId: 1,
+			baseAvatarItemColor: '#fff',
+			accessibility: 0,
+			designFilename: 'design_x.bin',
+			thumbnailImageFilename: 'thumb_x.png',
+		})
+		const res = await exports.default.fetch(`${ORIGIN}/api/ugcPurchasables/v1/items/bulk`, {
+			method: 'POST',
+			headers: { ...(await bearer()), 'content-type': 'application/json' },
+			body: JSON.stringify({
+				RoomId: 92,
+				Ids: [
+					{ itemType: 3, itemId: item.CustomAvatarItemId },
+					{ itemType: 3, itemId: 'does-not-exist' },
+					{ itemType: 1, itemId: item.CustomAvatarItemId },
+				],
+			}),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([
+			{
+				ItemType: 3,
+				ItemId: item.CustomAvatarItemId,
+				Name: 'Neon Visor',
+				Description: '',
+				ImageName: 'thumb_x.png',
+				RoomId: 92,
+				Price: 250,
+				PurchaseCurrencyId: null,
+				CreatedAt: item.CreatedAt,
+				ModifiedAt: item.ModifiedAt,
+			},
+		])
+	})
+
+	test('POST /api/ugcPurchasables/v1/items/bulk 400s without Ids and 401s without a token', async () => {
+		const bad = await exports.default.fetch(`${ORIGIN}/api/ugcPurchasables/v1/items/bulk`, {
+			method: 'POST',
+			headers: { ...(await bearer()), 'content-type': 'application/json' },
+			body: JSON.stringify({ RoomId: 92 }),
+		})
+		expect(bad.status).toBe(400)
+		const anon = await exports.default.fetch(`${ORIGIN}/api/ugcPurchasables/v1/items/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ RoomId: 92, Ids: [] }),
+		})
+		expect(anon.status).toBe(401)
 	})
 
 	test('GET /econ/roomEconConfig/:roomId echoes the room and disables sorting tabs', async () => {
@@ -2868,6 +2930,7 @@ describe('econ endpoints', () => {
 			'POST /api/objectives/v1/cleargroup',
 			'POST /api/objectives/v1/updateobjective',
 			'POST /api/storefronts/v2/buyItem',
+			'POST /api/ugcPurchasables/v1/items/bulk',
 			'PUT /api/equipment/v1/update',
 		])
 

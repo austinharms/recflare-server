@@ -21,6 +21,13 @@ import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
 // Invention storage (owned by the `api` worker, on this same `recflare` database).
 // Imported directly rather than copied: these are plain D1 helpers with no bindings of
 // their own, and buyInvention has to read the very rows `api` writes.
+// Custom avatar items likewise live in an `api`-owned table; the UGC-purchasable bulk
+// lookup is the store's view of those rows.
+import {
+	getCustomAvatarItems,
+	toUgcPurchasable,
+	UGC_ITEM_TYPE_CUSTOM_AVATAR_ITEM,
+} from '../../api/src/custom-avatar-items-db'
 import { getInventionById, toSaveResult } from '../../api/src/inventions-db'
 // The notification-type ids the hub carries, and the payload shapes recovered from the
 // client's own decoder (both owned by the `notify` worker). Imported rather than copied so
@@ -92,6 +99,8 @@ import {
 	SaveOutfitRequest,
 	SaveOutfitV4Response,
 	SubscriptionResponse,
+	UgcPurchasableBulkRequest,
+	UgcPurchasableItemList,
 	UNAUTHORIZED_RESPONSE,
 	UpdateObjectiveRequest,
 	UpdateObjectiveResponse,
@@ -2214,6 +2223,46 @@ const app = new Hono<App>({ strict: false })
 		'/api/ugcPurchasables/v1/items/room/:roomId',
 		listRoute('A room’s UGC purchasables', 'Empty stub so the client doesn’t 404'),
 		(c) => c.json([])
+	)
+
+	// Bulk lookup of UGC purchasables by `{ itemType, itemId }`. Only custom avatar items
+	// (type 3) exist to resolve; they come off the api-owned `custom_avatar_item` table.
+	.post(
+		'/api/ugcPurchasables/v1/items/bulk',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'Look up UGC purchasables by id',
+			description:
+				'Resolves `Ids[]` (`{ itemType, itemId }`) against the `custom_avatar_item` table and ' +
+				'answers the store-facing `UgcPurchasableItem` view of each, in request order. ' +
+				'Only `itemType` 3 (custom avatar item) is served; other types and unknown ids are ' +
+				'dropped. `RoomId` is echoed onto every item — what the client wants it for is ' +
+				'not yet known. `PurchaseCurrencyId` is null until a currency exists.',
+			security: AUTHED,
+			requestBody: jsonBody(UgcPurchasableBulkRequest, 'The room and the ids to resolve'),
+			responses: {
+				200: json(UgcPurchasableItemList, 'The resolved items (unknown ids omitted)'),
+				400: json(ErrorResponse, 'Malformed body'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (!body || !Array.isArray(body.Ids)) return c.json({ error: 'Ids is required' }, 400)
+			const roomId = typeof body.RoomId === 'number' ? body.RoomId : 0
+			const ids = (body.Ids as unknown[]).flatMap((ref) => {
+				if (!ref || typeof ref !== 'object') return []
+				const { itemType, itemId } = ref as Record<string, unknown>
+				return itemType === UGC_ITEM_TYPE_CUSTOM_AVATAR_ITEM && typeof itemId === 'string'
+					? [itemId]
+					: []
+			})
+			const items = await getCustomAvatarItems(c.env.DB, ids)
+			return c.json(items.map((item) => toUgcPurchasable(item, roomId)))
+		}
 	)
 
 	// Unlocked consumables. [Authorize]. The consumables the player has bought (from

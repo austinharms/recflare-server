@@ -50,6 +50,13 @@ export const UNAUTHORIZED_RESPONSE = { description: 'Missing or invalid bearer t
 /** Bearer-JWT security requirement, for the auth-gated routes. */
 export const AUTHED = [{ bearerAuth: [] }]
 
+/**
+ * A bearer token is honoured but not required: anonymous is a valid alternative. For routes
+ * that serve public data but show more to a known caller (a creator's own unpublished
+ * custom avatar items) instead of 401ing.
+ */
+export const OPTIONAL_AUTHED: OpenAPIV3_1.SecurityRequirementObject[] = [{}, { bearerAuth: [] }]
+
 /** An integer path parameter (ids are constrained to `[0-9]+` by the route pattern). */
 export function idParam(name: string, description: string): OpenAPIV3_1.ParameterObject {
 	return { name, in: 'path', required: true, description, schema: { type: 'integer' } }
@@ -90,6 +97,9 @@ export const JsonArray = z.array(z.unknown())
 
 /** A bare JSON boolean — several routes answer `true`/`false` with no envelope. */
 export const BareBoolean = z.boolean()
+
+/** A bare JSON integer (e.g. `/api/customAvatarItems/v1/minPriceForPublicItem`). */
+export const BareInteger = z.number().int()
 
 /** A bare JSON string (`POST /api/sanitize/v1` echoes one back). */
 export const BareString = z.string()
@@ -312,7 +322,9 @@ export const CheerPlayerRequest = z.object({
 export const SetSelectedCheerRequest = z.object({
 	CheerCategory: z
 		.string()
-		.describe('The category to pin: 0 General, 10 Helpful, 20 Sportmanship, 30 GreatHost, 40 Creative; -1 unpins'),
+		.describe(
+			'The category to pin: 0 General, 10 Helpful, 20 Sportmanship, 30 GreatHost, 40 Creative; -1 unpins'
+		),
 })
 
 /**
@@ -324,6 +336,66 @@ export const SetSelectedCheerRequest = z.object({
 export const CheerPlayerResponse = z.object({
 	Success: z.boolean(),
 	Message: z.string().nullable().describe('Null when the cheer landed'),
+})
+
+/** The `metadata` JSON field of a custom-avatar-item creation. */
+export const CreateCustomAvatarItemMetadata = z.object({
+	Name: z.string(),
+	Description: z.string().optional(),
+	Price: z.number().int().optional(),
+	BaseAvatarItemId: z.number().int(),
+	BaseAvatarItemColor: z.string().describe('Hex colour, e.g. `#F55C1A`'),
+	Accessibility: z.number().int().optional(),
+})
+
+/** The multipart body `POST /api/customAvatarItems/v1` takes. */
+export const CreateCustomAvatarItemRequest = z.object({
+	metadata: z.string().describe('JSON `CreateCustomAvatarItemMetadata`, posted as a text field'),
+	thumbnailImage: z.string().describe('The thumbnail PNG (binary file part)'),
+	design: z.string().describe('The design blob (binary file part)'),
+})
+
+/** The client's `CustomAvatarItem` record. */
+export const CustomAvatarItemDto = z.object({
+	CustomAvatarItemId: z.string(),
+	CreatorAccountId: z.number().int(),
+	Name: z.string(),
+	Description: z.string(),
+	Price: z.number().int(),
+	Accessibility: z.number().int(),
+	ForceCannotPublish: z.boolean(),
+	IsFeatured: z.boolean(),
+	IsRecRoomApproved: z.boolean(),
+	BaseAvatarItemId: z.number().int(),
+	BaseAvatarItemColor: z.string(),
+	DesignFilename: z.string(),
+	ThumbnailImageFilename: z.string(),
+	CreatedAt: z.string(),
+	ModifiedAt: z.string(),
+	PreviewOrientation: z.number().int(),
+	RankingContext: z.null(),
+	OutfitType: z.number().int(),
+	CurrentSaves: z.array(z.unknown()),
+	PurchaseInfo: z.null(),
+})
+
+/** The JSON body `PUT /api/customAvatarItems/v1/:id` takes; null leaves a field unchanged. */
+export const UpdateCustomAvatarItemRequest = z.object({
+	Name: z.string().nullable().optional(),
+	Description: z.string().nullable().optional(),
+	Price: z.number().int().nullable().optional(),
+	Accessibility: z.number().int().nullable().optional(),
+})
+
+/** A bare list of custom avatar items (the featured feed). */
+export const CustomAvatarItemList = z.array(CustomAvatarItemDto)
+
+/** The PascalCase `{ Value, Success, Error, error_id }` envelope custom-avatar-item routes answer with. */
+export const CustomAvatarItemResponse = z.object({
+	Value: CustomAvatarItemDto.nullable(),
+	Success: z.boolean(),
+	Error: z.string().nullable(),
+	error_id: z.string().nullable(),
 })
 
 /** The `Ids` form body the bulk POST endpoints take. */
@@ -507,7 +579,7 @@ export const BulkCustomAvatarItemsRequest = z.object({
 
 /** A paginated custom-avatar-item page (no storage yet, so always empty). */
 export const CustomAvatarItemsPage = z.object({
-	Results: JsonArray,
+	Results: CustomAvatarItemList,
 	TotalResults: z.int(),
 })
 
