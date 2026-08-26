@@ -1489,6 +1489,25 @@ describe('econ endpoints', () => {
 		expect(received?.payload).toMatchObject({ Message: masked })
 	})
 
+	test('POST /api/storefronts/v2/buyItem caps the gift message at the client’s 150 characters', async () => {
+		await seedAccount(209, 'LongNoteReceiver')
+		await drainFrames()
+		// The client's input field stops at 150, so a 200-character note is a client that
+		// ignored its own limit — the overrun is dropped, the purchase still goes through.
+		const long = 'a'.repeat(140) + 'b'.repeat(60)
+		const res = await giftBackpack('335', { ToPlayerId: 209, Message: long, Anonymous: false })
+		expect(res.status).toBe(200)
+		const [gift] = await pendingGifts('209')
+		expect(gift?.Message).toBe(long.slice(0, 150))
+		expect((gift?.Message as string).length).toBe(150)
+		// An emoji straddling the cut is dropped whole rather than stored as half a character.
+		const emoji = `${'x'.repeat(149)}😀tail`
+		const second = await giftBackpack('336', { ToPlayerId: 209, Message: emoji, Anonymous: false })
+		expect(second.status).toBe(200)
+		const notes = (await pendingGifts('209')).map((box) => box.Message)
+		expect(notes).toContain('x'.repeat(149))
+	})
+
 	test('POST /api/storefronts/v2/buyItem 404s a gift to a player that does not exist', async () => {
 		await drainFrames()
 		const res = await giftBackpack('332', { ToPlayerId: 999999, Message: 'hi', Anonymous: false })

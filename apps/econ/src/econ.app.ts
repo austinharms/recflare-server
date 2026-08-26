@@ -656,21 +656,46 @@ const COACH_ACCOUNT_ID = 1
 const DEFAULT_GIFT_MESSAGE = 'A gift for you <3'
 
 /**
- * The note a gift box carries, masked the way every other string a player typed is.
+ * The most a gift note may carry — the same 150 the client's own input field stops typing at,
+ * so a longer one is a client that ignored its own limit rather than a longer note.
+ */
+const MAX_GIFT_MESSAGE_LENGTH = 150
+
+/**
+ * The note a gift box carries: capped at {@link MAX_GIFT_MESSAGE_LENGTH}, then masked the way
+ * every other string a player typed is.
  *
  * The buyer writes this and someone ELSE reads it — off the box, out of the hub frame, and
  * for as long as the box goes unopened — so a gift is a way to put text in front of a player
- * who never chose to hear from you. The same filter runs in `chat` for the same reason:
- * nothing obliges a client to have called `POST /api/sanitize/v1` first, and this is the last
- * point before the note is stored.
+ * who never chose to hear from you. That is why both rules are re-applied here: nothing
+ * obliges a client to have called `POST /api/sanitize/v1` first, or to have honoured its own
+ * character limit, and this is the last point before the note is stored. `chat` censors its
+ * messages again for the same reason.
  *
- * Masking (not refusing) matches the rest of this server: the purchase goes through, the
- * swear comes out as asterisks, and the buyer is never told their gift was rejected. Blocked
- * characters are deliberately left alone, as in chat — a note is emoji-carrying text, and
- * stripping format characters would break the joiners inside a multi-person emoji.
+ * Trimming and masking (rather than refusing) matches the rest of this server: the purchase
+ * goes through, the swear comes out as asterisks, the overrun is dropped, and the buyer is
+ * never told their gift was rejected. Blocked characters are deliberately left alone, as in
+ * chat — a note is emoji-carrying text, and stripping format characters would break the
+ * joiners inside a multi-person emoji.
+ *
+ * The cap is applied FIRST so what gets filtered is what gets stored: cutting a word in half
+ * can leave a swear where there wasn't one ("assassin" ending as "ass"), and cutting after
+ * the mask would leave a half-masked word instead. Both counts are UTF-16 units, as the
+ * client's are — a trailing lone surrogate is dropped rather than stored as half a character.
  */
 function giftMessage(gift: GiftRequest | null): string {
-	return typeof gift?.Message === 'string' ? censorSwears(gift.Message) : DEFAULT_GIFT_MESSAGE
+	if (typeof gift?.Message !== 'string') return DEFAULT_GIFT_MESSAGE
+	return censorSwears(truncateGiftMessage(gift.Message))
+}
+
+/** `message` cut to the cap, never through the middle of a surrogate pair. */
+function truncateGiftMessage(message: string): string {
+	if (message.length <= MAX_GIFT_MESSAGE_LENGTH) return message
+	const cut = message.slice(0, MAX_GIFT_MESSAGE_LENGTH)
+	const last = cut.charCodeAt(cut.length - 1)
+	// A high surrogate at the end lost its partner to the cut, and alone it is not a
+	// character at all — the client would draw the replacement glyph for it.
+	return last >= 0xd800 && last <= 0xdbff ? cut.slice(0, -1) : cut
 }
 
 /**
