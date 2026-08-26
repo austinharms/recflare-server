@@ -151,6 +151,26 @@ inconsistency here without checking the client first.
   served under TWO names, `result` (what the client reads) and `errorCode` (what this
   server has always sent); they are the same number and must never disagree, which is why
   everything answers through `matchmakeResult` rather than building the envelope by hand.
+- A cheer (`api`: `POST /api/PlayerCheer/v1/create`) is a thing that happens in FRONT of
+  people, so the `ReputationUpdate` frame naming the cheered player goes to everyone in the
+  room instance, not just the two players — the effect plays on every client that gets it.
+  Two of the frame's fields are per-send instructions that wear the name of a profile field
+  on the reputation DTO (`api`: `/api/playerReputation/…`) and mean something else:
+  - `IsCheerful` on the DTO is a profile flag; on the frame, true plays the visual effect
+    and false moves the counters silently. It comes from the request's `Anonymous`,
+    INVERTED — never off the stored record, which doesn't vary. The second frame, the one
+    refreshing the giver's own `CheerCredit`, sends false: nothing was cheered at them.
+  - `SelectedCheer` on the DTO is the player's pinned cheer; on the frame it is WHICH cheer
+    plays — the category just given.
+  The cheered player gets the frame durably (their counters moved); the rest of the room
+  gets it ephemerally, since an effect queued for someone offline would play out of
+  nowhere hours later. The audience comes from the giver's live `presence` row, NOT the
+  body's `RoomId`, which is accepted and unused — otherwise a client could play its effect
+  in a room it isn't in. Neither `RoomId` nor `Anonymous` is stored; the frame is the whole
+  of their effect.
+- The cheer's reply is `{ Success, Message }` — PascalCase, with `Message` NULL on success.
+  That is NOT the lowercase `{ success, error: "" }` envelope the reports and warnings use;
+  the two live side by side in the same worker and must not be unified.
 - Accessibility is sent as the `RoomAccessibility` enum NAME on
   `rooms` `PUT /rooms/:id/subrooms/:sid/accessibility` (`accessibility=Private`), not the
   ordinal the room-level `/rooms/:id/accessibility` takes. The enum has five members

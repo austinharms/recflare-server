@@ -44,6 +44,14 @@ import {
 	isPlayerBanned,
 	SCHEMA_DDL as REPORTS_SCHEMA_DDL,
 } from '../../reports-db'
+import {
+	CheerCategory,
+	DAILY_CHEER_CREDIT,
+	getCheerCredit,
+	getReputation,
+	SCHEMA_DDL as REPUTATION_SCHEMA_DDL,
+	spendCheerCredit,
+} from '../../reputation-db'
 import { charadesWordsFor } from '../../routes/gameplay'
 import { getWarningsAgainst, SCHEMA_DDL as WARNINGS_SCHEMA_DDL } from '../../warnings-db'
 
@@ -136,6 +144,9 @@ beforeAll(async () => {
 
 	// Player events table (owned by the api worker) — scheduled events live here.
 	for (const stmt of EVENTS_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+
+	// Reputation + cheer credit (owned by the api worker) — cheering writes both.
+	for (const stmt of REPUTATION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 })
 
 // Mint a token the way the `auth` worker does, signing with the shared test key seeded into the JWT_SECRET store, so the
@@ -317,6 +328,290 @@ describe('public endpoints', () => {
 		const many = await exports.default.fetch(`${ORIGIN}/api/playerReputation/v2/bulk?id=1&id=2`)
 		const reps = (await many.json()) as Array<{ AccountId: number }>
 		expect(reps.map((r) => r.AccountId)).toEqual([1, 2])
+	})
+
+	// Cheering: `POST /api/PlayerCheer/v1/create`. The giver comes from the token, so these
+	// use ids of their own (71xx) rather than the shared 42 — a spent credit is durable
+	// state, and the reputation reads above assert all-zero records.
+	const cheer = async (fields: Record<string, string>, sub = '7100') =>
+		exports.default.fetch(`${ORIGIN}/api/PlayerCheer/v1/create`, {
+			method: 'POST',
+			headers: {
+				...(await bearer(sub)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams(fields),
+		})
+
+	const reputationOf = async (id: number) =>
+		(await (await exports.default.fetch(`${ORIGIN}/api/playerReputation/v1/${id}`)).json()) as {
+			CheerCredit: number
+			CheerGeneral: number
+			CheerHelpful: number
+		}
+
+	test('a cheer counts on the target and spends the giver’s credit', async () => {
+		// The body the client posts, verbatim from the live request.
+		const res = await cheer({
+			PlayerIdTo: '7101',
+			CheerCategory: '0',
+			RoomId: '112',
+			Anonymous: 'False',
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ Success: true, Message: null })
+
+		// The target's counter moved and nothing else did — in particular their OWN credit is
+		// untouched, since receiving a cheer doesn't pay for giving one.
+		expect(await reputationOf(7101)).toMatchObject({
+			CheerGeneral: 1,
+			CheerHelpful: 0,
+			CheerCredit: DAILY_CHEER_CREDIT,
+		})
+		// The giver paid, and has no counters of their own.
+		expect(await reputationOf(7100)).toMatchObject({
+			CheerGeneral: 0,
+			CheerCredit: DAILY_CHEER_CREDIT - 1,
+		})
+	})
+
+	test('each category counts into its own column', async () => {
+		for (const category of [
+			CheerCategory.General,
+			CheerCategory.Helpful,
+			CheerCategory.Sportmanship,
+			CheerCategory.GreatHost,
+			CheerCategory.Creative,
+		]) {
+			expect(
+				(await cheer({ PlayerIdTo: '7102', CheerCategory: String(category) }, '7103')).status
+			).toBe(200)
+		}
+		expect(await getReputation(env.DB, 7102)).toEqual({
+			AccountId: 7102,
+			IsCheerful: true,
+			Noteriety: 0,
+			SelectedCheer: 0,
+			CheerCredit: DAILY_CHEER_CREDIT,
+			CheerGeneral: 1,
+			CheerHelpful: 1,
+			CheerCreative: 1,
+			CheerGreatHost: 1,
+			CheerSportsman: 1,
+			SubscriberCount: 0,
+			SubscribedCount: 0,
+		})
+	})
+
+	test('a cheer the server can’t count is refused before it costs anything', async () => {
+		// Each refusal answers 200 with the reason — the client shows `Message` — and none of
+		// them may take a credit off the caller, which is what the closing assertion checks.
+		for (const [fields, Message] of [
+			[{ PlayerIdTo: '7105' }, 'CheerCategory is not a cheer category'],
+			// -1 is the enum's `None`: a real member, but not a counter.
+			[{ PlayerIdTo: '7105', CheerCategory: '-1' }, 'CheerCategory is not a cheer category'],
+			[{ PlayerIdTo: '7105', CheerCategory: '5' }, 'CheerCategory is not a cheer category'],
+			[{ CheerCategory: '0' }, 'PlayerIdTo is required'],
+			[{ PlayerIdTo: '7104', CheerCategory: '0' }, 'You cannot cheer yourself'],
+		] as Array<[Record<string, string>, string]>) {
+			const res = await cheer(fields, '7104')
+			expect(res.status).toBe(200)
+			expect(await res.json()).toEqual({ Success: false, Message })
+		}
+		expect(await getCheerCredit(env.DB, 7104)).toBe(DAILY_CHEER_CREDIT)
+		expect(await reputationOf(7105)).toMatchObject({ CheerGeneral: 0 })
+	})
+
+	test('the cheer frame plays in front of the whole room instance', async () => {
+		// Presence is written by the `match` worker; seeded straight into the table here.
+		// 7108 (the giver), 7109 (the target) and 7120 (a bystander) share instance 8800;
+		// 7121 stands in a different instance and must hear nothing.
+		const standIn = async (accountId: number, roomInstanceId: number | null) =>
+			env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+				.bind(
+					JSON.stringify({
+						accountId,
+						roomInstance: roomInstanceId === null ? null : { roomInstanceId, roomId: 112 },
+						statusVisibility: 0,
+						deviceClass: 0,
+						vrMovementMode: 0,
+						platform: 0,
+						appVersion: GAME_VERSION,
+						expiresAt: Math.floor(Date.now() / 1000) + PRESENCE_TTL_SECONDS,
+					})
+				)
+				.run()
+
+		// The notify DO is stubbed to record every notifyPlayer / notifyPlayersEphemeral call
+		// (see vitest.config).
+		const cheerHub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const framesFor = async (anonymous: string) => {
+			await cheerHub().fetch('http://do/all', { method: 'DELETE' })
+			expect(
+				(
+					await cheer(
+						{ PlayerIdTo: '7109', CheerCategory: '10', RoomId: '112', Anonymous: anonymous },
+						'7108'
+					)
+				).status
+			).toBe(200)
+			return (await (await cheerHub().fetch('http://do/all')).json()) as Array<{
+				playerId?: number
+				playerIds?: number[]
+				ephemeral?: boolean
+				notificationType: string
+				data: {
+					AccountId: number
+					IsCheerful: boolean
+					SelectedCheer: number | null
+					CheerHelpful: number
+					CheerCredit: number
+				}
+			}>
+		}
+
+		for (const id of [7108, 7109, 7120]) await standIn(id, 8800)
+		await standIn(7121, 8801)
+
+		// A signed cheer. Three sends: the target durably, the rest of their instance
+		// ephemerally, then the giver's own credit refresh.
+		const signed = await framesFor('False')
+		expect(signed).toHaveLength(3)
+
+		// `AccountId` is who the frame is ABOUT, not who it goes to — the room hears about
+		// 7109. `SelectedCheer` is the category just given (10, Helpful), not a pinned cheer.
+		const played = {
+			AccountId: 7109,
+			IsCheerful: true,
+			SelectedCheer: CheerCategory.Helpful,
+			CheerHelpful: 1,
+		}
+		expect(signed[0]).toMatchObject({ playerId: 7109, data: played })
+		// The bystander and the giver see it; the target is not in the room list (they got
+		// the durable copy), and 7121 is in another instance entirely.
+		expect(signed[1]).toMatchObject({ playerIds: [7108, 7120], ephemeral: true, data: played })
+
+		// The giver's second frame is about THEM: spent credit, no effect, no cheer selected.
+		expect(signed[2]).toMatchObject({
+			playerId: 7108,
+			data: {
+				AccountId: 7108,
+				IsCheerful: false,
+				SelectedCheer: 0,
+				CheerCredit: DAILY_CHEER_CREDIT - 1,
+			},
+		})
+
+		// An anonymous cheer reaches exactly the same people and moves the same counter —
+		// it just doesn't announce itself.
+		const anonymous = await framesFor('True')
+		expect(anonymous[0]).toMatchObject({
+			playerId: 7109,
+			data: {
+				AccountId: 7109,
+				IsCheerful: false,
+				SelectedCheer: CheerCategory.Helpful,
+				CheerHelpful: 2,
+			},
+		})
+		expect(anonymous[1]).toMatchObject({ playerIds: [7108, 7120], data: { IsCheerful: false } })
+
+		// The frame carries only the fields the client's decoder has — no Noteriety or
+		// subscriber counts, which live on the profile DTO alone.
+		expect(Object.keys(anonymous[0]!.data).sort()).toEqual([
+			'AccountId',
+			'CheerCreative',
+			'CheerCredit',
+			'CheerGeneral',
+			'CheerGreatHost',
+			'CheerHelpful',
+			'CheerSportsman',
+			'IsCheerful',
+			'SelectedCheer',
+		])
+	})
+
+	test('a cheer with no room instance still reaches the player cheered', async () => {
+		// Cheering from a profile screen: the giver has lobby presence (roomInstance null),
+		// so there is no audience — but the target's own frame is not the room's to lose.
+		await env.DB.prepare('INSERT OR REPLACE INTO presence (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					accountId: 7130,
+					roomInstance: null,
+					statusVisibility: 0,
+					deviceClass: 0,
+					vrMovementMode: 0,
+					platform: 0,
+					appVersion: GAME_VERSION,
+					expiresAt: Math.floor(Date.now() / 1000) + PRESENCE_TTL_SECONDS,
+				})
+			)
+			.run()
+		const cheerHub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await cheerHub().fetch('http://do/all', { method: 'DELETE' })
+
+		expect((await cheer({ PlayerIdTo: '7131', CheerCategory: '40' }, '7130')).status).toBe(200)
+
+		const frames = (await (await cheerHub().fetch('http://do/all')).json()) as Array<{
+			playerId?: number
+			ephemeral?: boolean
+			data: { AccountId: number; SelectedCheer: number | null }
+		}>
+		// Two sends, both durable and both addressed: nothing was broadcast.
+		expect(frames.map((f) => f.playerId)).toEqual([7131, 7130])
+		expect(frames.some((f) => f.ephemeral)).toBe(false)
+		expect(frames[0]!.data).toMatchObject({
+			AccountId: 7131,
+			SelectedCheer: CheerCategory.Creative,
+		})
+	})
+
+	test('cheering needs a token', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/PlayerCheer/v1/create`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: new URLSearchParams({ PlayerIdTo: '7101', CheerCategory: '0' }),
+		})
+		expect(res.status).toBe(401)
+	})
+
+	test('the daily credit runs out and refills a day after the FIRST cheer', async () => {
+		// Driven through spendCheerCredit with an injected clock: burning 20 cheers over HTTP
+		// says nothing more than this does, and the rollover can't be tested any other way.
+		const start = new Date('2026-08-25T09:00:00.000Z')
+		const at = (hours: number) => new Date(start.getTime() + hours * 60 * 60 * 1000)
+
+		// The first spend opens the window; the credit counts down to nothing.
+		for (let spent = 1; spent <= DAILY_CHEER_CREDIT; spent++) {
+			// Spread across the window — spending inside it must not slide the deadline.
+			expect(await spendCheerCredit(env.DB, 7110, at(spent === 1 ? 0 : 12))).toBe(
+				DAILY_CHEER_CREDIT - spent
+			)
+		}
+		expect(await spendCheerCredit(env.DB, 7110, at(12))).toBeNull()
+		expect(await getCheerCredit(env.DB, 7110, at(12))).toBe(0)
+
+		// 23 hours in, still empty: the window is measured from the first cheer, not the last.
+		expect(await spendCheerCredit(env.DB, 7110, at(23))).toBeNull()
+
+		// A day after that first cheer it refills — lazily, on the spend itself, so nothing
+		// has to run on a schedule.
+		expect(await getCheerCredit(env.DB, 7110, at(24.5))).toBe(DAILY_CHEER_CREDIT)
+		expect(await spendCheerCredit(env.DB, 7110, at(24.5))).toBe(DAILY_CHEER_CREDIT - 1)
+		expect(await getCheerCredit(env.DB, 7110, at(25))).toBe(DAILY_CHEER_CREDIT - 1)
+	})
+
+	test('a player out of credit is refused, and the target keeps their counters', async () => {
+		// Empty 7106's credit directly, then try to cheer over HTTP.
+		for (let i = 0; i < DAILY_CHEER_CREDIT; i++) await spendCheerCredit(env.DB, 7106)
+		const res = await cheer({ PlayerIdTo: '7107', CheerCategory: '10' }, '7106')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({
+			Success: false,
+			Message: 'You are out of cheers for today',
+		})
+		expect(await reputationOf(7107)).toMatchObject({ CheerHelpful: 0 })
 	})
 
 	test('GET /api/activities/charades/v1/words/Charades returns the word bank', async () => {
@@ -5004,6 +5299,7 @@ describe('openapi', () => {
 			'GET /outfits/me',
 			'GET /outfits/me/saved',
 			'GET /voice/config',
+			'POST /api/PlayerCheer/v1/create',
 			'POST /api/PlayerReporting/v1/deviceId',
 			'POST /api/PlayerReporting/v1/hile',
 			'POST /api/PlayerReporting/v1/moderationBlockDetails',

@@ -250,10 +250,14 @@ export const MutualFriendDto = z.object({
 // ---- Progression -----------------------------------------------------------
 
 /**
- * A player's reputation (cheer counters). Nobody has earned cheers yet, so every
- * counter is 0 and everyone has their full credit. `SelectedCheer` is an int (0 = none),
- * not null, and `IsCheerful` is true — the client reads it to decide whether the player
- * may hand out cheers at all.
+ * A player's reputation (cheer counters), read from the `reputation` table. A player
+ * nobody has cheered yet has no row and reads back all-zero with full cheer credit.
+ * `SelectedCheer` is an int (0 = none), not null, and `IsCheerful` is a bool the client
+ * reads to decide whether the player may hand out cheers at all.
+ *
+ * `CheerCredit` is the odd one out: it is what the player has left to GIVE (out of 20 per
+ * day), not something they have received, and it comes from `player_cheer` rather than
+ * from the reputation row.
  */
 export const ReputationDto = z.object({
 	AccountId: z.int(),
@@ -275,6 +279,45 @@ export const ProgressionDto = z.object({
 	PlayerId: z.int(),
 	Level: z.int(),
 	XP: z.int(),
+})
+
+/**
+ * The form body of `POST /api/PlayerCheer/v1/create`. Nothing here is stored beyond the
+ * counter the cheer increments: `Anonymous` is spent on the notification it triggers and
+ * `RoomId` is dropped outright — see the route.
+ */
+export const CheerPlayerRequest = z.object({
+	PlayerIdTo: z.string().describe('The account being cheered'),
+	CheerCategory: z
+		.string()
+		.describe('0 General, 10 Helpful, 20 Sportmanship, 30 GreatHost, 40 Creative'),
+	RoomId: z
+		.string()
+		.optional()
+		.describe(
+			'The room it happened in. Accepted but NOT used — the audience for the cheer’s ' +
+				'effect comes from the caller’s live presence, so a client cannot aim it at a room ' +
+				'it is not in'
+		),
+	Anonymous: z
+		.string()
+		.optional()
+		.describe(
+			'`True`/`False` (default `False`). Not stored — it sets `IsCheerful` (inverted) on ' +
+				'the `ReputationUpdate` frame, which is what plays the cheer effect on the clients ' +
+				'that receive it'
+		),
+})
+
+/**
+ * What a cheer answers — the reference's PascalCase `{ Success, Message }`, NOT the
+ * lowercase `{ success, error }` envelope the reports use, and `Message` is NULL on success
+ * where that one sends an empty string. On a refusal it names the reason (out of credit,
+ * bad category, cheering yourself), which the client shows the player.
+ */
+export const CheerPlayerResponse = z.object({
+	Success: z.boolean(),
+	Message: z.string().nullable().describe('Null when the cheer landed'),
 })
 
 /** The `Ids` form body the bulk POST endpoints take. */
