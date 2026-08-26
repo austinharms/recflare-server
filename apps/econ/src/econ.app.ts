@@ -378,6 +378,19 @@ const NOT_AN_INFLUENCER = 0
 /** The operator-granted role that comes with a complimentary subscription. */
 const DEVELOPER_ROLE = 'developer'
 
+/**
+ * Whether the caller currently holds a Rec Room Plus subscription — the ONE definition,
+ * shared by `UpdateAndGetSubscription` (which reports it) and the storefront buys (which
+ * price off it via `SubscriberPrices`). Nothing sells subscriptions here, so holding the
+ * `developer` role IS the subscription; if a real subscription store ever lands, this is
+ * the only place that has to learn about it. Read from the token's `role` claim, never the
+ * body; no or an invalid token is "not subscribed".
+ */
+async function isSubscriber(c: Context<App>): Promise<boolean> {
+	const roles = await authedRoles(c)
+	return roles?.includes(DEVELOPER_ROLE) ?? false
+}
+
 /** `SubscriptionLevel.Gold`. 1 is Platinum. */
 const SUBSCRIPTION_LEVEL_GOLD = 0
 
@@ -446,9 +459,10 @@ function toAvatarV2Dto(avatar: Avatar) {
 
 /**
  * The subset of a storefront catalog (`static/storefronts/sf{N}.json`) that `buyItem`
- * reads: each store item carries the `GiftDrop` describing what you get and a list of
- * `Prices` per currency. The catalogs hold more fields (SubscriberPrices, IsFeatured,
- * …) that the purchase path doesn't need.
+ * reads: each store item carries the `GiftDrop` describing what you get, a list of
+ * `Prices` per currency, and optionally `SubscriberPrices` — the discounted list a Rec Room
+ * Plus subscriber is shown and pays. The catalogs hold more fields (IsFeatured, …) that
+ * the purchase path doesn't need.
  */
 interface StoreGiftDrop {
 	FriendlyName: string
@@ -490,7 +504,48 @@ interface StorePrice {
 interface StoreItem {
 	GiftDrop: StoreGiftDrop
 	Prices: StorePrice[]
+	/**
+	 * The subscriber price list, where the catalog has one (sf300's item 2263 lists 95 tokens
+	 * in `Prices` and 85 in here). The client renders — and posts as `RequestedPrice` — the
+	 * subscriber price to a subscriber, so the price check has to read the same list or a
+	 * subscriber's every buy 409s as "Price has changed".
+	 */
+	SubscriberPrices?: StorePrice[] | null
 	PurchasableItemId: number
+}
+
+/**
+ * The Rec Room Plus discount, in percent off the regular price, floored to whole tokens.
+ *
+ * The client applies this ITSELF: a subscriber's client posts `floor(Price * 0.9)` as
+ * `RequestedPrice` (95 → 85, 75 → 67, 30 → 27) whatever the catalog says — the captured
+ * catalogs carry a `SubscriberPrices` list, but for 1238 of 1382 items it is a verbatim copy
+ * of `Prices` (they were captured through a non-subscriber's view), and every entry that does
+ * differ is exactly this formula. So the catalog list can't be the source of truth for the
+ * check; the formula is, and the list is only honoured where it agrees with it (i.e. is lower).
+ */
+const SUBSCRIBER_DISCOUNT_PERCENT = 10
+
+/**
+ * The price of an item in one currency for one buyer. A non-subscriber pays the `Prices`
+ * entry. A subscriber pays the `SubscriberPrices` entry when the catalog has a genuinely
+ * discounted one for that currency, else {@link SUBSCRIBER_DISCOUNT_PERCENT} off the regular
+ * price — what their client rendered and posted. `undefined` when the item isn't sold in
+ * that currency at all.
+ */
+function priceFor(
+	item: StoreItem,
+	currencyType: number,
+	subscriber: boolean
+): StorePrice | undefined {
+	const regular = item.Prices.find((p) => p.CurrencyType === currencyType)
+	if (regular === undefined || !subscriber) return regular
+	const listed = item.SubscriberPrices?.find((p) => p.CurrencyType === currencyType)
+	if (listed !== undefined && listed.Price < regular.Price) return listed
+	return {
+		CurrencyType: currencyType,
+		Price: Math.floor((regular.Price * (100 - SUBSCRIBER_DISCOUNT_PERCENT)) / 100),
+	}
 }
 interface Storefront {
 	StoreItems: StoreItem[]
@@ -1127,15 +1182,17 @@ function toPurchaseMethodId(raw: Partial<PurchaseMethodId> | null | undefined): 
  * Returns the failure — with the `UpdateResponse` its entry will carry — instead when the
  * line can't be bought.
  *
- * Pure — the catalog is passed in — so the whole bag resolves from ONE storefront read.
- * The price check is buyItem's, per line: `RequestedPrice` is the UNIT price the client
- * rendered, and a mismatch means the catalog moved under a stale client rather than that
- * the player agreed to today's price.
+ * Pure — the catalog and the buyer's subscriber status are passed in — so the whole bag
+ * resolves from ONE storefront read and ONE token read. The price check is buyItem's, per
+ * line: `RequestedPrice` is the UNIT price the client rendered (the subscriber price, for a
+ * subscriber — see {@link priceFor}), and a mismatch means the catalog moved under a stale
+ * client rather than that the player agreed to today's price.
  */
 function resolveBulkLine(
 	line: PurchaseItemRequest,
 	storefront: Storefront | null,
-	currencyType: number
+	currencyType: number,
+	subscriber: boolean
 ): BulkPurchaseLine | BulkLineFailure {
 	const method = toPurchaseMethodId(line.ItemPurchaseMethodId)
 	// Guid-keyed ids name UGC / custom avatar items, which no catalog here sells. Failing the
@@ -1184,7 +1241,7 @@ function resolveBulkLine(
 			error: 'This item can only be bought once per line',
 		}
 	}
-	const price = item.Prices.find((p) => p.CurrencyType === currencyType)
+	const price = priceFor(item, currencyType, subscriber)
 	if (price === undefined) {
 		return {
 			method,
@@ -2428,7 +2485,8 @@ const app = new Hono<App>({ strict: false })
 			summary: 'Buy a storefront item',
 			description: [
 				'Looks the item up in its storefront catalog, confirms the client’s `RequestedPrice`',
-				'still matches, debits the buyer atomically, grants the item (into the inventory or',
+				'still matches (the `SubscriberPrices` entry for a Rec Room Plus subscriber — the same',
+				'check as `UpdateAndGetSubscription` — else the `Prices` one), debits the buyer atomically, grants the item (into the inventory or',
 				'consumable table), and returns a gift box. A `Gift` block routes the item to another',
 				'player, but the caller always pays. `Balance` in the response is the CHANGE (negated',
 				'price), not the new total. Pushes a StorefrontBalancePurchase socket frame that SETS the',
@@ -2475,7 +2533,9 @@ const app = new Hono<App>({ strict: false })
 			const item = await findStoreItem(c, storefrontType as number, purchasableItemId as number)
 			if (item === null) return c.json({ error: 'Item not found' }, 404)
 
-			const price = item.Prices.find((p) => p.CurrencyType === currencyType)
+			// A subscriber is shown, and posts, the item's `SubscriberPrices` entry; checking the
+			// regular price against it 409'd every subscriber buy of a discounted item.
+			const price = priceFor(item, currencyType as number, await isSubscriber(c))
 			if (price === undefined) {
 				return c.json({ error: 'Currency type not available for this item' }, 400)
 			}
@@ -2628,8 +2688,9 @@ const app = new Hono<App>({ strict: false })
 
 			// One catalog read for the bag; every line resolves against it in memory.
 			const storefront = await loadStorefront(c, storefrontType as number)
+			const subscriber = await isSubscriber(c)
 			const resolved = lines.map((line) =>
-				resolveBulkLine(line, storefront, currencyType as number)
+				resolveBulkLine(line, storefront, currencyType as number, subscriber)
 			)
 			const buyable = resolved.filter(isBulkLine)
 
@@ -3206,8 +3267,7 @@ const app = new Hono<App>({ strict: false })
 			},
 		}),
 		async (c) => {
-			const roles = await authedRoles(c)
-			if (!roles?.includes(DEVELOPER_ROLE)) return c.json({})
+			if (!(await isSubscriber(c))) return c.json({})
 			const id = await authedId(c)
 			if (id === null) return c.json({})
 			return c.json({

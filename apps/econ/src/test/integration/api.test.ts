@@ -1265,6 +1265,67 @@ describe('econ endpoints', () => {
 		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 }])
 	})
 
+	// sf300's item 2263 is 95 tokens in `Prices` and 85 in `SubscriberPrices`. A subscriber's
+	// client renders and posts the 85, so the check has to read the list the buyer sees.
+	const buy2263 = async (headers: Record<string, string>, RequestedPrice: number) =>
+		exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...headers, 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 300,
+				PurchasableItemId: 2263,
+				CurrencyType: 2,
+				RequestedPrice,
+				CouponConsumablePlayerMappingId: null,
+				Gift: null,
+			}),
+		})
+
+	test('POST /api/storefronts/v2/buyItem charges a subscriber the SubscriberPrices entry', async () => {
+		await drainFrames()
+		const res = await buy2263(await bearer('322', ['gameClient', 'developer']), 85)
+		expect(res.status).toBe(200)
+		expect(((await res.json()) as { Balance: number }).Balance).toBe(-85)
+		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
+			headers: await bearer('322'),
+		})
+		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 - 85 }])
+	})
+
+	test('POST /api/storefronts/v2/buyItem derives the subscriber price when the catalog lists none', async () => {
+		// sf3's item 2184 is 95 in BOTH lists (captured through a non-subscriber's view), but a
+		// subscriber's client still posts floor(95 * 0.9) = 85.
+		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('325', ['gameClient', 'developer'])),
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: 2184,
+				CurrencyType: 2,
+				RequestedPrice: 85,
+				CouponConsumablePlayerMappingId: null,
+				Gift: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		expect(((await res.json()) as { Balance: number }).Balance).toBe(-85)
+	})
+
+	test('POST /api/storefronts/v2/buyItem 409s a subscriber posting the regular price', async () => {
+		const res = await buy2263(await bearer('323', ['gameClient', 'developer']), 95)
+		expect(res.status).toBe(409)
+	})
+
+	test('POST /api/storefronts/v2/buyItem 409s a non-subscriber posting the subscriber price', async () => {
+		const res = await buy2263(await bearer('324'), 85)
+		expect(res.status).toBe(409)
+		const ok = await buy2263(await bearer('324'), 95)
+		expect(ok.status).toBe(200)
+	})
+
 	test('POST /api/storefronts/v2/buyItem 404s for an unknown item', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
