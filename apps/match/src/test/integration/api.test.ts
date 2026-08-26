@@ -19,6 +19,7 @@ import {
 	ROOM_INVITE_SCHEMA_DDL,
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
+	setPresence,
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
@@ -2426,6 +2427,79 @@ describe('auth-gated endpoints', () => {
 		expect(after[0].data.Data).toBe('999999')
 	})
 
+	test('POST /invite picks the invite message type off the token’s build', async () => {
+		type Sent = { data: { Type: number; Data: string; RoomId: number | null } }
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sent = async (): Promise<Sent[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Sent[]
+
+		const instance = await createRoomInstance(env.DB, {
+			ownerAccountId: 42,
+			roomId: 2,
+			subRoomId: 2,
+			photonRoomId: crypto.randomUUID(),
+			name: '^RecCenter',
+			maxCapacity: 12,
+		})
+
+		// The one frame an invite from a client on `version` pushes, with the RoomInviteId
+		// the call answered — a v2 invite names it in its Data.
+		const inviteFrom = async (
+			version?: string
+		): Promise<{ frame: Sent; roomInviteId: number }> => {
+			await hub().fetch('http://do/all', { method: 'DELETE' })
+			const res = await exports.default.fetch(`${ORIGIN}/invite`, {
+				method: 'POST',
+				headers: {
+					...(await bearer('42', version)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: `playerId=153&roomInstanceId=${instance.roomInstanceId}`,
+			})
+			expect(res.status).toBe(200)
+			const { RoomInviteId } = (await res.json()) as { RoomInviteId: number }
+			const notes = await sent()
+			expect(notes).toHaveLength(1)
+			return { frame: notes[0], roomInviteId: RoomInviteId }
+		}
+		const typeFor = async (version?: string): Promise<number> =>
+			(await inviteFrom(version)).frame.data.Type
+
+		// The cutoff build and anything newer → GameInviteV2 (6). The cutoff is INCLUSIVE, and
+		// the point release after the date is not part of the comparison.
+		expect(await typeFor('20250718.01')).toBe(6)
+		expect(await typeFor('20230415')).toBe(6)
+		expect(await typeFor('20230414')).toBe(6)
+		expect(await typeFor('20230414.99')).toBe(6)
+
+		// Only builds OLDER than the cutoff get the original (0) — including the day before.
+		expect(await typeFor('20230413')).toBe(0)
+		expect(await typeFor('20230413.99')).toBe(0)
+		expect(await typeFor('20220101')).toBe(0)
+
+		// No `rn.ver` on the token, or one that isn't a build at all: fall back to the
+		// original rather than move an unknown client onto v2.
+		expect(await typeFor()).toBe(0)
+		expect(await typeFor('not-a-build')).toBe(0)
+
+		// v2 carries an escaped JSON object as its Data — a STRING holding JSON, not a
+		// nested object — naming the instance and the invite row behind it.
+		const v2 = await inviteFrom('20250718.01')
+		expect(typeof v2.frame.data.Data).toBe('string')
+		expect(JSON.parse(v2.frame.data.Data)).toEqual({
+			InviteId: v2.roomInviteId, // the row POST /invite just answered with
+			Name: '^RecCenter', // the instance's `^`-prefixed wire name
+			InviteMode: 22, // verbatim, as observed off the client
+		})
+		// RoomId still rides on the message itself, in both versions.
+		expect(v2.frame.data.RoomId).toBe(2)
+
+		// v1 is unchanged: the bare roomInstanceId as a string, no JSON.
+		const v1 = await inviteFrom('20220101')
+		expect(v1.frame.data.Data).toBe(String(instance.roomInstanceId))
+		expect(v1.frame.data.RoomId).toBe(2)
+	})
+
 	test('matchmake pushes SubscriptionUpdatePresence to the player’s friends', async () => {
 		// The notify DO is stubbed to record every send (see vitest.config). The friend
 		// fan-out is a single batch call carrying the friend ids.
@@ -2751,6 +2825,114 @@ describe('auth-gated endpoints', () => {
 		expect(await sent()).toEqual([])
 	})
 
+	test('POST /matchmake/invite/:id lands the invitee in the inviter’s instance', async () => {
+		// 8801 invites 8802. The invite row is what POST /invite answers with.
+		const instance = await createRoomInstance(env.DB, {
+			ownerAccountId: 8801,
+			roomId: 2,
+			subRoomId: 2,
+			photonRoomId: crypto.randomUUID(),
+			name: '^RecCenter',
+			maxCapacity: 12,
+		})
+		const stand = async (accountId: number, roomInstance: unknown) =>
+			setPresence(env.DB, {
+				accountId,
+				roomInstance,
+				statusVisibility: 0,
+				deviceClass: 0,
+				vrMovementMode: 1,
+				platform: 0,
+				appVersion: GAME_VERSION,
+			})
+		await stand(8801, instance)
+
+		const invite = async (sub: string) =>
+			exports.default.fetch(`${ORIGIN}/invite`, {
+				method: 'POST',
+				headers: {
+					...(await bearer(sub)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: `playerId=8802&roomInstanceId=${instance.roomInstanceId}`,
+			})
+		const accept = async (inviteId: number, sub: string) =>
+			exports.default.fetch(`${ORIGIN}/matchmake/invite/${inviteId}`, {
+				method: 'POST',
+				headers: {
+					...(await bearer(sub)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: 'CorrelationId=acc97dc2-be74-4722-99c3-36530491f5ff',
+			})
+
+		const { RoomInviteId } = (await (await invite('8801')).json()) as { RoomInviteId: number }
+
+		// Anyone who isn't the addressee is refused, the INVITER included — the row is the
+		// authorization, and an invite id is a small integer somebody else is holding.
+		for (const stranger of ['8801', '8803']) {
+			const res = await accept(RoomInviteId, stranger)
+			expect(res.status).toBe(200)
+			expect(await res.json()).toMatchObject({ ErrorCode: 76, RoomInstance: null })
+		}
+
+		// The addressee lands in the instance the inviter is standing in, answered in the
+		// PascalCase envelope with the CorrelationId echoed back.
+		const ok = await accept(RoomInviteId, '8802')
+		expect(ok.status).toBe(200)
+		expect(await ok.json()).toMatchObject({
+			ErrorCode: 0,
+			CorrelationId: 'acc97dc2-be74-4722-99c3-36530491f5ff',
+			RoomInstance: {
+				RoomInstanceId: instance.roomInstanceId,
+				RoomId: 2,
+				Name: '^RecCenter',
+				MatchmakingPolicy: 0,
+			},
+		})
+
+		// ...and it really moved them: presence now names that instance.
+		const presence = await exports.default.fetch(`${ORIGIN}/player?id=8802`, {
+			headers: await bearer('8802'),
+		})
+		expect(
+			((await presence.json()) as Array<{ roomInstance: { roomInstanceId: number } | null }>)[0]
+				?.roomInstance?.roomInstanceId
+		).toBe(instance.roomInstanceId)
+
+		// Standing there already is 17, not a second join.
+		const again = await accept(RoomInviteId, '8802')
+		expect(await again.json()).toMatchObject({ ErrorCode: 17, RoomInstance: null })
+
+		// An invite id that isn't there is 40 — expiry deletes rows, so "gone" and "expired"
+		// are one answer.
+		expect(await (await accept(99_999_999, '8802')).json()).toMatchObject({
+			ErrorCode: 40,
+			RoomInstance: null,
+		})
+
+		// The inviter walking out leaves nothing to join: 2, PlayerNotOnline. (The invitee is
+		// moved out of the instance first so the AlreadyIn check doesn't answer ahead of it.)
+		await stand(8802, null)
+		await env.DB.prepare('DELETE FROM presence WHERE account_id = 8801').run()
+		const { RoomInviteId: staleId } = (await (await invite('8801')).json()) as {
+			RoomInviteId: number
+		}
+		expect(await (await accept(staleId, '8802')).json()).toMatchObject({
+			ErrorCode: 2,
+			RoomInstance: null,
+		})
+
+		// Unauthenticated is a 401, not a refusal code.
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/matchmake/invite/${RoomInviteId}`, {
+					method: 'POST',
+				})
+			).status
+		).toBe(401)
+	})
+
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -2786,6 +2968,7 @@ describe('auth-gated endpoints', () => {
 			'POST /matchmake/dorm',
 			'POST /matchmake/event/{eventId}',
 			'POST /matchmake/instance/{instanceId}',
+			'POST /matchmake/invite/{inviteId}',
 			'POST /matchmake/none',
 			'POST /matchmake/player/{playerId}',
 			'POST /matchmake/room/{roomId}',
