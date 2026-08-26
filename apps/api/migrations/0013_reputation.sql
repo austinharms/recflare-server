@@ -23,10 +23,8 @@
 -- numbers that will have a source one day, so the column is here and turning them on later
 -- is a write rather than a migration.
 --
--- `IsCheerful` and `SelectedCheer` are NOT columns. They ride along on the DTO and the
--- `ReputationUpdate` frame, but nothing on this server varies them per player — they are
--- constants (true / 0) the projection fills in. A column defaulted to the same value for
--- everybody, that nothing ever writes, only invites a reader to believe it means something.
+-- `IsCheerful` and `SelectedCheer` were left off here on the theory that nothing varied
+-- them per player; 0014 adds them — `SelectedCheer` is written by `SetSelectedCheer`.
 
 CREATE TABLE IF NOT EXISTS reputation (
   account_id INTEGER PRIMARY KEY,

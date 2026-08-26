@@ -263,7 +263,7 @@ export const ReputationDto = z.object({
 	AccountId: z.int(),
 	IsCheerful: z.boolean(),
 	Noteriety: z.int(),
-	SelectedCheer: z.int().describe('0 = none selected'),
+	SelectedCheer: z.int().describe('The cheer pinned to the profile; 0 = none selected'),
 	CheerCredit: z.int(),
 	CheerGeneral: z.int(),
 	CheerHelpful: z.int(),
@@ -303,10 +303,16 @@ export const CheerPlayerRequest = z.object({
 		.string()
 		.optional()
 		.describe(
-			'`True`/`False` (default `False`). Not stored — it sets `IsCheerful` (inverted) on ' +
-				'the `ReputationUpdate` frame, which is what plays the cheer effect on the clients ' +
-				'that receive it'
+			'`True`/`False` (default `False`). Not stored — it picks the `PlayerCheerAnonymous` ' +
+				'message type (sender 0) over `PlayerCheer` for the frame that plays the cheer'
 		),
+})
+
+/** The form body of `POST /api/PlayerCheer/v1/SetSelectedCheer`. */
+export const SetSelectedCheerRequest = z.object({
+	CheerCategory: z
+		.string()
+		.describe('The category to pin: 0 General, 10 Helpful, 20 Sportmanship, 30 GreatHost, 40 Creative; -1 unpins'),
 })
 
 /**

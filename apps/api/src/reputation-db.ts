@@ -13,19 +13,20 @@
  *   {@link DAILY_CHEER_CREDIT} once the window in `created` is a day old. One row per
  *   account, created the first time they spend one.
  *
- * Three of the client's fields are deliberately NOT columns. `CheerCredit` sits alongside
+ * One of the client's fields is deliberately NOT a column. `CheerCredit` sits alongside
  * the counters in the client's record but is `player_cheer.cheers_left` with the rollover
  * applied — storing it twice would let the number a player reads drift from the one the
- * spend checks. `IsCheerful` and `SelectedCheer` are constants nothing varies per player;
- * they exist only to fill out the DTO. (On the `ReputationUpdate` frame `IsCheerful` is a
- * different thing wearing the same name — see {@link IS_CHEERFUL}.)
+ * spend checks. `SelectedCheer` (the cheer pinned to the profile, set by
+ * `POST /api/PlayerCheer/v1/SetSelectedCheer`) and `IsCheerful` (a profile flag every
+ * reference serves as true) ARE columns, added in 0014 — the `ReputationUpdate` frame is
+ * the record trimmed, nothing more, so both come off the row.
  *
- * The `api` worker owns the schema/migration (migrations/0013_reputation.sql, applied
- * under its own `migrations_table` so it doesn't clash with the other workers' migrations
- * that share the database).
+ * The `api` worker owns the schema/migrations (migrations/0013_reputation.sql and
+ * 0014_reputation_selected_cheer.sql, applied under its own `migrations_table` so they
+ * don't clash with the other workers' migrations that share the database).
  */
 
-/** Schema DDL (mirror of migrations/0013_reputation.sql). */
+/** Schema DDL (mirror of migrations/0013_reputation.sql + 0014, folded into one CREATE). */
 export const SCHEMA_DDL: string[] = [
 	`CREATE TABLE IF NOT EXISTS reputation (
 		account_id INTEGER PRIMARY KEY,
@@ -36,7 +37,9 @@ export const SCHEMA_DDL: string[] = [
 		cheer_great_host INTEGER NOT NULL DEFAULT 0,
 		cheer_sportsman INTEGER NOT NULL DEFAULT 0,
 		subscriber_count INTEGER NOT NULL DEFAULT 0,
-		subscribed_count INTEGER NOT NULL DEFAULT 0
+		subscribed_count INTEGER NOT NULL DEFAULT 0,
+		is_cheerful INTEGER NOT NULL DEFAULT 1,
+		selected_cheer INTEGER NOT NULL DEFAULT 0
 	)`,
 	`CREATE TABLE IF NOT EXISTS player_cheer (
 		player_id INTEGER PRIMARY KEY,
@@ -93,15 +96,18 @@ interface ReputationRow {
 	cheer_sportsman: number
 	subscriber_count: number
 	subscribed_count: number
+	/** SQLite boolean: 0 / 1. */
+	is_cheerful: number
+	selected_cheer: number
 }
 
 /**
- * A player's reputation as the client's DTO renders it — and, trimmed and with `IsCheerful`
- * overridden, as the `ReputationUpdate` frame carries it.
+ * A player's reputation as the client's DTO renders it — and, trimmed, as the
+ * `ReputationUpdate` frame carries it.
  *
- * Not all of it is stored. `Noteriety` (the reference's spelling), `SubscriberCount` and
- * `SubscribedCount` are columns nothing writes yet. {@link IS_CHEERFUL} and
- * {@link SELECTED_CHEER} aren't columns at all — see their comments.
+ * `Noteriety` (the reference's spelling), `SubscriberCount` and `SubscribedCount` are
+ * columns nothing writes yet. `IsCheerful` is a column nothing writes either, defaulted
+ * true like every reference serves it. `SelectedCheer` is the pinned cheer, 0 = none.
  */
 export interface Reputation {
 	AccountId: number
@@ -119,25 +125,6 @@ export interface Reputation {
 }
 
 /**
- * `IsCheerful` as the profile DTO carries it. Nothing on this server varies it per player,
- * so it is a constant rather than a column defaulted the same way for everybody.
- *
- * Do NOT reach for this when building a `ReputationUpdate` frame. The field is named the
- * same there but means something else — it is a per-frame flag driving the cheer's visual
- * effect on the receiving client, which the cheer route sets from the request's
- * `Anonymous`. Only the two names coincide.
- */
-const IS_CHEERFUL = true
-
-/**
- * The cheer a player has PINNED to their profile (0 = none). No endpoint sets one — the
- * client's picker posts elsewhere and this server doesn't serve that path — so, like
- * {@link IS_CHEERFUL}, it is a constant rather than a column defaulted to the same value
- * for everybody.
- */
-const SELECTED_CHEER = 0
-
-/**
  * What a player with no row has: nobody has cheered them, and they hold their full credit.
  * `credit` is passed in rather than defaulted because a player can have spent cheers
  * without having received any — the two tables are independent.
@@ -145,9 +132,9 @@ const SELECTED_CHEER = 0
 export function defaultReputation(accountId: number, credit = DAILY_CHEER_CREDIT): Reputation {
 	return {
 		AccountId: accountId,
-		IsCheerful: IS_CHEERFUL,
+		IsCheerful: true,
 		Noteriety: 0,
-		SelectedCheer: SELECTED_CHEER,
+		SelectedCheer: 0,
 		CheerCredit: credit,
 		CheerGeneral: 0,
 		CheerHelpful: 0,
@@ -163,9 +150,9 @@ export function defaultReputation(accountId: number, credit = DAILY_CHEER_CREDIT
 function toReputation(row: ReputationRow, credit: number): Reputation {
 	return {
 		AccountId: row.account_id,
-		IsCheerful: IS_CHEERFUL,
+		IsCheerful: row.is_cheerful !== 0,
 		Noteriety: row.noteriety,
-		SelectedCheer: SELECTED_CHEER,
+		SelectedCheer: row.selected_cheer,
 		CheerCredit: credit,
 		CheerGeneral: row.cheer_general,
 		CheerHelpful: row.cheer_helpful,
@@ -327,5 +314,32 @@ export async function addCheer(
 	])
 	// RETURNING always yields the upserted row; the non-null assert keeps the caller from
 	// having to handle an impossible null.
+	return toReputation(row!, credit)
+}
+
+/**
+ * Pin `category` as `accountId`'s selected cheer — the badge the client shows on their
+ * profile — returning the reputation they now hold. `None` (-1) unpins it, stored as 0 the
+ * way the DTO reads "nothing selected". Creates the row if nobody has cheered them yet:
+ * a player can pin a badge before ever receiving a cheer.
+ */
+export async function setSelectedCheer(
+	db: D1Database,
+	accountId: number,
+	category: CheerCategory,
+	now: Date = new Date()
+): Promise<Reputation> {
+	const selected = category === CheerCategory.None ? 0 : category
+	const [row, credit] = await Promise.all([
+		db
+			.prepare(
+				`INSERT INTO reputation (account_id, selected_cheer) VALUES (?1, ?2)
+				 ON CONFLICT (account_id) DO UPDATE SET selected_cheer = ?2
+				 RETURNING *`
+			)
+			.bind(accountId, selected)
+			.first<ReputationRow>(),
+		getCheerCredit(db, accountId, now),
+	])
 	return toReputation(row!, credit)
 }

@@ -151,23 +151,21 @@ inconsistency here without checking the client first.
   served under TWO names, `result` (what the client reads) and `errorCode` (what this
   server has always sent); they are the same number and must never disagree, which is why
   everything answers through `matchmakeResult` rather than building the envelope by hand.
-- A cheer (`api`: `POST /api/PlayerCheer/v1/create`) is a thing that happens in FRONT of
-  people, so the `ReputationUpdate` frame naming the cheered player goes to everyone in the
-  room instance, not just the two players — the effect plays on every client that gets it.
-  Two of the frame's fields are per-send instructions that wear the name of a profile field
-  on the reputation DTO (`api`: `/api/playerReputation/…`) and mean something else:
-  - `IsCheerful` on the DTO is a profile flag; on the frame, true plays the visual effect
-    and false moves the counters silently. It comes from the request's `Anonymous`,
-    INVERTED — never off the stored record, which doesn't vary. The second frame, the one
-    refreshing the giver's own `CheerCredit`, sends false: nothing was cheered at them.
-  - `SelectedCheer` on the DTO is the player's pinned cheer; on the frame it is WHICH cheer
-    plays — the category just given.
-  The cheered player gets the frame durably (their counters moved); the rest of the room
-  gets it ephemerally, since an effect queued for someone offline would play out of
-  nowhere hours later. The audience comes from the giver's live `presence` row, NOT the
-  body's `RoomId`, which is accepted and unused — otherwise a client could play its effect
-  in a room it isn't in. Neither `RoomId` nor `Anonymous` is stored; the frame is the whole
-  of their effect.
+- What PLAYS a cheer on the cheered player's client is a `MessageReceived` frame carrying a
+  Message of type 50 `PlayerCheer` (51 `PlayerCheerAnonymous`, `FromPlayerId` 0, when the
+  body says `Anonymous`) with `Data` = the category as a string — the same frame every
+  reference server (meownet-api, DorkNet, E12354) sends. `ReputationUpdate` alone refreshes
+  the counters and shows nothing: the cheer "worked" server-side and nobody saw it. The
+  `ReputationUpdate` frames the cheer (`api`: `POST /api/PlayerCheer/v1/create`) sends are
+  the RECORD, trimmed — `IsCheerful` (a profile flag, always true) and `SelectedCheer` (the
+  cheer pinned via `POST /api/PlayerCheer/v1/SetSelectedCheer`, stored on `reputation`) come
+  off the row exactly as the DTO serves them. This server once overrode both per frame to
+  "play" the cheer; no reference does, and it played nothing.
+- A cheer is a thing that happens in FRONT of people, so the `ReputationUpdate` naming the
+  cheered player goes to everyone in the room instance, not just the two players. The
+  cheered player gets it durably (their counters moved); the rest of the room gets it
+  ephemerally. The audience comes from the giver's live `presence` row, NOT the body's
+  `RoomId`, which is accepted and unused. Neither `RoomId` nor `Anonymous` is stored.
 - The cheer's reply is `{ Success, Message }` — PascalCase, with `Message` NULL on success.
   That is NOT the lowercase `{ success, error: "" }` envelope the reports and warnings use;
   the two live side by side in the same worker and must not be unified.

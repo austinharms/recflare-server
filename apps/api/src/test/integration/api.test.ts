@@ -14,6 +14,7 @@ import {
 	LEVEL_REQUIRED_XP,
 	LEVEL_REWARDS,
 	MAX_LEVEL,
+	MessageType,
 	OUTFIT_SCHEMA_DDL,
 	PRESENCE_SCHEMA_DDL,
 	PRESENCE_TTL_SECONDS,
@@ -460,30 +461,35 @@ describe('public endpoints', () => {
 				playerIds?: number[]
 				ephemeral?: boolean
 				notificationType: string
-				data: {
-					AccountId: number
-					IsCheerful: boolean
-					SelectedCheer: number | null
-					CheerHelpful: number
-					CheerCredit: number
-				}
+				data: Record<string, unknown>
 			}>
 		}
 
 		for (const id of [7108, 7109, 7120]) await standIn(id, 8800)
 		await standIn(7121, 8801)
 
-		// A signed cheer. Three sends: the target durably, the rest of their instance
-		// ephemerally, then the giver's own credit refresh.
-		const signed = await framesFor('False')
-		expect(signed).toHaveLength(3)
+		// A signed cheer. Four sends: the PlayerCheer message that plays the cheer on the
+		// target's client, then the ReputationUpdate for the target durably, the rest of their
+		// instance ephemerally, and the giver's own credit refresh.
+		const all = await framesFor('False')
+		expect(all).toHaveLength(4)
+		expect(all[0]).toMatchObject({
+			playerId: 7109,
+			notificationType: 2, // NotificationType.MessageReceived
+			data: { FromPlayerId: 7108, ToPlayerId: 7109, Type: MessageType.PlayerCheer, Data: '10' },
+		})
+		expect(all[0]!.ephemeral).toBeFalsy()
+		const signed = all.slice(1)
+		expect(signed.every((f) => f.notificationType === 'ReputationUpdate')).toBe(true)
 
 		// `AccountId` is who the frame is ABOUT, not who it goes to — the room hears about
-		// 7109. `SelectedCheer` is the category just given (10, Helpful), not a pinned cheer.
+		// 7109. The frame is 7109's RECORD: `SelectedCheer` is their pinned cheer (none), not
+		// the category just given, and `IsCheerful` is the profile flag — the message above
+		// is what plays the cheer.
 		const played = {
 			AccountId: 7109,
 			IsCheerful: true,
-			SelectedCheer: CheerCategory.Helpful,
+			SelectedCheer: 0,
 			CheerHelpful: 1,
 		}
 		expect(signed[0]).toMatchObject({ playerId: 7109, data: played })
@@ -491,30 +497,33 @@ describe('public endpoints', () => {
 		// the durable copy), and 7121 is in another instance entirely.
 		expect(signed[1]).toMatchObject({ playerIds: [7108, 7120], ephemeral: true, data: played })
 
-		// The giver's second frame is about THEM: spent credit, no effect, no cheer selected.
+		// The giver's second frame is about THEM: their record with the spent credit.
 		expect(signed[2]).toMatchObject({
 			playerId: 7108,
 			data: {
 				AccountId: 7108,
-				IsCheerful: false,
+				IsCheerful: true,
 				SelectedCheer: 0,
 				CheerCredit: DAILY_CHEER_CREDIT - 1,
 			},
 		})
 
 		// An anonymous cheer reaches exactly the same people and moves the same counter —
-		// it just doesn't announce itself.
-		const anonymous = await framesFor('True')
+		// it just doesn't announce who gave it: the message is the anonymous type from
+		// sender 0. The reputation frames are the same records as before.
+		const allAnonymous = await framesFor('True')
+		expect(allAnonymous).toHaveLength(4)
+		expect(allAnonymous[0]).toMatchObject({
+			playerId: 7109,
+			notificationType: 2, // NotificationType.MessageReceived
+			data: { FromPlayerId: 0, ToPlayerId: 7109, Type: MessageType.PlayerCheerAnonymous, Data: '10' },
+		})
+		const anonymous = allAnonymous.slice(1)
 		expect(anonymous[0]).toMatchObject({
 			playerId: 7109,
-			data: {
-				AccountId: 7109,
-				IsCheerful: false,
-				SelectedCheer: CheerCategory.Helpful,
-				CheerHelpful: 2,
-			},
+			data: { AccountId: 7109, IsCheerful: true, SelectedCheer: 0, CheerHelpful: 2 },
 		})
-		expect(anonymous[1]).toMatchObject({ playerIds: [7108, 7120], data: { IsCheerful: false } })
+		expect(anonymous[1]).toMatchObject({ playerIds: [7108, 7120], data: { IsCheerful: true } })
 
 		// The frame carries only the fields the client's decoder has — no Noteriety or
 		// subscriber counts, which live on the profile DTO alone.
@@ -556,15 +565,66 @@ describe('public endpoints', () => {
 		const frames = (await (await cheerHub().fetch('http://do/all')).json()) as Array<{
 			playerId?: number
 			ephemeral?: boolean
-			data: { AccountId: number; SelectedCheer: number | null }
+			data: Record<string, unknown>
 		}>
-		// Two sends, both durable and both addressed: nothing was broadcast.
-		expect(frames.map((f) => f.playerId)).toEqual([7131, 7130])
+		// Three sends — the target's cheer message and reputation, then the giver's
+		// reputation — all durable and all addressed: nothing was broadcast.
+		expect(frames.map((f) => f.playerId)).toEqual([7131, 7131, 7130])
 		expect(frames.some((f) => f.ephemeral)).toBe(false)
-		expect(frames[0]!.data).toMatchObject({
-			AccountId: 7131,
-			SelectedCheer: CheerCategory.Creative,
+		expect(frames[0]!.data).toMatchObject({ ToPlayerId: 7131, Type: MessageType.PlayerCheer, Data: '40' })
+		expect(frames[1]!.data).toMatchObject({ AccountId: 7131, CheerCreative: 1 })
+	})
+
+	test('SetSelectedCheer pins a cheer to the profile and pushes the record', async () => {
+		const pin = async (CheerCategory: string, sub: string) =>
+			exports.default.fetch(`${ORIGIN}/api/PlayerCheer/v1/SetSelectedCheer`, {
+				method: 'POST',
+				headers: { ...(await bearer(sub)), 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: new URLSearchParams({ CheerCategory }),
+			})
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		// 7140 has never been cheered — pinning still works, creating their row.
+		const res = await pin(String(CheerCategory.GreatHost), '7140')
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ Success: true, Message: null })
+		expect(await getReputation(env.DB, 7140)).toMatchObject({
+			SelectedCheer: CheerCategory.GreatHost,
+			IsCheerful: true,
+			CheerGreatHost: 0,
 		})
+		const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+			playerId?: number
+			data: Record<string, unknown>
+		}>
+		expect(frames).toHaveLength(1)
+		expect(frames[0]).toMatchObject({
+			playerId: 7140,
+			data: { AccountId: 7140, SelectedCheer: CheerCategory.GreatHost },
+		})
+
+		// The pin survives a cheer landing on the row, and a cheer's frame carries it.
+		expect((await cheer({ PlayerIdTo: '7140', CheerCategory: '0' }, '7141')).status).toBe(200)
+		expect(await reputationOf(7140)).toMatchObject({ CheerGeneral: 1 })
+		expect(await getReputation(env.DB, 7140)).toMatchObject({ SelectedCheer: CheerCategory.GreatHost })
+
+		// -1 (`None`) unpins, read back as 0; a made-up category is refused.
+		expect(await (await pin('-1', '7140')).json()).toEqual({ Success: true, Message: null })
+		expect(await getReputation(env.DB, 7140)).toMatchObject({ SelectedCheer: 0 })
+		expect(await (await pin('7', '7140')).json()).toEqual({
+			Success: false,
+			Message: 'CheerCategory is not a cheer category',
+		})
+		expect((await pin('0', '7140').then((r) => r.status))).toBe(200)
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/api/PlayerCheer/v1/SetSelectedCheer`, {
+					method: 'POST',
+					body: new URLSearchParams({ CheerCategory: '0' }),
+				})
+			).status
+		).toBe(401)
 	})
 
 	test('cheering needs a token', async () => {
@@ -5299,6 +5359,7 @@ describe('openapi', () => {
 			'GET /outfits/me',
 			'GET /outfits/me/saved',
 			'GET /voice/config',
+			'POST /api/PlayerCheer/v1/SetSelectedCheer',
 			'POST /api/PlayerCheer/v1/create',
 			'POST /api/PlayerReporting/v1/deviceId',
 			'POST /api/PlayerReporting/v1/hile',

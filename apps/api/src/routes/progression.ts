@@ -1,7 +1,13 @@
 import { Hono } from 'hono'
 import { describeRoute } from 'hono-openapi'
 
-import { getPlayerIdsInInstance, getPresence, getProgression, getProgressions } from '@repo/domain'
+import {
+	getPlayerIdsInInstance,
+	getPresence,
+	getProgression,
+	getProgressions,
+	MessageType,
+} from '@repo/domain'
 import { logger } from '@repo/hono-helpers'
 
 // The notification-type ids the hub carries (owned by the `notify` worker). Imported as a
@@ -13,6 +19,7 @@ import {
 	BulkIdsRequest,
 	CheerPlayerRequest,
 	CheerPlayerResponse,
+	SetSelectedCheerRequest,
 	form,
 	idParam,
 	intQuery,
@@ -24,10 +31,12 @@ import {
 } from '../openapi'
 import {
 	addCheer,
+	CheerCategory,
 	DAILY_CHEER_CREDIT,
 	getReputation,
 	getReputations,
 	isCheerCategory,
+	setSelectedCheer,
 	spendCheerCredit,
 } from '../reputation-db'
 
@@ -63,34 +72,60 @@ async function pushProgression(c: Context<App>, progression: Progression): Promi
 }
 
 /**
- * The two fields a `ReputationUpdate` frame carries as INSTRUCTIONS rather than as facts
- * about the player named in it. Both wear the name of a profile field and mean something
- * else here, which is why they are passed per send instead of read off the record — see
- * {@link reputationFrame}.
+ * Push the `MessageReceived` frame that actually plays a cheer on the cheered player's
+ * client — a Message of type `PlayerCheer` (or its anonymous twin). That message, NOT
+ * `ReputationUpdate`, is what the client renders the cheer from; every reference server
+ * (meownet-api, DorkNet, the E12354 C# server) sends it, and a cheer that only pushes
+ * `ReputationUpdate` moves the counters and plays nothing.
+ *
+ * `Data` is the category given, as a string (a Message's `Data` is always a string). An
+ * anonymous cheer uses the anonymous type and names sender 0, so the recipient's client
+ * neither shows nor can look up who gave it — `Anonymous` decides nothing else.
+ *
+ * Durable, like the rest of the target's frames: the cheer is theirs whether or not they are
+ * connected right now. Best-effort — the cheer is already counted.
  */
-interface CheerEffect {
-	/** True plays the cheer's visual effect on the receiving client; false is silent. */
-	isCheerful: boolean
-	/** WHICH cheer plays — the category just given, not the player's pinned cheer. */
-	selectedCheer?: number
+async function pushCheerMessage(
+	c: Context<App>,
+	fromId: number,
+	toId: number,
+	category: number,
+	anonymous: boolean
+): Promise<void> {
+	try {
+		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
+			toId,
+			NotificationType.MessageReceived,
+			{
+				FromPlayerId: anonymous ? 0 : fromId,
+				ToPlayerId: toId,
+				Type: anonymous ? MessageType.PlayerCheerAnonymous : MessageType.PlayerCheer,
+				Data: String(category),
+			}
+		)
+	} catch (err) {
+		logger.error('failed to push PlayerCheer MessageReceived notification', {
+			fromId,
+			toId,
+			error: err instanceof Error ? err.message : String(err),
+		})
+	}
 }
 
 /**
  * Trim a stored reputation to the fields a `ReputationUpdate` frame carries — the client's
- * decoder has no `Noteriety` or subscriber counts on this payload, and its `SelectedCheer`
- * is nullable where the DTO's is not. Built against the recovered interface so a renamed
- * key fails the build rather than vanishing on the wire.
+ * decoder has no `Noteriety` or subscriber counts on this payload. Nothing else changes:
+ * `IsCheerful` and `SelectedCheer` are the record's, exactly as the profile DTO serves them.
+ * (This once overrode both per send to "play" the cheer — no reference does that, and the
+ * client plays a cheer off the `PlayerCheer` MESSAGE, not this frame.) Built against the
+ * recovered interface so a renamed key fails the build rather than vanishing on the wire.
  *
- * `AccountId` is who the frame is ABOUT, which is not who it is sent to: a cheer's effect
- * frame names the player being cheered and goes to everyone watching.
+ * `AccountId` is who the frame is ABOUT, which is not who it is sent to: a cheer's frame
+ * names the player being cheered and goes to everyone watching.
  */
-function reputationFrame(reputation: Reputation, effect: CheerEffect): ReputationPayload {
+function reputationFrame(reputation: Reputation): ReputationPayload {
 	const { Noteriety: _n, SubscriberCount: _sr, SubscribedCount: _sd, ...payload } = reputation
-	return {
-		...payload,
-		IsCheerful: effect.isCheerful,
-		SelectedCheer: effect.selectedCheer ?? payload.SelectedCheer,
-	}
+	return payload
 }
 
 /**
@@ -302,17 +337,18 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 				'the first cheer opens a 24-hour window, and the first cheer after that window has ' +
 				'passed starts a fresh one at full credit — so a player who spends all day refills ' +
 				'24h after their FIRST cheer, not their last.\n\n' +
+				'The cheered player gets a durable `MessageReceived` frame carrying a Message of ' +
+				'type 50 (`PlayerCheer`) — 51 (`PlayerCheerAnonymous`, sender 0) when `Anonymous` — ' +
+				'with `Data` = the category. That message is what plays the cheer on their ' +
+				'client; the `ReputationUpdate` frames below only refresh the numbers.\n\n' +
 				'A cheer is played in front of people, so the `ReputationUpdate` frame naming the ' +
 				'cheered player goes to EVERYONE in the room instance the caller is standing in, ' +
 				'not just the two of them. The cheered player gets it durably (their counters ' +
 				'really moved); the rest of the room gets it only if they are connected, since ' +
 				'the effect belongs to the moment. The caller gets a second frame of their own ' +
 				'because their `CheerCredit` moved and the response body does not carry it.\n\n' +
-				'Two fields on that frame are instructions, not facts about the player named in ' +
-				'it: `IsCheerful` plays the effect — set from `Anonymous`, inverted, so an ' +
-				'anonymous cheer moves the counters in silence — and `SelectedCheer` says which ' +
-				'cheer plays, the category just given. Both wear the name of a profile field on ' +
-				'the reputation DTO and mean something else here.\n\n' +
+				'`Anonymous` swaps the message for its anonymous twin (type 51, sender 0) and ' +
+				'nothing else — the counters move the same either way.\n\n' +
 				'The audience comes from the caller’s live presence, not from `RoomId`, which is ' +
 				'accepted and unused: a client cannot aim its effect at a room it is not in. ' +
 				'Neither field is stored — this keeps counters, not a log of individual cheers.\n\n' +
@@ -350,15 +386,15 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 
 			const cheered = await addCheer(c.env.DB, toId, category)
 
-			// The frame the room sees. It is ABOUT the player cheered — `AccountId` is theirs,
-			// and so are the counters — but it goes to everyone standing there, because the
-			// cheer is a thing that visibly happens in front of people. `IsCheerful` is what
-			// plays it (so an anonymous cheer moves the numbers in silence) and `SelectedCheer`
-			// says WHICH cheer plays: the category just given, not anyone's pinned one.
-			const frame = reputationFrame(cheered, {
-				isCheerful: !asBool(formField(body, c, 'Anonymous')),
-				selectedCheer: category,
-			})
+			// The frame that PLAYS the cheer on the cheered player's client — a Message of
+			// type PlayerCheer (or its anonymous twin). `ReputationUpdate` alone moves the
+			// numbers and shows nothing.
+			await pushCheerMessage(c, fromId, toId, category, asBool(formField(body, c, 'Anonymous')))
+
+			// The frame the room sees: the cheered player's record, so everyone's copy of
+			// their counters moves. It is ABOUT them — `AccountId` is theirs — but goes to
+			// everyone standing there.
+			const frame = reputationFrame(cheered)
 
 			// The audience is read from the GIVER's live presence, not from the body's
 			// `RoomId` — a client that lied about the room would otherwise play its effect in
@@ -379,17 +415,46 @@ export const progressionRoutes = new Hono<App>({ strict: false })
 
 			// The caller's own record, with the credit the spend just resolved rather than a
 			// re-read — a cheer they fired off in parallel must not make this frame report a
-			// credit they no longer have. Never cheerful: this one reports THEIR numbers, and
-			// nothing was cheered at them.
+			// credit they no longer have.
 			await pushReputation(
 				c,
 				fromId,
-				reputationFrame(
-					{ ...(await getReputation(c.env.DB, fromId)), CheerCredit: remaining },
-					{ isCheerful: false }
-				)
+				reputationFrame({ ...(await getReputation(c.env.DB, fromId)), CheerCredit: remaining })
 			)
 
+			return cheerResult(c)
+		}
+	)
+	// Pinning a cheer to the caller's own profile: the badge the client shows next to
+	// their name, read back as `SelectedCheer` on the reputation DTO.
+	.post(
+		'/api/PlayerCheer/v1/SetSelectedCheer',
+		describeRoute({
+			tags: ['Progression'],
+			summary: 'Pin a cheer to your profile',
+			description:
+				'Stores `CheerCategory` as the caller’s `SelectedCheer` (-1 `None` unpins, read ' +
+				'back as 0) and pushes them a `ReputationUpdate` so a second device catches up. ' +
+				'Same `{ Success, Message }` reply as the cheer.',
+			security: AUTHED,
+			requestBody: form(SetSelectedCheerRequest, 'The category to pin'),
+			responses: {
+				200: json(CheerPlayerResponse, '`{ Success: true, Message: null }`'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = await c.req.parseBody().catch(() => ({}) as Record<string, unknown>)
+			const category = asInt(formField(body, c, 'CheerCategory'))
+			if (category === null || !(category === CheerCategory.None || isCheerCategory(category))) {
+				return cheerResult(c, 'CheerCategory is not a cheer category')
+			}
+
+			const reputation = await setSelectedCheer(c.env.DB, id, category)
+			await pushReputation(c, id, reputationFrame(reputation))
 			return cheerResult(c)
 		}
 	)
