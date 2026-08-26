@@ -230,6 +230,26 @@ export async function listFeaturedCustomAvatarItems(
 }
 
 /**
+ * The "hot" (trending) feed (`GET /api/customAvatarItems/v1/hot`): every PUBLISHED item —
+ * `Accessibility` 0 is the unpublished state and is the only thing held back. Newest
+ * first, standing in for a trend ranking there is nothing to compute one from yet (no
+ * purchase or wear counts are recorded).
+ */
+export async function listHotCustomAvatarItems(
+	db: D1Database,
+	limit = 50
+): Promise<CustomAvatarItem[]> {
+	const { results } = await db
+		.prepare(
+			`SELECT * FROM custom_avatar_item WHERE accessibility != 0
+			 ORDER BY created_at DESC, custom_avatar_item_id LIMIT ?1`
+		)
+		.bind(limit)
+		.all<Row>()
+	return results.map(toDto)
+}
+
+/**
  * What an account has authored (`GET /api/customAvatarItems/v2/fromCreator/:id`), newest
  * first, with the total for the client's paginated envelope. `includeUnpublished` is for
  * the creator looking at their own shelf: it adds the `Accessibility` 0 items everyone

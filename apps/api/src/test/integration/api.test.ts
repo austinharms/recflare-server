@@ -1007,10 +1007,49 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	test('GET /api/customAvatarItems/v1/hot returns []', async () => {
+	test('GET /api/customAvatarItems/v1/hot lists the published items, newest first', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+		const empty = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/hot`)
+		expect(empty.status).toBe(200)
+		expect(await empty.json()).toEqual([])
+
+		const older = await createCustomAvatarItem(
+			env.DB,
+			item('Older', 1),
+			new Date('2026-08-01T00:00:00Z')
+		)
+		const newer = await createCustomAvatarItem(
+			env.DB,
+			item('Newer', 1),
+			new Date('2026-08-02T00:00:00Z')
+		)
+		const unpublished = await createCustomAvatarItem(env.DB, item('Unpublished', 0))
+
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/hot`)
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+		const got = (await res.json()) as Array<{ CustomAvatarItemId: string; Name: string }>
+		// Unfeatured but published: the hot feed does not care about the featured flag.
+		expect(got.map((i) => i.CustomAvatarItemId)).toEqual([
+			newer.CustomAvatarItemId,
+			older.CustomAvatarItemId,
+		])
+		expect(got.map((i) => i.CustomAvatarItemId)).not.toContain(unpublished.CustomAvatarItemId)
+		expect(got[0]).toMatchObject({ Name: 'Newer', IsFeatured: false, CurrentSaves: [] })
+
+		function item(name: string, accessibility: number) {
+			return {
+				customAvatarItemId: crypto.randomUUID(),
+				creatorAccountId: 205,
+				name,
+				description: '',
+				price: 0,
+				baseAvatarItemId: 1,
+				baseAvatarItemColor: '#fff',
+				accessibility,
+				designFilename: 'design_x.bin',
+				thumbnailImageFilename: 'thumb_x.png',
+			}
+		}
 	})
 
 	test('GET /api/customAvatarItems/v2/fromCreator/:id shows unpublished items only to the creator', async () => {

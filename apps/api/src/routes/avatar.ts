@@ -18,6 +18,7 @@ import {
 	getCustomAvatarItem,
 	listCustomAvatarItemsByCreator,
 	listFeaturedCustomAvatarItems,
+	listHotCustomAvatarItems,
 	updateCustomAvatarItem,
 } from '../custom-avatar-items-db'
 import { authedId, unauthorized } from '../http'
@@ -446,16 +447,21 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 		async (c) => c.json(await listFeaturedCustomAvatarItems(c.env.DB))
 	)
 
-	// The "hot" (trending) custom-avatar-item feed. No items yet → an empty list.
+	// The "hot" (trending) custom-avatar-item feed: every published (`Accessibility` != 0)
+	// item from the `custom_avatar_item` table. There is nothing to rank a trend from yet,
+	// so it is the accessible items, newest first.
 	.get(
 		'/api/customAvatarItems/v1/hot',
 		describeRoute({
 			tags: ['Avatar'],
 			summary: 'Trending custom avatar items',
-			description: 'The “hot” feed. No custom items exist yet, so it is empty.',
-			responses: { 200: json(JsonArray, 'An empty list') },
+			description:
+				'The “hot” feed: the published items (`Accessibility` 0 is unpublished and is left ' +
+				'out), newest first, up to 50. No purchase or wear counts are recorded, so there is ' +
+				'no trend to rank by and recency stands in for one.',
+			responses: { 200: json(CustomAvatarItemList, 'The items, newest first') },
 		}),
-		(c) => c.json([])
+		async (c) => c.json(await listHotCustomAvatarItems(c.env.DB))
 	)
 
 	// A batch lookup of custom avatar items by id. The reference filters a static catalog
