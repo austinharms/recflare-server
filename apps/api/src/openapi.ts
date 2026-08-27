@@ -966,6 +966,21 @@ export const PlayerEventReportRequest = z.object({
 	Details: z.string().optional().describe('The free-text description the reporter typed'),
 })
 
+/**
+ * `POST /api/inventions/v1/report` JSON body — a report against an invention. JSON, like
+ * the event report and unlike the form-encoded player report. The reporter is NOT in the
+ * body: it's the bearer token's player, and neither is the invention's creator, who is
+ * read from the invention.
+ */
+export const InventionReportRequest = z.object({
+	InventionId: z.int().describe('The invention being reported'),
+	ReportCategory: z
+		.int()
+		.optional()
+		.describe('The reason picked in the report UI. Stored verbatim; unmapped'),
+	Details: z.string().optional().describe('The free-text description the reporter typed'),
+})
+
 /** `POST /api/playerevents/v1/bulkInvite` JSON body — who to invite to which event. */
 export const PlayerEventBulkInviteRequest = z.object({
 	PlayerEventId: z.int(),

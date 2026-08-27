@@ -60,6 +60,7 @@ import {
 	InventionDetails,
 	InventionDto,
 	InventionPersonalDetails,
+	InventionReportRequest,
 	InventionSaveResult,
 	InventionVersionDto,
 	json,
@@ -78,12 +79,14 @@ import {
 	SetTagsResponse,
 	stringParam,
 	stringQuery,
+	SuccessErrorEnvelope,
 	SuccessValueEnvelope,
 	TagFilters,
 	UNAUTHORIZED_RESPONSE,
 	UpdateCustomAvatarItemRequest,
 	UpdatePriceRequest,
 } from '../openapi'
+import { createReport } from '../reports-db'
 
 import type { Context } from 'hono'
 import type { App } from '../context'
@@ -1295,6 +1298,70 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			const id = await authedId(c)
 			if (id === null) return unauthorized(c)
 			return c.json(await getMyInventions(c.env.DB, id))
+		}
+	)
+
+	// Report an invention. Stored in the `report` table the player and event reports use —
+	// same fields, same moderation life — with `invention_id` set. See
+	// migrations/0016_report_invention.sql.
+	.post(
+		'/api/inventions/v1/report',
+		describeRoute({
+			tags: ['Inventions', 'Moderation'],
+			summary: 'Report an invention',
+			description:
+				'Files a report against an invention. Stored as a row in the same `report` table a ' +
+				'player report goes to (`POST /api/PlayerReporting/v3/create`) and an event report ' +
+				'(`POST /api/playerevents/v1/report`) — it is the same submission with the same ' +
+				'moderation life, and a moderator converts any of them into a ban the same way. ' +
+				'What marks it as an invention report is `invention_id`; the row’s ' +
+				'`reported_player_id` is the invention’s CREATOR — who a moderator would act ' +
+				'against — read from the invention rather than sent by the client. Nothing fills ' +
+				'`room_id`: an invention isn’t tied to one room the way an event is.\n\n' +
+				'The reporter is the caller (from the bearer token), never a body field. ' +
+				'`ReportCategory` is stored verbatim — the enum is not mapped here. Nothing ' +
+				'dedupes the rows: reporting the same invention twice files two reports, and ' +
+				'reporting your own is allowed rather than being a special case.\n\n' +
+				'Answers the same `{ success, error }` envelope as the event report, `error` being ' +
+				'an empty string rather than null, on the rejected branches too so there is only ' +
+				'one shape to parse.',
+			security: AUTHED,
+			requestBody: jsonBody(InventionReportRequest, 'The report'),
+			responses: {
+				200: json(SuccessErrorEnvelope, '`{ success: true, error: "" }`'),
+				400: json(SuccessErrorEnvelope, 'No usable `InventionId` in the body'),
+				401: UNAUTHORIZED_RESPONSE,
+				404: json(SuccessErrorEnvelope, 'No such invention'),
+			},
+		}),
+		async (c) => {
+			const reporterId = await authedId(c)
+			if (reporterId === null) return unauthorized(c)
+
+			const body = await c.req
+				.json<{ InventionId?: unknown; ReportCategory?: unknown; Details?: unknown }>()
+				.catch(() => ({}) as Record<string, unknown>)
+			const inventionId = Number(body.InventionId)
+			if (!Number.isInteger(inventionId)) {
+				return c.json({ success: false, error: 'InventionId is required' }, 400)
+			}
+
+			// The invention supplies the reported player. An unknown invention is refused rather
+			// than filed against nobody: the row's reported player has to be someone, and a
+			// report naming an invention that never existed isn't actionable.
+			const invention = await getInventionById(c.env.DB, inventionId)
+			if (invention === null) return c.json({ success: false, error: 'No such invention' }, 404)
+
+			const category = Number(body.ReportCategory)
+			await createReport(c.env.DB, {
+				reporterPlayerId: reporterId,
+				reportedPlayerId: invention.CreatorPlayerId,
+				reportCategory: Number.isInteger(category) ? category : 0,
+				details: typeof body.Details === 'string' ? body.Details : null,
+				inventionId,
+			})
+
+			return c.json({ success: true, error: '' })
 		}
 	)
 

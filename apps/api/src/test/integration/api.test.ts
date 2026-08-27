@@ -1546,6 +1546,67 @@ describe('public endpoints', () => {
 		])
 	})
 
+	test('POST /api/inventions/v1/report files a report row against the invention', async () => {
+		// 5150 saves an invention; 42 reports it. The creator is derived from the invention,
+		// so the reporter never gets to name who the report is against.
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5150')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Reportable', inventionDataFilename: 'blob' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveResult).Invention.InventionId
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Details: 'test', ReportCategory: 0 }),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		// One row in the shared report table, marked as an invention report by `invention_id`,
+		// with the reported player filled in FROM the invention. `room_id` stays null: an
+		// invention isn't tied to one room the way an event is, so there is nothing to read.
+		const row = await env.DB.prepare('SELECT * FROM report WHERE invention_id = ?1')
+			.bind(inventionId)
+			.first<Record<string, unknown>>()
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 5150, // the invention's creator
+			report_category: 0,
+			details: 'test',
+			invention_id: inventionId,
+			event_id: null, // the two id columns are mutually exclusive
+			room_id: null,
+			banned: 0, // filed unbanned, like any report
+		})
+
+		// A body with no usable invention id, and one naming an invention that doesn't exist —
+		// both answer the same envelope shape as the success branch.
+		const noId = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ Details: 'x' }),
+		})
+		expect(noId.status).toBe(400)
+		expect(await noId.json()).toEqual({ success: false, error: 'InventionId is required' })
+
+		const unknown = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: 999999 }),
+		})
+		expect(unknown.status).toBe(404)
+		expect(await unknown.json()).toEqual({ success: false, error: 'No such invention' })
+
+		// Auth-gated: the reporter comes from the token, so there's no filing one signed out.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/report`, {
+			method: 'POST',
+			body: JSON.stringify({ InventionId: inventionId }),
+		})
+		expect(anon.status).toBe(401)
+	})
+
 	test('POST /api/inventions/v6/save 401s without a bearer token', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
 			method: 'POST',
@@ -5767,6 +5828,7 @@ describe('openapi', () => {
 			'POST /api/images/v1/cheer',
 			'POST /api/images/v4/uploadsaved',
 			'POST /api/images/v5/cheered/bulk',
+			'POST /api/inventions/v1/report',
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
