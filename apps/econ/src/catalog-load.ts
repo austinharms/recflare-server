@@ -259,3 +259,30 @@ export const SUBSCRIBER_DISCOUNT_PERCENT = 10
 /** The subscriber price for a regular one. Floored, matching the server's `subscriberFloor`. */
 export const subscriberPriceFor = (regular: number): number =>
 	Math.floor((regular * (100 - SUBSCRIBER_DISCOUNT_PERCENT)) / 100)
+
+/**
+ * The last client build treated as the 2023-era one, as a build number and as the ISO date the
+ * item catalogue records `CreatedAt` in.
+ *
+ * One constant in two forms because two things key off the same moment: the econ worker decides
+ * which storefront FILE a caller is served by comparing their token's `rn.ver` to the number,
+ * and the storefront generator decides which ITEMS go in the 2023 file by comparing each item's
+ * `CreatedAt` to the date. They must not drift — a build served the old store but a store built
+ * to a different date would sell items that build has never heard of.
+ */
+export const LEGACY_CLIENT_BUILD = 20_230_414
+
+/** {@link LEGACY_CLIENT_BUILD} as `YYYY-MM-DD`, for comparing against a `CreatedAt`. */
+export const LEGACY_CLIENT_BUILD_DATE = '2023-04-14'
+
+/**
+ * Whether an item existed by the time of {@link LEGACY_CLIENT_BUILD} — i.e. whether the 2023
+ * store should sell it.
+ *
+ * An item with NO `CreatedAt` is treated as too new and left out: three catalogue rows carry
+ * none, and there is no way to show they predate the cutoff. Excluding is the conservative
+ * direction — the 2023 store missing three items nobody noticed is better than it offering
+ * something that build cannot render.
+ */
+export const existedByLegacyBuild = (createdAt: string | null | undefined): boolean =>
+	typeof createdAt === 'string' && createdAt.slice(0, 10) < LEGACY_CLIENT_BUILD_DATE

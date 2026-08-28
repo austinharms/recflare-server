@@ -29,10 +29,11 @@ import { NotificationType } from '../../../../notify/src/notification-types'
 import catalogStructureSql from '../../../migrations/0015_catalog.sql?raw'
 import catalogIdSql from '../../../migrations/0016_catalog_id.sql?raw'
 import avatarItemsJson from '../../../static/db/avatar-items.json'
-import skinsJson from '../../../static/db/skins.json'
-import sf32025 from '../../../static/storefronts/sf3-2025.json'
 // The merged 2025 general store, read as a FILE: which file the route serves depends on the
 // caller's build, and these assertions are about the file's CONTENTS.
+import carriedItems from '../../../static/db/consumables.json'
+import skinsJson from '../../../static/db/skins.json'
+import sf32025 from '../../../static/storefronts/sf3-2025.json'
 import sf3 from '../../../static/storefronts/sf3.json'
 import { SCHEMA_DDL } from '../../avatar-db'
 import {
@@ -74,15 +75,55 @@ import type { CatalogLoadRow, CatalogRow, CatalogValue } from '../../catalog-db'
 import type { Env } from '../../context'
 
 /**
- * The half of the merged store that came from the item CATALOG — nothing in the file marks
- * which half a row is from, so it is whatever sf3 does not already contain.
+ * The GENERATED half of a store file — the items built from the item catalog, as opposed to the
+ * equipment, consumables and boxes carried across from the 2023 capture.
  *
- * NOT `id >= CATALOG_ID_BASE`, which looks equivalent and is not: sf3 carries one id far above
- * that range (20756767), so an id test counts it as a catalog row and every count comes out one
- * too high. Membership in sf3's own ids is the question actually being asked.
+ * Split on membership in the CARRIED ids rather than on `CATALOG_ID_BASE`. The two happen to
+ * agree now that the equipment skins are gone — the carried ids run 2168-2458, well below the
+ * base — but they did not while a skin carried id 20756767, and asking the real question costs
+ * nothing.
+ */
+const capturedIds = new Set(carriedItems.map((i) => i.PurchasableItemId))
+const catalogItems = () => sf32025.StoreItems.filter((i) => !capturedIds.has(i.PurchasableItemId))
+
+/**
+ * An item ONLY the newer store sells — created after the cutoff, so it is in sf3-2025 and not in
+ * sf3. The build gate is only observable through such an item: everything else is in both files
+ * and buys identically either way.
  */
 const sf3Ids = new Set(sf3.StoreItems.map((i) => i.PurchasableItemId))
-const catalogItems = () => sf32025.StoreItems.filter((i) => !sf3Ids.has(i.PurchasableItemId))
+const NEWER_ONLY = (() => {
+	const item = sf32025.StoreItems.find((i) => !sf3Ids.has(i.PurchasableItemId))
+	if (item === undefined) throw new Error('sf3-2025 sells nothing sf3 does not')
+	return {
+		id: item.PurchasableItemId,
+		price: item.Prices[0]!.Price,
+		name: item.GiftDrop.FriendlyName,
+	}
+})()
+
+/**
+ * Items the generated `sf3.json` sells, resolved FROM the file rather than hardcoded.
+ *
+ * sf3 used to be a capture with its own ids (73 = "Bowtie (White)" at 450); it is now generated
+ * from the item catalog, so those ids are gone and the prices come from the rarity table. Looking
+ * them up here means a regenerate — or a repriced tier — cannot leave these tests asserting
+ * against items the store no longer sells.
+ *
+ * `atPrice` picks an AVATAR item at a given tier; the carried equipment/consumables/boxes keep
+ * their captured ids and are still referenced by number where a test is about one of those.
+ */
+const sf3AvatarAtPrice = (price: number) => {
+	const item = sf3.StoreItems.find(
+		(i) => (i.GiftDrop.AvatarItemDesc ?? '') !== '' && i.Prices[0]?.Price === price
+	)
+	if (item === undefined) throw new Error(`sf3 sells no avatar item at ${price}`)
+	return { id: item.PurchasableItemId, price, name: item.GiftDrop.FriendlyName }
+}
+/** A mid-priced item — the general "buy something" fixture. */
+const SF3_ITEM = sf3AvatarAtPrice(600)
+/** The cheapest tier, for the line-level price-mismatch assertions. */
+const SF3_CHEAP = sf3AvatarAtPrice(150)
 
 declare module 'cloudflare:test' {
 	interface ProvidedEnv extends Env {}
@@ -116,6 +157,27 @@ beforeAll(async () => {
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CATALOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// A few equipment skins, which is where the WEEKLY CHALLENGE gift pool comes from now that
+	// skins are awarded rather than sold and no storefront lists one. Without these the pool is
+	// empty and the week has nothing to be themed on.
+	// Skipping the two the `catalog` block seeds by hand further down — `item_key` is the primary
+	// key, so a second insert of either would fail rather than merge.
+	const catalogBlockSeeds = new Set([
+		'19ef59c7-f74b-4c63-935a-1d4b1abd8518',
+		'bfrFOdnHzEaIwHqem2dXkg',
+	])
+	for (const [i, skin] of skinsJson
+		.filter((sk) => !catalogBlockSeeds.has(sk.ModificationGuid))
+		.slice(0, 8)
+		.entries()) {
+		await env.DB.prepare(
+			`INSERT OR IGNORE INTO catalog
+				(item_key, catalog_id, kind, friendly_name, tooltip, rarity, platform_mask, prefab_name)
+			 VALUES (?1, ?2, 'skin', ?3, '', ?4, -1, ?5)`
+		)
+			.bind(skin.ModificationGuid, 70_001 + i, skin.FriendlyName, skin.Rarity, skin.PrefabName)
+			.run()
+	}
 	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 		.bind(JSON.stringify({ accountId: 42, username: 'Tester', displayName: 'Tester' }))
 		.run()
@@ -799,8 +861,8 @@ describe('econ endpoints', () => {
 			body: JSON.stringify({
 				PurchaseItemRequests: [
 					{
-						ItemPurchaseMethodId: { Type: 0, NumberId: 10222, Guid: null },
-						RequestedPrice: 3000,
+						ItemPurchaseMethodId: { Type: 0, NumberId: NEWER_ONLY.id, Guid: null },
+						RequestedPrice: NEWER_ONLY.price,
 						Gift: null,
 						CouponConsumablePlayerMappingId: null,
 						DuplicateItemCount: 1,
@@ -824,13 +886,14 @@ describe('econ endpoints', () => {
 		expect(body.Error).not.toBe('Item not found')
 		expect(body.Success).toBe(true)
 
-		// 10222 is "Maker Pen Shirt", rarity 50, which the shared pricing puts at 3000 — the same
-		// number the client posted, because the file it browsed was generated from that pricing.
-		const item = sf32025.StoreItems.find((i) => i.PurchasableItemId === 10222)
-		expect(item?.Prices[0]?.Price).toBe(3000)
+		// The price the client posts is the one the file lists, because the file it browsed and the
+		// purchase it made are priced from the same shared rarity table. A second pricing anywhere
+		// would 409 every purchase as "Price has changed".
+		const item = sf32025.StoreItems.find((i) => i.PurchasableItemId === NEWER_ONLY.id)
+		expect(item?.Prices[0]?.Price).toBe(NEWER_ONLY.price)
 
-		// The SAME request from an old build still fails: its storefront 3 is the captured sf3,
-		// which does not list the item, and nothing offers it that id anyway.
+		// The SAME request from an old build still fails: its storefront 3 is generated to the
+		// cutoff, and this item postdates it.
 		const legacy = await exports.default.fetch(`${ORIGIN}/api/items/bulkpurchase`, {
 			method: 'POST',
 			headers: {
@@ -840,8 +903,8 @@ describe('econ endpoints', () => {
 			body: JSON.stringify({
 				PurchaseItemRequests: [
 					{
-						ItemPurchaseMethodId: { Type: 0, NumberId: 10222, Guid: null },
-						RequestedPrice: 3000,
+						ItemPurchaseMethodId: { Type: 0, NumberId: NEWER_ONLY.id, Guid: null },
+						RequestedPrice: NEWER_ONLY.price,
 						DuplicateItemCount: 1,
 					},
 				],
@@ -854,8 +917,8 @@ describe('econ endpoints', () => {
 	})
 
 	test('bulkpurchase resolves catalog ids for newer builds, at the storefront’s price', async () => {
-		// A catalog row the generated storefront would list at 600 (rarity 10) and a skin the
-		// storefront lists nowhere at all — both bought straight off the `catalog` table.
+		// A catalog row the generated storefront would list at 600 (rarity 10), bought straight off
+		// the `catalog` table; plus a skin and a developer-tier row, neither of which may be.
 		const AVATAR_ID = 20_001
 		const SKIN_ID = 20_002
 		const DEV_ID = 20_003
@@ -903,16 +966,19 @@ describe('econ endpoints', () => {
 				}),
 			})
 
-		// 150 (rarity 0) and 600 (rarity 10) are the generated storefront's own prices. They MUST
-		// match: `priceCheck` refuses a line whose posted price differs, so a server pricing a buy
-		// differently from the file it listed would 409 every purchase.
-		const res = await buy('20250718.01', [
-			{ id: AVATAR_ID, price: 600 },
-			{ id: SKIN_ID, price: 150 },
-		])
+		// 600 (rarity 10) is the generated storefront's own price. It MUST match: `priceCheck`
+		// refuses a line whose posted price differs, so a server pricing a buy differently from the
+		// file it listed would 409 every purchase.
+		const res = await buy('20250718.01', [{ id: AVATAR_ID, price: 600 }])
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as { Success: boolean; Value: { Balance: number } | null }
 		expect(body.Success).toBe(true)
+
+		// A SKIN is refused even though the catalog holds it: skins are awarded from weekly
+		// challenges rather than sold, so no storefront lists one and the bag will not resolve one
+		// off the table either.
+		const skin = await buy('20250718.01', [{ id: SKIN_ID, price: 150 }])
+		expect(((await skin.json()) as { Success: boolean }).Success).toBe(false)
 
 		// A price the storefront does not list is refused, not quietly charged.
 		const wrongPrice = await buy('20250718.01', [{ id: AVATAR_ID, price: 1 }])
@@ -929,11 +995,11 @@ describe('econ endpoints', () => {
 		const unversioned = await buy(undefined, [{ id: AVATAR_ID, price: 600 }])
 		expect(((await unversioned.json()) as { Success: boolean }).Success).toBe(false)
 
-		// The two id spaces do not overlap, so a bag may MIX a captured storefront's item with a
-		// catalog row. Item 73 is sf3's "Bowtie (White)" at 450.
+		// A bag may MIX an item the STOREFRONT FILE lists with one resolved straight off the
+		// `catalog` table.
 		const mixed = await buy('20250718.01', [
-			{ id: 73, price: 450 },
-			{ id: SKIN_ID, price: 150 },
+			{ id: SF3_ITEM.id, price: SF3_ITEM.price },
+			{ id: AVATAR_ID, price: 600 },
 		])
 		expect(((await mixed.json()) as { Success: boolean }).Success).toBe(true)
 
@@ -944,69 +1010,62 @@ describe('econ endpoints', () => {
 			.run()
 	})
 
-	test('POST /api/avatar/v1/lockeditems/bulk returns the catalogue as a bare array', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/avatar/v1/lockeditems/bulk`, {
-			method: 'POST',
-			headers: { ...(await bearer()), 'content-type': 'application/json' },
-			body: JSON.stringify({
-				AvatarItemDescriptions: [
-					'c70005d5-6276-4a98-acb3-6a77bc19379a,OBcu3bf1NEio_7t9smqGag',
-					'4eaaad39-aa44-4791-8b67-2eafa8305850',
-				],
-			}),
-		})
-		expect(res.status).toBe(200)
-
-		// A BARE ARRAY, no envelope.
-		const body = (await res.json()) as Array<{
-			AvatarItemType: number
-			AvatarItemDesc: string
-			FriendlyName: string
-			Rarity: number
-		}>
-		expect(Array.isArray(body)).toBe(true)
-
-		// TEST STUB: the whole bundled catalogue, whatever was posted. Pinned so the day this
-		// grows real lock logic, the change is visible here rather than silently altering what a
-		// client is told is locked.
-		expect(body).toHaveLength(avatarItemsJson.length)
-		expect(body[0]).toMatchObject({
-			AvatarItemDesc: avatarItemsJson[0]!.AvatarItemDesc,
-			FriendlyName: avatarItemsJson[0]!.FriendlyName,
-		})
-
-		// Every entry carries the shape the client reads, including the four fields the
-		// `defaultunlocked` catalogue leaves out.
-		for (const key of [
-			'AvatarItemType',
-			'AvatarItemDesc',
-			'FriendlyName',
-			'Tooltip',
-			'Rarity',
-			'AvatarItemId',
-			'IsBaseAvatarItem',
-			'ThumbnailImage',
-			'CreatedAt',
-		]) {
-			expect(Object.keys(body[0] as object), key).toContain(key)
+	test('lockeditems/bulk filters by exact AvatarItemDesc, in catalogue order', async () => {
+		const ask = async (
+			descs: unknown
+		): Promise<Array<{ AvatarItemDesc: string; FriendlyName: string }>> => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/avatar/v1/lockeditems/bulk`, {
+				method: 'POST',
+				headers: { 'content-type': 'application/json' },
+				body: JSON.stringify(descs === undefined ? {} : { AvatarItemDescriptions: descs }),
+			})
+			expect(res.status).toBe(200)
+			return (await res.json()) as Array<{ AvatarItemDesc: string; FriendlyName: string }>
 		}
 
-		// Nothing is echoed: the posted descs are not read, so what comes back is unrelated to
-		// what was asked for. A real implementation answers one entry per posted desc.
-		expect(body.map((i) => i.AvatarItemDesc)).not.toEqual([
-			'c70005d5-6276-4a98-acb3-6a77bc19379a,OBcu3bf1NEio_7t9smqGag',
-			'4eaaad39-aa44-4791-8b67-2eafa8305850',
+		// Three real catalogue entries, deliberately asked for OUT of catalogue order.
+		const [first, second, third] = [
+			avatarItemsJson[0]!,
+			avatarItemsJson[40]!,
+			avatarItemsJson[900]!,
+		]
+
+		const got = await ask([third.AvatarItemDesc, first.AvatarItemDesc, second.AvatarItemDesc])
+		expect(got).toHaveLength(3)
+		// In CATALOGUE order, not request order: the reference's filter walks the catalogue, so
+		// the response must never be read positionally against what was asked for.
+		expect(got.map((i) => i.AvatarItemDesc)).toEqual([
+			first.AvatarItemDesc,
+			second.AvatarItemDesc,
+			third.AvatarItemDesc,
 		])
 
-		// No auth needed, and a body it cannot read is not an error — the answer does not depend
-		// on either.
-		const anon = await exports.default.fetch(`${ORIGIN}/api/avatar/v1/lockeditems/bulk`, {
+		// The match is the WHOLE desc, not the base asset: asking for a plain base does not drag
+		// in every colourway built on it.
+		const one = await ask([first.AvatarItemDesc])
+		expect(one).toHaveLength(1)
+		expect(one[0]?.AvatarItemDesc).toBe(first.AvatarItemDesc)
+
+		// A miss is not an error: unknown descs are absent and do not cost the caller the batch.
+		expect(
+			(await ask(['no-such-desc,,,', first.AvatarItemDesc])).map((i) => i.AvatarItemDesc)
+		).toEqual([first.AvatarItemDesc])
+		expect(await ask(['no-such-desc,,,'])).toEqual([])
+
+		// EMPTY or absent means the WHOLE catalogue — the reference's "give me everything" case,
+		// not a degenerate match-nothing.
+		expect(await ask([])).toHaveLength(avatarItemsJson.length)
+		expect(await ask(undefined)).toHaveLength(avatarItemsJson.length)
+
+		// No auth needed, and a body that will not parse falls back to the catalogue rather than
+		// erroring.
+		const junk = await exports.default.fetch(`${ORIGIN}/api/avatar/v1/lockeditems/bulk`, {
 			method: 'POST',
 			headers: { 'content-type': 'application/json' },
-			body: JSON.stringify({}),
+			body: 'not json',
 		})
-		expect(anon.status).toBe(200)
-		expect(((await anon.json()) as unknown[]).length).toBe(avatarItemsJson.length)
+		expect(junk.status).toBe(200)
+		expect(((await junk.json()) as unknown[]).length).toBe(avatarItemsJson.length)
 	})
 
 	test('POST /api/items/purchaseInfos prices custom avatar items in tokens', async () => {
@@ -1306,9 +1365,9 @@ describe('econ endpoints', () => {
 			headers: { ...(await at('20250718.01')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 73, // sf3's "Bowtie (White)", 450 tokens
+				PurchasableItemId: SF3_ITEM.id, // an avatar item the generated sf3 sells
 				CurrencyType: 2,
-				RequestedPrice: 450,
+				RequestedPrice: SF3_ITEM.price,
 			}),
 		})
 		expect(bowtie.status).toBe(200)
@@ -1317,7 +1376,7 @@ describe('econ endpoints', () => {
 		// listing-only swap breaks. `findStoreItem` resolves the purchase through the same
 		// build-aware path the listing does, so an item on the page is an item that can be bought.
 		// From the catalog half — see `catalogItems`, which is why this is not an id comparison.
-		const catalogItem = catalogItems()[0]
+		const catalogItem = sf32025.StoreItems.find((i) => i.PurchasableItemId === NEWER_ONLY.id)
 		expect(catalogItem).toBeDefined()
 		const bought = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
@@ -1331,7 +1390,8 @@ describe('econ endpoints', () => {
 		})
 		expect(bought.status).toBe(200)
 
-		// The SAME item is not for sale to an old build, because its store does not list it.
+		// The SAME item is not for sale to an old build: it postdates the cutoff, so sf3 — which
+		// is generated to that date — does not list it.
 		const refused = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await at('20230414')), 'Content-Type': 'application/json' },
@@ -1345,32 +1405,40 @@ describe('econ endpoints', () => {
 		expect(refused.status).toBe(404)
 	})
 
-	test('sf3-2025 merges sf3 with the catalog, priced by rarity', async () => {
-		// The general store as the 2025 client sees it. Asserted against the FILE rather than the
-		// endpoint, because which file the route serves depends on the caller's build and this is
-		// about the file's contents.
-		//
-		// It reports storefront 3, not an id of its own: the client asks for 3 either way and
-		// neither half knows there are two files.
+	test('sf3 and sf3-2025 are the same store at two points in time', async () => {
+		// BOTH are generated from the item catalog now — sf3 is no longer a capture. They report
+		// the same storefront id, because they are two versions of ONE store and the client asks
+		// for 3 either way.
+		expect(sf3.StorefrontType).toBe(3)
 		expect(sf32025.StorefrontType).toBe(3)
 
-		// sf3's own items are carried through UNCHANGED — the merge adds to the store the older
-		// client knows rather than restating it.
-		const base = new Map(sf3.StoreItems.map((i) => [i.PurchasableItemId, i]))
-		expect(sf32025.StoreItems.length).toBe(sf3.StoreItems.length + catalogItems().length)
-		for (const [id, item] of base) {
-			expect(
-				sf32025.StoreItems.find((i) => i.PurchasableItemId === id),
-				String(id)
-			).toEqual(item)
+		// sf3 is a strict SUBSET of sf3-2025: same items, same ids, same prices — it just stops at
+		// the cutoff. Anything else would mean a player's store changed under them on upgrade.
+		const newer = new Map(sf32025.StoreItems.map((i) => [i.PurchasableItemId, i]))
+		for (const item of sf3.StoreItems) {
+			expect(newer.get(item.PurchasableItemId), String(item.PurchasableItemId)).toEqual(item)
+		}
+		expect(sf3.StoreItems.length).toBeLessThan(sf32025.StoreItems.length)
+
+		// Ids are unique within each file. The merge of carried and generated halves is only safe
+		// because their id spaces don't overlap, so a collision must fail rather than be resolved
+		// by array order.
+		for (const [label, file] of [
+			['sf3', sf3],
+			['sf3-2025', sf32025],
+		] as const) {
+			const ids = file.StoreItems.map((i) => i.PurchasableItemId)
+			expect(new Set(ids).size, label).toBe(ids.length)
 		}
 
-		// The subscriber discount is expressed ONLY in `SubscriberPrices`. The top-level
-		// `SubscriberDiscountPercent` stays 0 so a client cannot take the 10% a second time off an
-		// already-discounted price and post 19% off, which falls through the server's own
-		// subscriber floor and is refused as "Price has changed".
+		// The discount is expressed ONLY in `SubscriberPrices`; announcing it again at the top
+		// level risks a client taking 10% off an already-discounted price and posting through the
+		// server's own subscriber floor, refused as "Price has changed".
+		expect(sf3.SubscriberDiscountPercent).toBe(0)
 		expect(sf32025.SubscriberDiscountPercent).toBe(0)
 
+		// Every GENERATED item is priced from its rarity, and rarity -1 (the developer tier) is
+		// excluded rather than priced — an item listed here can be bought.
 		const priceByRarity = new Map([
 			[0, 150],
 			[10, 600],
@@ -1378,45 +1446,46 @@ describe('econ endpoints', () => {
 			[30, 800],
 			[50, 3000],
 		])
-		// Rarity -1 is the developer/unreleased tier and is EXCLUDED rather than priced. An item
-		// listed here can be bought — `findStoreItem` resolves a purchase against this very file —
-		// so leaving them in at any price would put them on sale.
-		expect(catalogItems().filter((i) => i.GiftDrop.Rarity === -1)).toEqual([])
-
 		for (const item of catalogItems()) {
 			const expected = priceByRarity.get(item.GiftDrop.Rarity)
 			expect(expected, `rarity ${item.GiftDrop.Rarity}`).toBeDefined()
 			expect(item.Prices[0]).toMatchObject({ CurrencyType: 2, Price: expected })
-			// Floored, matching the server's own `subscriberFloor`. Every tier here divides evenly.
+			// Floored, matching the server's own `subscriberFloor`.
 			expect(item.SubscriberPrices[0]).toMatchObject({
 				CurrencyType: 2,
 				Price: Math.floor((expected! * 90) / 100),
 			})
+			// `GiftDropId` echoes the id, as the capture did on all 1161 of its items.
+			expect(item.GiftDrop.GiftDropId).toBe(item.PurchasableItemId)
+			expect(item.PurchasableItemId).toBeGreaterThanOrEqual(CATALOG_ID_BASE)
+		}
+		expect(catalogItems().filter((i) => i.GiftDrop.Rarity === -1)).toEqual([])
+
+		// The CARRIED half — 30 consumables and 5 random boxes — comes from
+		// `static/db/consumables.json`, what survives of the 2023 capture. The item catalog does
+		// not model these, so they keep their own ids and prices.
+		const carried = sf3.StoreItems.filter((i) => capturedIds.has(i.PurchasableItemId))
+		expect(carried.length).toBeGreaterThan(0)
+		expect(carried.every((i) => (i.GiftDrop.AvatarItemDesc ?? '') === '')).toBe(true)
+
+		// And NO equipment skins anywhere in either file: they are awarded from weekly challenges,
+		// so a store listing one would sell something the game gives away.
+		for (const [label, file] of [
+			['sf3', sf3],
+			['sf3-2025', sf32025],
+		] as const) {
+			expect(
+				file.StoreItems.filter((i) => (i.GiftDrop.EquipmentModificationGuid ?? '') !== ''),
+				label
+			).toEqual([])
 		}
 
-		// Every item is an avatar item with a real desc, and its id is in the GENERATED range,
-		// echoed in `GiftDropId` the way sf3 does on all 1161 of its own items. Ids must be unique
-		// or a purchase resolves the wrong row.
-		const ids = catalogItems().map((i) => i.PurchasableItemId)
-		expect(new Set(ids).size).toBe(ids.length)
-
-		// The id IS the `catalog_id` — one number, no second numbering and no arithmetic between
-		// them. Catalog ids start at 10000 precisely so this is safe: every captured storefront's
-		// own ids are 2764 or below, and numbering from 1 would have collided with sf3's head-on,
-		// making one id mean two different items depending on which storefront it came from.
-		expect(Math.min(...ids)).toBe(CATALOG_ID_BASE)
-		expect(ids.every((id) => id >= CATALOG_ID_BASE)).toBe(true)
-		expect(catalogItems().every((i) => i.GiftDrop.GiftDropId === i.PurchasableItemId)).toBe(true)
-		expect(catalogItems().every((i) => i.GiftDrop.AvatarItemDesc.length > 0)).toBe(true)
-
-		// An id with neither a capture nor an alias still 404s.
-		const missing = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/1705`)
-		expect(missing.status).toBe(404)
-
-		// 1704 is gone: it was a stand-in for a store that turned out to belong inside sf3, so
-		// nothing answers that id any more.
-		const gone = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/1704`)
-		expect(gone.status).toBe(404)
+		// An id with no storefront still 404s, and 1704 is gone — it was a stand-in for a store
+		// that turned out to belong inside sf3.
+		for (const id of [1705, 1704]) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/${id}`)
+			expect(res.status, String(id)).toBe(404)
+		}
 	})
 
 	// Item 73 in sf3.json — "Bowtie (White)", 450 RecCenterTokens (CurrencyType 2).
@@ -1426,9 +1495,9 @@ describe('econ endpoints', () => {
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 73,
+				PurchasableItemId: SF3_ITEM.id,
 				CurrencyType: 2,
-				RequestedPrice: 450,
+				RequestedPrice: SF3_ITEM.price,
 			}),
 		})
 		expect(res.status).toBe(401)
@@ -1442,9 +1511,9 @@ describe('econ endpoints', () => {
 			headers: { ...(await bearer('20')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 73,
+				PurchasableItemId: SF3_ITEM.id,
 				CurrencyType: 2,
-				RequestedPrice: 450,
+				RequestedPrice: SF3_ITEM.price,
 			}),
 		})
 		expect(res.status).toBe(200)
@@ -1457,7 +1526,7 @@ describe('econ endpoints', () => {
 			}>
 		}
 		// `Balance` is the change applied (the negated price), not the resulting total.
-		expect(body.Balance).toBe(-450)
+		expect(body.Balance).toBe(-SF3_ITEM.price)
 		expect(body.CurrencyType).toBe(2)
 		expect(body.BalanceType).toBe(-2)
 		const gift = body.BalanceUpdates[0].Data[0]
@@ -1478,8 +1547,8 @@ describe('econ endpoints', () => {
 				payload: {
 					// 1400 = CommercePurchase; -2 = NonPurchasedNotUsableInP2P, the only bucket we use.
 					BalanceAddType: 1400,
-					Delta: -450,
-					Balance: 9550,
+					Delta: -SF3_ITEM.price,
+					Balance: DEFAULT_STARTING_TOKENS - SF3_ITEM.price,
 					Platform: -2,
 					CurrencyType: 2,
 				},
@@ -1490,14 +1559,16 @@ describe('econ endpoints', () => {
 		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
 			headers: await bearer('20'),
 		})
-		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 9550 }])
+		expect(await bal.json()).toEqual([
+			{ CurrencyType: 2, Platform: -2, Balance: DEFAULT_STARTING_TOKENS - SF3_ITEM.price },
+		])
 
 		// The item is now owned — it leads the v4/items list (owned items prepend the catalog).
 		const items = await exports.default.fetch(`${ORIGIN}/api/avatar/v4/items`, {
 			headers: await bearer('20'),
 		})
 		const list = (await items.json()) as Array<{ avatarItemDesc: string; friendlyName: string }>
-		expect(list[0].friendlyName).toBe('Bowtie (White)')
+		expect(list[0].friendlyName).toBe(SF3_ITEM.name)
 		expect(list[0].avatarItemDesc).toBe(gift.AvatarItemDesc)
 
 		// And a pending gift box is waiting to be opened.
@@ -1592,96 +1663,10 @@ describe('econ endpoints', () => {
 		expect(second[0].CreatedAts).toHaveLength(2)
 	})
 
-	test('POST /api/storefronts/v2/buyItem grants equipment, read back by getUnlocked, no re-buy dupe', async () => {
-		// Item 1950 (Disc Skin (Coop)) in storefront 3 is a pure equipment drop — its
-		// gift-drop carries an EquipmentModificationGuid but no avatar/consumable desc.
-		const guid = '19ef59c7-f74b-4c63-935a-1d4b1abd8518'
-		const buy = async () =>
-			exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
-				method: 'POST',
-				headers: { ...(await bearer('31')), 'Content-Type': 'application/json' },
-				body: JSON.stringify({
-					StorefrontType: 3,
-					PurchasableItemId: 1950,
-					CurrencyType: 2,
-					RequestedPrice: 3500,
-				}),
-			})
-
-		const res = await buy()
-		expect(res.status).toBe(200)
-		const body = (await res.json()) as {
-			Balance: number
-			BalanceUpdates: Array<{
-				Data: Array<{ Id: number; EquipmentModificationGuid: string; EquipmentPrefabName: string }>
-			}>
-		}
-		expect(body.Balance).toBe(-3500)
-		const gift = body.BalanceUpdates[0].Data[0]
-		expect(gift.EquipmentModificationGuid).toBe(guid)
-		expect(gift.EquipmentPrefabName).toBe('[DiscGolfDisc]')
-
-		const unlocked = async () => {
-			const r = await exports.default.fetch(`${ORIGIN}/api/equipment/v2/getUnlocked`, {
-				headers: await bearer('31'),
-			})
-			expect(r.status).toBe(200)
-			return (await r.json()) as Array<{
-				ModificationGuid: string
-				PrefabName: string
-				FriendlyName: string
-				PlatformMask: number
-				Favorited: boolean
-			}>
-		}
-		const first = await unlocked()
-		expect(first).toHaveLength(1)
-		// The unlocked DTO is unprefixed, unlike the gift-drop the grant came from.
-		expect(first[0].ModificationGuid).toBe(guid)
-		expect(first[0].PrefabName).toBe('[DiscGolfDisc]')
-		expect(first[0].FriendlyName).toBe('Disc Skin (Coop)')
-		expect(first[0].PlatformMask).toBe(-1)
-
-		// Equipment is not an avatar item — it does not show up in v4/items.
-		const items = await exports.default.fetch(`${ORIGIN}/api/avatar/v4/items`, {
-			headers: await bearer('31'),
-		})
-		const list = (await items.json()) as Array<{ friendlyName: string }>
-		expect(list.every((i) => i.friendlyName !== 'Disc Skin (Coop)')).toBe(true)
-
-		expect(first[0].Favorited).toBe(false)
-
-		// Owning equipment is boolean: re-buying upserts, it does not add a second row.
-		expect((await buy()).status).toBe(200)
-		expect(await unlocked()).toHaveLength(1)
-
-		// Favouriting sticks.
-		const update = async (favorited: boolean, method: 'PUT' | 'POST' = 'PUT') =>
-			exports.default.fetch(`${ORIGIN}/api/equipment/v1/update`, {
-				method,
-				headers: { ...(await bearer('31')), 'Content-Type': 'application/json' },
-				body: JSON.stringify([
-					{ PrefabName: '[DiscGolfDisc]', ModificationGuid: guid, Favorited: favorited },
-					// A guid the caller doesn't own is silently skipped, not inserted.
-					{ PrefabName: '[Basketball]', ModificationGuid: 'not-owned', Favorited: true },
-				]),
-			})
-		expect((await update(true)).status).toBe(200)
-		let after = await unlocked()
-		expect(after).toHaveLength(1)
-		expect(after[0].Favorited).toBe(true)
-
-		// …and un-favouriting flips it back.
-		expect((await update(false)).status).toBe(200)
-		after = await unlocked()
-		expect(after[0].Favorited).toBe(false)
-
-		// The client sends this as a POST too, with the same body — same effect.
-		expect((await update(true, 'POST')).status).toBe(200)
-		expect((await unlocked())[0]?.Favorited).toBe(true)
-		expect((await update(false, 'POST')).status).toBe(200)
-		expect((await unlocked())[0]?.Favorited).toBe(false)
-	})
+	// The equipment-purchase test that lived here is gone: skins are awarded from weekly
+	// challenges rather than sold, so no storefront lists one and the bulk bag will not resolve
+	// one off the catalog either. Equipment GRANTING is still covered — the weekly challenge
+	// reward path grants a skin and reads it back through `getUnlocked`.
 
 	test('POST /api/equipment/v1/update favourites from the client’s own body', async () => {
 		// The body verbatim as the client sends it — a full echo of the entry it was served,
@@ -1752,7 +1737,7 @@ describe('econ endpoints', () => {
 			headers: { ...(await bearer('21')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 73,
+				PurchasableItemId: SF3_ITEM.id,
 				CurrencyType: 2,
 				RequestedPrice: 1,
 			}),
@@ -1863,16 +1848,20 @@ describe('econ endpoints', () => {
 			.run()
 	}
 
-	/** Buy sf3's item 2107 (Backpack Skin (Camo), 3500) with a `Gift` block, as the client posts it. */
+	/**
+	 * Buy one sf3 item with a `Gift` block, as the client posts it. This used to buy an equipment
+	 * skin; skins are awarded from weekly challenges rather than sold, so the store no longer
+	 * lists one and these tests use an ordinary avatar item — they are about GIFTING either way.
+	 */
 	const giftBackpack = async (sub: string, gift: Record<string, unknown> | null) =>
 		exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 2107,
+				PurchasableItemId: SF3_ITEM.id,
 				CurrencyType: 2,
-				RequestedPrice: 3500,
+				RequestedPrice: SF3_ITEM.price,
 				CouponConsumablePlayerMappingId: null,
 				Gift: gift,
 			}),
@@ -1886,14 +1875,6 @@ describe('econ endpoints', () => {
 		return (await res.json()) as Array<Record<string, unknown>>
 	}
 
-	const equipment = async (sub: string) => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/equipment/v2/getUnlocked`, {
-			headers: await bearer(sub),
-		})
-		expect(res.status).toBe(200)
-		return (await res.json()) as Array<{ ModificationGuid: string }>
-	}
-
 	test('POST /api/storefronts/v2/buyItem charges the buyer and hands the item to the gift’s receiver', async () => {
 		await seedAccount(205, 'GiftReceiver')
 		await drainFrames()
@@ -1905,18 +1886,25 @@ describe('econ endpoints', () => {
 		})
 		expect(res.status).toBe(200)
 		// The buyer pays — `Balance` is their change — even though nothing lands on them.
-		expect(((await res.json()) as { Balance: number }).Balance).toBe(-3500)
+		expect(((await res.json()) as { Balance: number }).Balance).toBe(-SF3_ITEM.price)
 		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
 			headers: await bearer('330'),
 		})
-		expect(await bal.json()).toEqual([{ CurrencyType: 2, Platform: -2, Balance: 10000 - 3500 }])
+		expect(await bal.json()).toEqual([
+			{ CurrencyType: 2, Platform: -2, Balance: DEFAULT_STARTING_TOKENS - SF3_ITEM.price },
+		])
 
-		// The item and its box are the RECEIVER's; the buyer keeps neither.
-		expect(await equipment('330')).toEqual([])
+		// The item and its box are the RECEIVER's; the buyer keeps neither. An avatar item lands
+		// in the inventory rather than the equipment list — `v4/items` leads with what is owned.
 		expect(await pendingGifts('330')).toEqual([])
-		const [box, ...rest] = await equipment('205')
-		expect(rest).toEqual([])
-		expect(box?.ModificationGuid).toBe('523e3615-4633-41a3-9b2d-17d3207a684b')
+		const ownedBy = async (sub: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/avatar/v4/items`, {
+				headers: await bearer(sub),
+			})
+			return (await res.json()) as Array<{ avatarItemDesc: string; friendlyName: string }>
+		}
+		expect((await ownedBy('330'))[0]?.friendlyName).not.toBe(SF3_ITEM.name)
+		expect((await ownedBy('205'))[0]?.friendlyName).toBe(SF3_ITEM.name)
 		const [gift, ...others] = await pendingGifts('205')
 		expect(others).toEqual([])
 		// The box outlives the request, so it carries who sent it and why — the receiver may
@@ -1936,7 +1924,8 @@ describe('econ endpoints', () => {
 			FromPlayerId: 330,
 			GiftContext: 500,
 			Message: 'hello this is a message',
-			EquipmentModificationGuid: '523e3615-4633-41a3-9b2d-17d3207a684b',
+			// An avatar item, so the equipment half of the drop is empty and the desc carries it.
+			EquipmentModificationGuid: '',
 		})
 		// …and the spend frame still goes to the BUYER, who is the one who paid.
 		const spend = frames.find(
@@ -2043,7 +2032,7 @@ describe('econ endpoints', () => {
 				StorefrontType: 3,
 				PurchasableItemId: 9999999,
 				CurrencyType: 2,
-				RequestedPrice: 450,
+				RequestedPrice: SF3_ITEM.price,
 			}),
 		})
 		expect(res.status).toBe(404)
@@ -2059,9 +2048,9 @@ describe('econ endpoints', () => {
 			headers: { ...(await bearer('23')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 73,
+				PurchasableItemId: SF3_ITEM.id,
 				CurrencyType: 2,
-				RequestedPrice: 450,
+				RequestedPrice: SF3_ITEM.price,
 			}),
 		})
 		expect(res.status).toBe(400)
@@ -2132,7 +2121,7 @@ describe('econ endpoints', () => {
 			method: 'POST',
 			headers: { 'Content-Type': 'application/json' },
 			body: JSON.stringify({
-				PurchaseItemRequests: [line(10, 200)],
+				PurchaseItemRequests: [line(SF3_ITEM.id, SF3_ITEM.price)],
 				StorefrontType: 3,
 				CurrencyType: 2,
 			}),
@@ -2142,11 +2131,15 @@ describe('econ endpoints', () => {
 
 	test('POST /api/items/bulkpurchase debits the bag once and grants every line', async () => {
 		// Account 90: fresh, so its first balance touch grants the 10000 default. Three donuts
-		// (a consumable, 100 each — consumables are the only thing that stacks) and one dress
-		// (an avatar item, 200) — 500 in total.
+		// (a consumable, 100 each — consumables are the only thing that stacks) and one avatar
+		// item. The prices come from the fixtures rather than being written out: sf3 is generated
+		// now, so a repriced rarity tier must not silently invalidate the arithmetic.
 		await drainFrames()
 		const res = await bulkPurchase('90', {
-			PurchaseItemRequests: [line(2182, 100, { DuplicateItemCount: 3 }), line(10, 200)],
+			PurchaseItemRequests: [
+				line(2182, 100, { DuplicateItemCount: 3 }),
+				line(SF3_ITEM.id, SF3_ITEM.price),
+			],
 			ShoppingBagId: 'bag-1',
 		})
 		expect(res.status).toBe(200)
@@ -2155,17 +2148,17 @@ describe('econ endpoints', () => {
 		expect(body.Error).toBe(null)
 		expect(body.error_id).toBe(null)
 		const value = body.Value!
-		// `Balance` here is the RESULTING total (10000 - 500), unlike buyItem's change. The
+		// `Balance` here is the RESULTING total, unlike buyItem's change. The
 		// bucket is -2, the one `GET /balance` reports — the reference server's 4
 		// (RecNetPurchased) would read as a second balance the client adds to the real one.
-		expect(value.Balance).toBe(9500)
+		expect(value.Balance).toBe(DEFAULT_STARTING_TOKENS - 300 - SF3_ITEM.price)
 		expect(value.CurrencyType).toBe(2)
 		expect(value.Platform).toBe(-2)
 
 		// ONE entry per REQUESTED item — three donuts are one line, so one entry — in order.
 		expect(value.BalanceUpdates).toHaveLength(2)
 		expect(codes(body)).toEqual([0, 0])
-		expect(value.BalanceUpdates.map((u) => u.Data.PurchasableItemId)).toEqual([2182, 10])
+		expect(value.BalanceUpdates.map((u) => u.Data.PurchasableItemId)).toEqual([2182, SF3_ITEM.id])
 		expect(value.BalanceUpdates.every((u) => u.Data.CustomAvatarItem === null)).toBe(true)
 		// The box each line produced, as `GiftPackage` carries it: 20 keys, the receiver in
 		// `PlayerId`, a self-buy attributed to the "Coach" account (1), and the platform MASK in
@@ -2202,15 +2195,15 @@ describe('econ endpoints', () => {
 		expect(value.BalanceUpdates[1].Data.GiftPackage!.AvatarItemDesc).not.toBe('')
 
 		// ONE frame for the whole bag, setting the account-wide bucket to the resulting total —
-		// the same 9500 the body reports, so the two agree instead of compounding.
+		// the same total the body reports, so the two agree instead of compounding.
 		expect(await drainFrames()).toEqual([
 			{
 				accountId: 90,
 				notificationType: NotificationType.StorefrontBalancePurchase,
 				payload: {
 					BalanceAddType: 1400,
-					Delta: -500,
-					Balance: 9500,
+					Delta: -(300 + SF3_ITEM.price),
+					Balance: DEFAULT_STARTING_TOKENS - 300 - SF3_ITEM.price,
 					Platform: -2,
 					CurrencyType: 2,
 				},
@@ -2218,7 +2211,7 @@ describe('econ endpoints', () => {
 		])
 		expect(
 			await getBalance(env.DB, 90, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
-		).toBe(9500)
+		).toBe(DEFAULT_STARTING_TOKENS - 300 - SF3_ITEM.price)
 
 		// Everything landed: the dress is owned, all three donuts stacked into the one box's
 		// grant, and each LINE left one gift box.
@@ -2226,7 +2219,7 @@ describe('econ endpoints', () => {
 			headers: await bearer('90'),
 		})
 		const list = (await items.json()) as Array<{ friendlyName: string }>
-		expect(list[0].friendlyName).toBe('Babydoll Dress (Blue)')
+		expect(list[0].friendlyName).toBe(SF3_ITEM.name)
 		const unlocked = await exports.default.fetch(`${ORIGIN}/api/consumables/v2/getUnlocked`, {
 			headers: await bearer('90'),
 		})
@@ -2245,30 +2238,30 @@ describe('econ endpoints', () => {
 		// The second line's price no longer matches the catalog (200, not 1). The bag still
 		// succeeds — that entry just comes back non-OK, which is what AllowPartialSuccess means.
 		const res = await bulkPurchase('91', {
-			PurchaseItemRequests: [line(10, 200), line(80, 1)],
+			PurchaseItemRequests: [line(SF3_ITEM.id, SF3_ITEM.price), line(SF3_CHEAP.id, 1)],
 		})
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as BulkBody
 		expect(body.Success).toBe(true)
 		expect(body.Error).toBe(null)
-		expect(body.Value!.Balance).toBe(9800)
+		expect(body.Value!.Balance).toBe(DEFAULT_STARTING_TOKENS - SF3_ITEM.price)
 		// 6 = RequestedPriceDoesNotMatch. The failed line still names the item it asked for.
 		expect(codes(body)).toEqual([0, 6])
 		expect(body.Value!.BalanceUpdates[1].Data).toEqual({
 			GiftPackage: null,
-			PurchasableItemId: 80,
+			PurchasableItemId: SF3_CHEAP.id,
 			CustomAvatarItem: null,
 		})
 		expect(
 			await getBalance(env.DB, 91, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
-		).toBe(9800)
+		).toBe(DEFAULT_STARTING_TOKENS - SF3_ITEM.price)
 	})
 
 	test('POST /api/items/bulkpurchase charges nothing when a line fails and partial success is off', async () => {
 		await drainFrames()
 		const res = await bulkPurchase('92', {
 			AllowPartialSuccess: false,
-			PurchaseItemRequests: [line(10, 200), line(80, 1)],
+			PurchaseItemRequests: [line(SF3_ITEM.id, SF3_ITEM.price), line(SF3_CHEAP.id, 1)],
 		})
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as BulkBody
@@ -2283,38 +2276,59 @@ describe('econ endpoints', () => {
 			headers: await bearer('92'),
 		})
 		const list = (await items.json()) as Array<{ friendlyName: string }>
-		expect(list.every((i) => i.friendlyName !== 'Babydoll Dress (Blue)')).toBe(true)
+		expect(list.every((i) => i.friendlyName !== SF3_ITEM.name)).toBe(true)
 		expect(await drainFrames()).toEqual([])
 	})
 
 	test('POST /api/items/bulkpurchase takes the lines that fit, in request order', async () => {
-		// Leave account 93 with 250 tokens: enough for the first 200-token line, not both.
+		// Leave account 93 with enough for the FIRST line and not both, whatever the tiers cost.
+		const fitsOne = SF3_ITEM.price + SF3_CHEAP.price - 1
 		await getBalance(env.DB, 93, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
 		expect(
-			await spendCurrency(env.DB, 93, CurrencyType.RecCenterTokens, 9750, DEFAULT_STARTING_TOKENS)
+			await spendCurrency(
+				env.DB,
+				93,
+				CurrencyType.RecCenterTokens,
+				DEFAULT_STARTING_TOKENS - fitsOne,
+				DEFAULT_STARTING_TOKENS
+			)
 		).toBe(true)
 		const res = await bulkPurchase('93', {
-			PurchaseItemRequests: [line(10, 200), line(80, 200)],
+			PurchaseItemRequests: [
+				line(SF3_ITEM.id, SF3_ITEM.price),
+				line(SF3_CHEAP.id, SF3_CHEAP.price),
+			],
 		})
 		const body = (await res.json()) as BulkBody
 		expect(body.Success).toBe(true)
-		expect(body.Value!.Balance).toBe(50)
+		expect(body.Value!.Balance).toBe(fitsOne - SF3_ITEM.price)
 		// 2 = NotEnoughCredit for the line the balance no longer covered.
 		expect(codes(body)).toEqual([0, 2])
 		expect(body.Value!.BalanceUpdates[1].Data.GiftPackage).toBe(null)
 		expect(
 			await getBalance(env.DB, 93, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
-		).toBe(50)
+		).toBe(fitsOne - SF3_ITEM.price)
 	})
 
 	test('POST /api/items/bulkpurchase fails the whole bag it cannot afford when partial success is off', async () => {
+		// Same shaping as above: enough for one line, not both.
+		const affordsOne = SF3_ITEM.price + SF3_CHEAP.price - 1
 		await getBalance(env.DB, 94, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
 		expect(
-			await spendCurrency(env.DB, 94, CurrencyType.RecCenterTokens, 9750, DEFAULT_STARTING_TOKENS)
+			await spendCurrency(
+				env.DB,
+				94,
+				CurrencyType.RecCenterTokens,
+				DEFAULT_STARTING_TOKENS - affordsOne,
+				DEFAULT_STARTING_TOKENS
+			)
 		).toBe(true)
 		const res = await bulkPurchase('94', {
 			AllowPartialSuccess: false,
-			PurchaseItemRequests: [line(10, 200), line(80, 200)],
+			PurchaseItemRequests: [
+				line(SF3_ITEM.id, SF3_ITEM.price),
+				line(SF3_CHEAP.id, SF3_CHEAP.price),
+			],
 		})
 		const body = (await res.json()) as BulkBody
 		// Even the line that would have fitted is refused: all of it or none.
@@ -2323,21 +2337,21 @@ describe('econ endpoints', () => {
 		expect(body.Value).toBe(null)
 		expect(
 			await getBalance(env.DB, 94, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
-		).toBe(250)
+		).toBe(affordsOne)
 	})
 
 	test('POST /api/items/bulkpurchase grants without gift boxes when BypassGiftPackages is set', async () => {
 		const res = await bulkPurchase('95', {
 			BypassGiftPackages: true,
-			PurchaseItemRequests: [line(10, 200)],
+			PurchaseItemRequests: [line(SF3_ITEM.id, SF3_ITEM.price)],
 		})
 		const body = (await res.json()) as BulkBody
 		expect(body.Success).toBe(true)
-		expect(body.Value!.Balance).toBe(9800)
+		expect(body.Value!.Balance).toBe(DEFAULT_STARTING_TOKENS - SF3_ITEM.price)
 		// No box was created, so there is none to hand back — the capture's null GiftPackage.
 		expect(body.Value!.BalanceUpdates[0]).toEqual({
 			UpdateResponse: 0,
-			Data: { GiftPackage: null, PurchasableItemId: 10, CustomAvatarItem: null },
+			Data: { GiftPackage: null, PurchasableItemId: SF3_ITEM.id, CustomAvatarItem: null },
 		})
 		const gifts = await exports.default.fetch(`${ORIGIN}/api/avatar/v2/gifts`, {
 			headers: await bearer('95'),
@@ -2348,7 +2362,7 @@ describe('econ endpoints', () => {
 			headers: await bearer('95'),
 		})
 		const list = (await items.json()) as Array<{ friendlyName: string }>
-		expect(list[0].friendlyName).toBe('Babydoll Dress (Blue)')
+		expect(list[0].friendlyName).toBe(SF3_ITEM.name)
 	})
 
 	test('POST /api/items/bulkpurchase routes a gifted line to its receiver', async () => {
@@ -2356,7 +2370,7 @@ describe('econ endpoints', () => {
 		await drainFrames()
 		const res = await bulkPurchase('960', {
 			PurchaseItemRequests: [
-				line(10, 200),
+				line(SF3_ITEM.id, SF3_ITEM.price),
 				line(2182, 100, {
 					Gift: { ToPlayerId: 207, Message: 'from the bag', Anonymous: false, GiftContext: 500 },
 				}),
@@ -2365,7 +2379,7 @@ describe('econ endpoints', () => {
 		const body = (await res.json()) as BulkBody
 		expect(body.Success).toBe(true)
 		// The buyer pays for both lines; only the first one lands on them.
-		expect(body.Value!.Balance).toBe(10000 - 300)
+		expect(body.Value!.Balance).toBe(DEFAULT_STARTING_TOKENS - SF3_ITEM.price - 100)
 		const [own, gifted] = body.Value!.BalanceUpdates
 		expect(own?.Data.GiftPackage).toMatchObject({ PlayerId: 960, FromPlayerId: 1 })
 		expect(gifted?.Data.GiftPackage).toMatchObject({
@@ -2389,7 +2403,7 @@ describe('econ endpoints', () => {
 	test('POST /api/items/bulkpurchase 404s a bag gifting to a player that does not exist', async () => {
 		const res = await bulkPurchase('970', {
 			PurchaseItemRequests: [
-				line(10, 200),
+				line(SF3_ITEM.id, SF3_ITEM.price),
 				line(2182, 100, { Gift: { ToPlayerId: 999998, Message: 'hi', Anonymous: false } }),
 			],
 		})
@@ -2408,20 +2422,20 @@ describe('econ endpoints', () => {
 		const res = await bulkPurchase('96', {
 			PurchaseItemRequests: [
 				// A guid-keyed (UGC) item — nothing here sells one, and it has no NumberId to echo.
-				line(0, 200, {
+				line(0, SF3_ITEM.price, {
 					ItemPurchaseMethodId: { Type: 1, NumberId: null, Guid: 'a3f1-not-a-catalog-item' },
 				}),
 				// Nothing issues coupons, so a line claiming one is refused rather than charged full
 				// price for a discount it thinks it applied.
-				line(10, 200, { CouponConsumablePlayerMappingId: 4242 }),
-				line(999999, 200),
-				line(10, 200, { DuplicateItemCount: 0 }),
+				line(SF3_ITEM.id, SF3_ITEM.price, { CouponConsumablePlayerMappingId: 4242 }),
+				line(999999, SF3_ITEM.price),
+				line(SF3_ITEM.id, SF3_ITEM.price, { DuplicateItemCount: 0 }),
 				// An avatar item is owned once — a second copy would grant nothing and charge for it.
-				line(80, 200, { DuplicateItemCount: 2 }),
+				line(SF3_CHEAP.id, SF3_CHEAP.price, { DuplicateItemCount: 2 }),
 				// The catalog prices this item in RecCenterTokens only.
 				line(2182, 100),
 				// …and one that works, so the bag is a partial success rather than a refusal.
-				line(10, 200),
+				line(SF3_ITEM.id, SF3_ITEM.price),
 			],
 			CurrencyType: 2,
 		})
@@ -2432,15 +2446,15 @@ describe('econ endpoints', () => {
 		// RequestedAmountNotAllowed, 0 OK (the donuts do price in tokens), 0 OK.
 		expect(codes(body)).toEqual([4, 5, 4, 7, 7, 0, 0])
 		expect(body.Value!.BalanceUpdates[0].Data.PurchasableItemId).toBe(null)
-		// Only the two OK lines were charged (100 + 200).
-		expect(body.Value!.Balance).toBe(9700)
+		// Only the two OK lines were charged: the donuts and one avatar item.
+		expect(body.Value!.Balance).toBe(DEFAULT_STARTING_TOKENS - 100 - SF3_ITEM.price)
 		expect(await drainFrames()).toHaveLength(1)
 	})
 
 	test('POST /api/items/bulkpurchase refuses a bag where nothing sells', async () => {
 		const res = await bulkPurchase('97', {
 			CurrencyType: CurrencyType.LaserTagTickets,
-			PurchaseItemRequests: [line(10, 200)],
+			PurchaseItemRequests: [line(SF3_ITEM.id, SF3_ITEM.price)],
 		})
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as BulkBody
@@ -2460,7 +2474,7 @@ describe('econ endpoints', () => {
 		// A room-scoped currency is not an account balance we can debit.
 		const roomCurrency = await bulkPurchase('98', {
 			CurrencyType: CurrencyType.RoomCurrency,
-			PurchaseItemRequests: [line(10, 200)],
+			PurchaseItemRequests: [line(SF3_ITEM.id, SF3_ITEM.price)],
 		})
 		expect(roomCurrency.status).toBe(400)
 		expect(((await roomCurrency.json()) as BulkBody).Error).toBe('Currency type is not spendable')
@@ -2640,9 +2654,9 @@ describe('econ endpoints', () => {
 			headers: { ...(await bearer('24')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 73,
+				PurchasableItemId: SF3_ITEM.id,
 				CurrencyType: 2,
-				RequestedPrice: 450,
+				RequestedPrice: SF3_ITEM.price,
 			}),
 		})
 		const bought = (await buy.json()) as {
@@ -2670,7 +2684,7 @@ describe('econ endpoints', () => {
 			headers: await bearer('24'),
 		})
 		const list = (await items.json()) as Array<{ friendlyName: string }>
-		expect(list.some((i) => i.friendlyName === 'Bowtie (White)')).toBe(true)
+		expect(list.some((i) => i.friendlyName === SF3_ITEM.name)).toBe(true)
 
 		// Opening it again is a harmless no-op — still 200.
 		const again = await exports.default.fetch(`${ORIGIN}/api/avatar/v2/gifts/consume/`, {
@@ -2735,9 +2749,9 @@ describe('econ endpoints', () => {
 			headers: { ...(await bearer('27')), 'Content-Type': 'application/json' },
 			body: JSON.stringify({
 				StorefrontType: 3,
-				PurchasableItemId: 73,
+				PurchasableItemId: SF3_ITEM.id,
 				CurrencyType: 2,
-				RequestedPrice: 450,
+				RequestedPrice: SF3_ITEM.price,
 			}),
 		})
 		const giftId = (
@@ -2794,6 +2808,24 @@ describe('econ endpoints', () => {
 		expect(rotationIndex(nextWeek)).toBe(rotationIndex(at) + 1)
 		expect(buildRotation(nextWeek).ChallengeMapId).toBe(buildRotation(at).ChallengeMapId + 1)
 		expect(buildRotation(nextWeek).StartAt).toBe(buildRotation(at).EndAt)
+	})
+
+	test('the weekly gift pool leaves out the sandbox dice', async () => {
+		// The pool is the catalog's skins, and a sixth of them are `[Sandbox_D4]`…`[Sandbox_D20]`
+		// recolours. A week themed on "Sandbox D8 (Pewter)" spends its headline reward on a die, so
+		// those prefabs are excluded — everything else is fair game.
+		const res = await exports.default.fetch(`${ORIGIN}/api/challenge/v2/getCurrent`)
+		expect(res.status).toBe(200)
+		const week = (await res.json()) as {
+			ChallengeThemeString: string
+			Gift: { EquipmentPrefabName: string }
+		}
+		expect(week.Gift.EquipmentPrefabName.startsWith('[Sandbox_')).toBe(false)
+		expect(week.ChallengeThemeString).not.toMatch(/^Sandbox D/)
+
+		// It still rolls something: excluding the dice must not empty the pool, which would leave
+		// the week themed on nothing.
+		expect(week.ChallengeThemeString).not.toBe('')
 	})
 
 	test('the week is themed on the name of the item it rolls', async () => {
@@ -3772,7 +3804,12 @@ describe('econ endpoints', () => {
 describe('catalog', () => {
 	// One row of each kind, plus the cases that decided the schema: an avatar_item_id shared by
 	// two rows and absent from a third, and keys that are alpha strings rather than GUIDs.
+	//
+	// Starts from an EMPTY table: the suite-wide setup seeds skins for the weekly-challenge gift
+	// pool, and the exact counts and lists below are about these rows alone. This block is the
+	// last in the file, so clearing is safe.
 	beforeAll(async () => {
+		await env.DB.prepare('DELETE FROM catalog').run()
 		const insert = (row: unknown[]) =>
 			env.DB.prepare(
 				`INSERT INTO catalog (

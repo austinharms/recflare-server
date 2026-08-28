@@ -51,10 +51,14 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
+// `LEGACY_CLIENT_BUILD` is shared with the storefront generator rather than restated: it picks
+// which store FILE a caller is served here, and which ITEMS go in that file there. The two must
+// name the same moment or a build gets a store built to a different cutoff.
 import {
 	CATALOG_ID_BASE,
 	CatalogKind,
 	isSellableRarity,
+	LEGACY_CLIENT_BUILD,
 	priceForRarity,
 	subscriberPriceFor,
 } from './catalog-load'
@@ -186,15 +190,6 @@ async function authedBuild(c: Context<App>): Promise<number | null> {
 	const build = Number.parseInt(version.split('.')[0] ?? '', 10)
 	return Number.isInteger(build) ? build : null
 }
-
-/**
- * The last client build treated as the 2023-era one. `GAME_VERSION` — what the rest of the
- * stack targets and reports for itself — so it and anything older keep exactly what they had,
- * and only a LATER build gets anything served differently.
- *
- * Compared with {@link authedBuild}, which reads the build off the token's `rn.ver`.
- */
-const LEGACY_CLIENT_BUILD = 20230414
 
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
@@ -654,11 +649,11 @@ const STOREFRONT_ALIASES: Record<string, string> = {
  * Storefronts that have a SECOND file for newer clients, keyed by the id the client asks for
  * and naming the file a build past {@link LEGACY_CLIENT_BUILD} is served instead.
  *
- * `3` is the general store. The 2023 client keeps `sf3.json` exactly as captured; a later one
- * gets `sf3-2025.json`, which is that same file plus every sellable row of the item catalog
- * (see `runx storefront build`). One storefront id either way — the client asks for 3 in both
- * cases and neither knows there are two files — so nothing about the request changes and no
- * item is renumbered. The two id spaces do not collide, which is what makes the merge safe.
+ * `3` is the general store, and BOTH files are generated from the item catalog by
+ * `runx storefront build` — the same store at two points in time. `sf3.json` holds what existed
+ * by {@link LEGACY_CLIENT_BUILD}; `sf3-2025.json` holds everything. One storefront id either
+ * way: the client asks for 3 in both cases and neither knows there are two files, so nothing
+ * about the request changes and no item is renumbered between them.
  *
  * Resolved in {@link storefrontAssetPath}, which BOTH the listing route and
  * {@link loadStorefront} go through, so browsing and buying always read the same file. That is
@@ -1018,23 +1013,87 @@ async function pushProgressionUpdate(
  */
 const ROLL_STOREFRONT_TYPE = 3
 
-/** Every item in the roll catalog, or `[]` if it can't be read (a roll then yields nothing). */
+/**
+ * Every item a roll or a weekly gift may draw, or `[]` if it can't be read (a roll then yields
+ * nothing).
+ *
+ * The storefront PLUS every equipment skin, which no storefront sells: skins are awarded from
+ * weekly challenges rather than bought, so they were taken out of sf3 — and the weekly gift pool
+ * is exactly the equipment in this list, which would otherwise be empty. They come from the
+ * `catalog` table, whose skins are the same rows `static/db/skins.json` holds.
+ *
+ * Being in this list does NOT make an item purchasable. `findStoreItem` and the bulk bag resolve
+ * a purchase against the storefront file, never against this.
+ */
 async function loadRollCatalog(c: Context<App>): Promise<StoreItem[]> {
 	const storefront = await loadStorefront(c, ROLL_STOREFRONT_TYPE)
-	return storefront?.StoreItems ?? []
+	const { results } = await c.env.DB.prepare(
+		`SELECT * FROM catalog WHERE kind = ?1 AND catalog_id IS NOT NULL`
+	)
+		.bind(CatalogKind.Skin)
+		.all<CatalogRow>()
+	return [...(storefront?.StoreItems ?? []), ...results.map(toSkinStoreItem)]
 }
 
 /**
- * The equipment a weekly challenge gift can be drawn from: every roll-catalog item carrying
- * an `EquipmentModificationGuid`. Weekly rewards are equipment — the captured rotation's is a
- * camera skin — and in sf3 that guid is exactly what marks an item as equipment (187 of its
- * 1161, all with a prefab, none with an avatar item or consumable attached).
+ * One catalog skin as a STORE ITEM, so the roll catalog and the weekly gift pool can read it the
+ * same way they read a storefront entry.
  *
- * `GiftDropId` comes off `PurchasableItemId`, which every sf3 equipment entry agrees with.
+ * Keyed the way a gift-drop keys equipment (`EquipmentPrefabName` + `EquipmentModificationGuid`)
+ * rather than as an avatar item — that guid is what marks an entry as equipment, and what the
+ * gift pool filters on. Priced at zero: nothing sells these, and a price here would be a number
+ * no surface ever shows.
+ */
+function toSkinStoreItem(row: CatalogRow): StoreItem {
+	return {
+		GiftDrop: {
+			FriendlyName: row.friendly_name,
+			Tooltip: row.tooltip ?? '',
+			ConsumableItemDesc: '',
+			AvatarItemDesc: '',
+			AvatarItemType: 0,
+			EquipmentPrefabName: row.prefab_name ?? '',
+			EquipmentModificationGuid: row.item_key,
+			Rarity: row.rarity,
+			Context: 0,
+			Currency: 0,
+			CurrencyType: 0,
+		},
+		Prices: [],
+		PurchasableItemId: row.catalog_id as number,
+	}
+}
+
+/**
+ * Equipment prefabs a weekly gift is never drawn from, matched on the prefix of
+ * `EquipmentPrefabName`.
+ *
+ * `[Sandbox_D4]` … `[Sandbox_D20]` are the sandbox dice — 24 skins across six prefabs, a sixth
+ * of the whole pool. Theming a week on "Sandbox D8 (Pewter)" spends the week's headline reward
+ * on a die recolour, so they are excluded and the pool is the 248 that remain.
+ */
+const WEEKLY_GIFT_EXCLUDED_PREFABS = ['[Sandbox_']
+
+/**
+ * The equipment a weekly challenge gift can be drawn from: every roll-catalog item carrying an
+ * `EquipmentModificationGuid`, less {@link WEEKLY_GIFT_EXCLUDED_PREFABS}. Weekly rewards are
+ * equipment — the captured rotation's is a camera skin — and that guid is exactly what marks an
+ * entry as equipment.
+ *
+ * The pool comes from the catalog's SKINS now rather than from sf3, which no longer sells
+ * equipment at all: skins are awarded here, not bought. See {@link loadRollCatalog}.
+ *
+ * `GiftDropId` comes off `PurchasableItemId`, which for a skin is its `catalog_id`.
  */
 function toEquipmentGiftPool(catalog: StoreItem[]): EquipmentGift[] {
 	return catalog
-		.filter((item) => item.GiftDrop.EquipmentModificationGuid !== '')
+		.filter(
+			(item) =>
+				item.GiftDrop.EquipmentModificationGuid !== '' &&
+				!WEEKLY_GIFT_EXCLUDED_PREFABS.some((prefix) =>
+					item.GiftDrop.EquipmentPrefabName.startsWith(prefix)
+				)
+		)
 		.map((item) => ({
 			GiftDropId: item.PurchasableItemId,
 			EquipmentPrefabName: item.GiftDrop.EquipmentPrefabName,
@@ -1496,9 +1555,13 @@ async function catalogStoreItems(db: D1Database, catalogIds: number[]): Promise<
 		.all<CatalogRow>()
 
 	return results
-		.filter((row) => row.catalog_id !== null && isSellableRarity(row.rarity))
+		.filter(
+			(row) =>
+				row.catalog_id !== null &&
+				row.kind === CatalogKind.AvatarItem &&
+				isSellableRarity(row.rarity)
+		)
 		.map((row) => {
-			const skin = row.kind === CatalogKind.Skin
 			const price = priceForRarity(row.rarity)
 			return {
 				GiftDrop: {
@@ -1506,12 +1569,12 @@ async function catalogStoreItems(db: D1Database, catalogIds: number[]): Promise<
 					// The client's field is a string; the catalog keeps NULL and "" apart.
 					Tooltip: row.tooltip ?? '',
 					ConsumableItemDesc: '',
-					// `item_key` IS the desc for an avatar item and the modification guid for a skin —
-					// one key column, read into whichever field its kind belongs in.
-					AvatarItemDesc: skin ? '' : row.item_key,
-					AvatarItemType: skin ? 0 : (row.avatar_item_type ?? 0),
-					EquipmentPrefabName: skin ? (row.prefab_name ?? '') : '',
-					EquipmentModificationGuid: skin ? row.item_key : '',
+					// `item_key` IS the `AvatarItemDesc` for an avatar item — that is what makes it the
+					// key. The equipment fields stay empty: only avatar items reach here.
+					AvatarItemDesc: row.item_key,
+					AvatarItemType: row.avatar_item_type ?? 0,
+					EquipmentPrefabName: '',
+					EquipmentModificationGuid: '',
 					Rarity: row.rarity,
 					Context: 0,
 					Currency: 0,
@@ -1964,43 +2027,64 @@ const app = new Hono<App>({ strict: false })
 	.onError(withOnError())
 	.notFound(withNotFound())
 
-	// A batch lookup of LOCKED avatar items — the client posts the descs it is about to draw
-	// and expects back the ones it must grey out, as a BARE ARRAY.
+	// A batch lookup of LOCKED avatar items — the client posts the descs it wants the locked
+	// state for and expects the matching item records back, as a BARE ARRAY.
 	//
-	// A TEST STUB: it answers the whole bundled catalogue regardless of what was posted, so
-	// every item the client can see comes back locked. Two consequences to know before reading
-	// anything into what the client does with it:
+	// Filtered by exact `AvatarItemDesc`, matching the reference implementation: it walks its
+	// own item list and keeps the entries whose desc appears in the posted set. Two consequences
+	// of copying that shape rather than the obvious one:
 	//
-	//  - The posted `AvatarItemDescriptions` are NOT read, so nothing is echoed. The reference
-	//    answers per requested desc; a client that matches responses to its request will find
-	//    entries it never asked for and none of the ones it did.
-	//  - It is the whole catalogue every call — 3098 items, about a megabyte — which is fine for
-	//    a stub and is not what a real implementation should send.
+	//  - Order is the CATALOGUE's, not the request's, because the filter iterates the catalogue.
+	//    A caller must not read the response positionally against what it asked for.
+	//  - The match is the WHOLE desc, not the base asset. `<base>,,,` and `<base>,<colour>,` are
+	//    different items and only the one asked for comes back.
 	//
-	// The real thing resolves each posted desc against what the player has NOT unlocked. The
-	// `catalog` table is keyed by `AvatarItemDesc` (`item_key`), so the lookup is already there
-	// to build on; what is missing is anything recording a lock.
+	// An EMPTY or absent list means everything, again as the reference does — that is its "give
+	// me the catalogue" case rather than a degenerate "match nothing".
 	//
-	// NOTE: the `api` worker has a route of this same path that answers `[]` — it predates this
-	// one and is left alone deliberately. The client asks THIS host, so that one is unreached;
-	// they must be reconciled before either is taken for real behaviour.
+	// Unknown descs are simply absent from the response; a miss is not an error. Nothing records
+	// a LOCK yet, so what comes back is the item records rather than a genuine locked answer.
+	//
+	// POST only, despite the reference declaring it `[HttpGet]` with a `[FromBody]` parameter —
+	// a combination the fetch standard forbids, so a GET could never carry the descs it needs.
+	//
+	// NOTE: the `api` worker has a route of this same path that answers `[]`. The client asks
+	// THIS host, so that one is unreached; they must be reconciled before either is taken for
+	// real behaviour.
 	.post(
 		'/api/avatar/v1/lockeditems/bulk',
 		describeRoute({
 			tags: ['Avatar'],
-			summary: 'Locked avatar items in bulk (test stub)',
+			summary: 'Locked avatar items in bulk',
 			description: [
-				'Resolves a batch of `AvatarItemDescriptions` to the items that are LOCKED for the',
-				'caller, as a bare array.',
-				'TEST STUB: the posted descs are ignored and the whole bundled catalogue comes back,',
-				'so the client renders everything as locked. Nothing records a lock yet, and nothing',
-				'is echoed — a real implementation answers one entry per posted desc, carrying that',
-				'desc verbatim.',
+				'Resolves `AvatarItemDescriptions` against the bundled item catalogue and answers the',
+				'matching records as a bare array. The match is on the WHOLE `AvatarItemDesc`, so a',
+				'colourway is not found by its base asset alone.',
+				'An empty or absent list answers the WHOLE catalogue, which is the reference’s own',
+				'behaviour rather than a degenerate empty match.',
+				'Results come back in CATALOGUE order, not request order — the filter walks the',
+				'catalogue — so the response must not be read positionally. Unknown descs are simply',
+				'absent; a miss is not an error.',
+				'Nothing records a LOCK yet, so what comes back is the item records rather than a',
+				'genuine locked/unlocked answer.',
 			].join(' '),
-			requestBody: jsonBody(LockedItemsBulkRequest, 'The descs to resolve (currently ignored)'),
-			responses: { 200: json(JsonArray, 'The locked items — currently the whole catalogue') },
+			requestBody: jsonBody(LockedItemsBulkRequest, 'The descs to resolve'),
+			responses: { 200: json(JsonArray, 'The matching items, in catalogue order') },
 		}),
-		(c) => c.json(avatarItemCatalog)
+		async (c) => {
+			const body = (await c.req.json().catch(() => null)) as {
+				AvatarItemDescriptions?: unknown
+			} | null
+			const requested = Array.isArray(body?.AvatarItemDescriptions)
+				? body.AvatarItemDescriptions.filter((d): d is string => typeof d === 'string')
+				: []
+			if (requested.length === 0) return c.json(avatarItemCatalog)
+
+			// A Set rather than `Array.includes` per item: the client posts hundreds of descs
+			// against a catalogue of thousands, and the reference's nested scan is quadratic.
+			const wanted = new Set(requested)
+			return c.json(avatarItemCatalog.filter((item) => wanted.has(item.AvatarItemDesc)))
+		}
 	)
 
 	// Default-unlocked avatar items, served from the bundled static JSON.
