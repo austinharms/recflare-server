@@ -344,12 +344,30 @@ export async function ownsAllInventions(
 }
 
 /**
- * Invention search — the browse/search list the client shows when picking an
- * invention to spawn. Only published, non-hidden inventions are visible here (a
- * player's own unpublished ones come from `getInventionsByCreator`). `value` is
- * matched case-insensitively against the name and description, term by term; an
- * empty `value` browses everything published. Paginated via skip/take, newest
- * first. Returns a bare array — the shape the client expects from v2/search.
+ * Invention search — the browse/search list the client shows when picking an invention to
+ * spawn. Only published, non-hidden inventions are visible here (a player's own unpublished
+ * ones come from `getInventionsByCreator`). Newest first, paginated via skip/take. Returns a
+ * bare array — the shape the client expects from v2/search.
+ *
+ * `value` is split into terms on whitespace and `+`, and EVERY term must match (AND, not OR),
+ * which is what makes typing more words narrow the list. Each is matched case-insensitively
+ * against the NAME and the DESCRIPTION.
+ *
+ * Filtered, ordered and paged entirely IN SQL. It used to read every published invention into
+ * memory, filter there and slice — which meant the cost of a search grew with the whole
+ * catalogue no matter how narrow the query or how small the page, and a browse screen asking
+ * for 100 rows paid for all of them. `Name`, `Description` and `CreatedAt` live inside the JSON
+ * blob, so they are reached with `json_extract`; `is_published`/`hide_from_player` are already
+ * generated columns.
+ *
+ * Both sides of the comparison are lowered rather than leaning on `LIKE`, which folds case for
+ * ASCII only — and invention names are full of things it would not fold. `%` and `_` in a term
+ * are escaped so a player searching for one finds it instead of matching everything.
+ *
+ * A term starting with `#` is NOT special here: the browse screen's filter chips send `#small`,
+ * and a tag appears in no name or description, so those searches find nothing. Matching tags
+ * needs them out of the JSON blob and into something indexable first; until then this stays a
+ * text search rather than one that scans every row to look at its tags.
  */
 export async function searchInventions(
 	db: D1Database,
@@ -357,22 +375,39 @@ export async function searchInventions(
 	skip: number,
 	take: number
 ): Promise<SavedInvention[]> {
-	let inventions = await publicInventions(db)
+	const limit = Math.max(take, 0)
+	const offset = Math.max(skip, 0)
+	if (limit === 0) return []
 
-	const terms = value
+	const where = ['is_published = 1', 'hide_from_player = 0']
+	const binds: Array<string | number> = []
+	/** Bind a value and get its placeholder, so the numbering can't drift as terms are added. */
+	const bind = (v: string | number): string => `?${binds.push(v)}`
+
+	for (const term of value
 		.trim()
 		.toLowerCase()
 		.split(/[\s+]+/)
-		.filter(Boolean)
-	for (const term of terms) {
-		inventions = inventions.filter(
-			(i) => i.Name.toLowerCase().includes(term) || i.Description.toLowerCase().includes(term)
+		.filter(Boolean)) {
+		const escaped = term.replace(/[\\%_]/g, (ch) => `\\${ch}`)
+		const pattern = bind(`%${escaped}%`)
+		where.push(
+			`(lower(json_extract(data, '$.Name')) LIKE ${pattern} ESCAPE '\\'` +
+				` OR lower(json_extract(data, '$.Description')) LIKE ${pattern} ESCAPE '\\')`
 		)
 	}
 
-	return inventions
-		.sort((a, b) => b.CreatedAt.localeCompare(a.CreatedAt) || b.InventionId - a.InventionId)
-		.slice(skip, skip + take)
+	const limitAt = bind(limit)
+	const offsetAt = bind(offset)
+	const { results } = await db
+		.prepare(
+			`SELECT data FROM invention WHERE ${where.join(' AND ')}
+			 ORDER BY json_extract(data, '$.CreatedAt') DESC, id DESC
+			 LIMIT ${limitAt} OFFSET ${offsetAt}`
+		)
+		.bind(...binds)
+		.all<InventionRow>()
+	return results.map((r) => JSON.parse(r.data) as SavedInvention)
 }
 
 /**
@@ -691,6 +726,14 @@ export async function getInventionsByRoom(
 }
 
 /**
+ * The `version` that means "whichever is current" rather than a version number to match.
+ *
+ * Zero is not a version any invention has — a fresh save is version 1 — so a caller sending
+ * it does not know which version it wants, and reading it literally finds nothing.
+ */
+const CURRENT_INVENTION_VERSION = 0
+
+/**
  * A single version of an invention (`v1/version?inventionId=…&version=…`), which
  * is how the client resolves the blob to download for a given version number.
  *
@@ -698,6 +741,13 @@ export async function getInventionsByRoom(
  * (there's no `v4/addversion` yet), and a fresh save is always version 1. So this
  * answers for the current version number and reports null for any other, rather
  * than inventing a version whose blob doesn't exist.
+ *
+ * VERSION 0 is the exception: it means "whichever version is current" rather than a
+ * version number to match, and gets {@link CURRENT_INVENTION_VERSION}. The client asks
+ * for 0 when it has an invention id but no version to go with it — a discovery row or a
+ * spawn that carries the id alone — and there is no version 0 to find, so matching it
+ * literally 404s and the invention silently fails to load. Answering with the current
+ * version is what it would have asked for had it known the number.
  */
 export async function getInventionVersion(
 	db: D1Database,
@@ -707,7 +757,12 @@ export async function getInventionVersion(
 ): Promise<InventionVersion | null> {
 	const invention = await getInventionById(db, inventionId)
 	if (invention === null) return null
-	if (invention.CurrentVersionNumber !== versionNumber) return null
+	if (
+		versionNumber !== CURRENT_INVENTION_VERSION &&
+		invention.CurrentVersionNumber !== versionNumber
+	) {
+		return null
+	}
 
 	// A version saved before its blob finished uploading (or before we hashed on
 	// save at all) carries no hash. Hash it now and keep the result, so the other

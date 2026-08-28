@@ -1001,6 +1001,27 @@ describe('public endpoints', () => {
 		}
 	})
 
+	test('GET /api/CircuitChipLists/:list is empty for any name', async () => {
+		// A palette on the Maker Pen's circuit board, named by the path. Nothing records which
+		// chips a player has used or favourited, so every one of them is empty — including names
+		// this server has never heard of, which the client will ask for as its build changes.
+		// An unknown name being a 404 would render as a palette that FAILED to load rather than
+		// one with nothing in it.
+		for (const list of [
+			'Favorites',
+			'Recent',
+			'All',
+			'SomePaletteThisServerHasNeverHeardOf',
+			// Path-segment oddities: a name that needs escaping, and a numeric one.
+			encodeURIComponent('Weird Name/With Slash'),
+			'42',
+		]) {
+			const res = await exports.default.fetch(`${ORIGIN}/api/CircuitChipLists/${list}`)
+			expect(res.status, list).toBe(200)
+			expect(await res.json(), list).toEqual([])
+		}
+	})
+
 	test('GET /api/inventions/v1/featureddormskins returns []', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/featureddormskins`)
 		expect(res.status).toBe(200)
@@ -1050,6 +1071,209 @@ describe('public endpoints', () => {
 				thumbnailImageFilename: 'thumb_x.png',
 			}
 		}
+	})
+
+	test('GET /api/customAvatarItems/v1/search filters, pages and excludes unpublished', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+
+		const search = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/search${query}`)
+			expect(res.status, query).toBe(200)
+			return (await res.json()) as Array<{
+				CustomAvatarItemId: string
+				Name: string
+				OutfitType: number
+				PurchaseInfo: null
+			}>
+		}
+
+		// A BARE ARRAY, not the `{ Results, TotalResults }` envelope `fromCreator` uses.
+		expect(await search('')).toEqual([])
+
+		const made: Record<string, string> = {}
+		// Six published items across three outfit types, plus one unpublished and one Coach's.
+		// Creation times ascend with the index so "newest first" is unambiguous.
+		const spec: Array<[name: string, outfitType: number, accessibility: number, creator: number]> =
+			[
+				['Hat A', 0, 1, 205],
+				['Shirt A', 2, 1, 205],
+				['Shirt B', 2, 1, 205],
+				['Trousers A', 3, 1, 205],
+				['Coach Hat', 0, 1, 1],
+				['Hidden', 0, 0, 205],
+			]
+		for (const [i, [name, outfitType, accessibility, creator]] of spec.entries()) {
+			const created = await createCustomAvatarItem(
+				env.DB,
+				{
+					customAvatarItemId: crypto.randomUUID(),
+					creatorAccountId: creator,
+					name,
+					description: '',
+					price: 0,
+					baseAvatarItemId: 1,
+					baseAvatarItemColor: '#fff',
+					accessibility,
+					designFilename: 'design_x.bin',
+					thumbnailImageFilename: 'thumb_x.png',
+				},
+				new Date(Date.UTC(2026, 7, 1 + i))
+			)
+			made[name] = created.CustomAvatarItemId
+			// Nothing sets outfit_type on creation yet, so set it straight in the table.
+			await env.DB.prepare(
+				'UPDATE custom_avatar_item SET outfit_type = ?2 WHERE custom_avatar_item_id = ?1'
+			)
+				.bind(created.CustomAvatarItemId, outfitType)
+				.run()
+		}
+
+		// Newest first, and `Hidden` never appears: Accessibility 0 is unpublished, and this is
+		// the shared browse surface — its creator sees it through `fromCreator`, not here.
+		const all = await search('')
+		expect(all.map((i) => i.Name)).toEqual([
+			'Coach Hat',
+			'Trousers A',
+			'Shirt B',
+			'Shirt A',
+			'Hat A',
+		])
+
+		// `outfitTypes` repeats and acts as a whitelist — the real client sends a dozen of them.
+		expect((await search('?outfitTypes=2')).map((i) => i.Name)).toEqual(['Shirt B', 'Shirt A'])
+		expect((await search('?outfitTypes=0&outfitTypes=3')).map((i) => i.Name)).toEqual([
+			'Coach Hat',
+			'Trousers A',
+			'Hat A',
+		])
+
+		// Sending NONE means no filter, not no results: the client sends every type it can render,
+		// so reading an absent parameter as an empty `IN ()` would empty the store.
+		expect((await search('?skip=0&take=100')).map((i) => i.Name)).toEqual(all.map((i) => i.Name))
+
+		// A non-numeric value is dropped rather than becoming NaN, which would match nothing and
+		// quietly empty a filter the caller believes they set.
+		expect((await search('?outfitTypes=2&outfitTypes=nonsense')).map((i) => i.Name)).toEqual([
+			'Shirt B',
+			'Shirt A',
+		])
+
+		// Paging, and it is STABLE: consecutive pages must not repeat or skip a row, which the
+		// id tiebreak in the ordering is what guarantees when timestamps collide.
+		const page1 = await search('?skip=0&take=2')
+		const page2 = await search('?skip=2&take=2')
+		expect(page1.map((i) => i.Name)).toEqual(['Coach Hat', 'Trousers A'])
+		expect(page2.map((i) => i.Name)).toEqual(['Shirt B', 'Shirt A'])
+		expect(
+			page1.some((i) => page2.some((j) => j.CustomAvatarItemId === i.CustomAvatarItemId))
+		).toBe(false)
+		expect(await search('?skip=99&take=10')).toEqual([])
+		expect(await search('?take=0')).toEqual([])
+
+		// The client capitalises its booleans (`includeCoachItems=True`), so the comparison folds
+		// case; only a recognisable "false" turns the stock content off.
+		expect((await search('?includeCoachItems=True')).map((i) => i.Name)).toContain('Coach Hat')
+		expect((await search('?includeCoachItems=false')).map((i) => i.Name)).not.toContain('Coach Hat')
+
+		// The whole query the client actually sends, unchanged — the parameters that aren't acted
+		// on yet must be accepted rather than 400 or throw.
+		const real = await search(
+			'?outfitTypes=0&outfitTypes=2&outfitTypes=3&outfitTypes=10&outfitTypes=20&outfitTypes=100' +
+				'&outfitTypes=101&outfitTypes=102&outfitTypes=103&outfitTypes=200&outfitTypes=300' +
+				'&outfitTypes=301&includePurchaseInfos=True&includeCoachItems=True&ordering=0&skip=0' +
+				'&take=100&unityAssetTarget=0&unityAssetVersion=3'
+		)
+		expect(real.map((i) => i.Name)).toEqual(all.map((i) => i.Name))
+		// `includePurchaseInfos=True` notwithstanding: nothing prices a custom item here yet, so
+		// the field is null on every item and the parameter changes nothing.
+		expect(real.every((i) => i.PurchaseInfo === null)).toBe(true)
+	})
+
+	test('GET /api/customAvatarItems/v1/search matches name or description, and bounds price', async () => {
+		await env.DB.prepare('DELETE FROM custom_avatar_item').run()
+
+		const search = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/search${query}`)
+			expect(res.status, query).toBe(200)
+			return ((await res.json()) as Array<{ Name: string }>).map((i) => i.Name)
+		}
+
+		const make = async (name: string, description: string, price: number, i: number) =>
+			createCustomAvatarItem(
+				env.DB,
+				{
+					customAvatarItemId: crypto.randomUUID(),
+					creatorAccountId: 205,
+					name,
+					description,
+					price,
+					baseAvatarItemId: 1,
+					baseAvatarItemColor: '#fff',
+					accessibility: 1,
+					designFilename: 'design_x.bin',
+					thumbnailImageFilename: 'thumb_x.png',
+				},
+				new Date(Date.UTC(2026, 7, 1 + i))
+			)
+
+		await make('Room Hat', '', 100, 0)
+		// Matched on DESCRIPTION, not name — the two are searched together.
+		await make('Cosy Beanie', 'Warm in any ROOM', 500, 1)
+		// Matched case-insensitively and as a SUBSTRING, mid-word.
+		await make('Ballroom Shoes', '', 9000, 2)
+		await make('Unrelated Cap', 'nothing to do with it', 250, 3)
+		// A name holding LIKE metacharacters, for the escaping below.
+		await make('100% Wool', 'a_b', 50, 4)
+
+		// Newest first throughout, so the order also proves the query didn't disturb the ordering.
+		expect(await search('?searchQuery=room')).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
+		// Case folds both ways: SQLite's own LIKE only folds ASCII, so both sides are lowered.
+		expect(await search('?searchQuery=ROOM')).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
+		expect(await search('?searchQuery=beanie')).toEqual(['Cosy Beanie'])
+		expect(await search('?searchQuery=nothing%20to%20do')).toEqual(['Unrelated Cap'])
+		expect(await search('?searchQuery=zzzz')).toEqual([])
+
+		// Blank or absent is NO filter, not an empty result — a cleared search box must show the
+		// store rather than nothing.
+		expect(await search('?searchQuery=')).toHaveLength(5)
+		expect(await search('?searchQuery=%20%20')).toHaveLength(5)
+
+		// A needle of LIKE metacharacters matches them LITERALLY. Unescaped, `%` would match every
+		// item and `_` any single character, so a player searching for "100%" would get the lot.
+		expect(await search('?searchQuery=%25')).toEqual(['100% Wool'])
+		expect(await search('?searchQuery=a_b')).toEqual(['100% Wool'])
+
+		// Price bounds, inclusive at both ends.
+		expect(await search('?minPrice=250&maxPrice=9000')).toEqual([
+			'Unrelated Cap',
+			'Ballroom Shoes',
+			'Cosy Beanie',
+		])
+		expect(await search('?maxPrice=100')).toEqual(['100% Wool', 'Room Hat'])
+		expect(await search('?minPrice=9000')).toEqual(['Ballroom Shoes'])
+		expect(await search('?minPrice=100000')).toEqual([])
+
+		// Combined with the text search, since the client sends both together.
+		expect(await search('?searchQuery=room&maxPrice=500')).toEqual(['Cosy Beanie', 'Room Hat'])
+
+		// The whole query the client actually sends. `itemTypes` and the unity asset parameters are
+		// accepted and not acted on; `outfitTypes=105` matches nothing, so this is empty — which is
+		// the filter working, not the search failing.
+		expect(
+			await search(
+				'?searchQuery=room&itemTypes=-1&outfitTypes=105&minPrice=0&maxPrice=10000' +
+					'&includePurchaseInfos=True&includeCoachItems=False&ordering=0&skip=0&take=1000' +
+					'&unityAssetTarget=0&unityAssetVersion=3'
+			)
+		).toEqual([])
+		// Same query with the outfit-type filter dropped: the rest of it does match.
+		expect(
+			await search(
+				'?searchQuery=room&itemTypes=-1&minPrice=0&maxPrice=10000&includePurchaseInfos=True' +
+					'&includeCoachItems=False&ordering=0&skip=0&take=1000&unityAssetTarget=0' +
+					'&unityAssetVersion=3'
+			)
+		).toEqual(['Ballroom Shoes', 'Cosy Beanie', 'Room Hat'])
 	})
 
 	test('GET /api/customAvatarItems/v2/fromCreator/:id shows unpublished items only to the creator', async () => {
@@ -1131,29 +1355,110 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
-	// A BARE ARRAY of the items that matched — not the `{ Results, TotalResults }` page
-	// the sibling custom-item reads serve. Nothing stores custom items, so every id
-	// misses, and a miss is an absent entry rather than an error.
-	test('POST /api/customAvatarItems/v1/bulk returns the matching items as an array', async () => {
-		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/bulk`, {
+	/** Create a custom avatar item and return it, so a bulk lookup has something to find. */
+	async function createCustomItem(
+		creator: string,
+		metadata: Record<string, unknown>
+	): Promise<{ CustomAvatarItemId: string; Name: string }> {
+		const form = new FormData()
+		form.set(
+			'metadata',
+			JSON.stringify({
+				Name: 'bulk item',
+				Description: '',
+				Price: 0,
+				BaseAvatarItemId: 2184,
+				BaseAvatarItemColor: '#F55C1A',
+				Accessibility: 1,
+				...metadata,
+			})
+		)
+		form.set('thumbnailImage', new File([new Uint8Array([1])], 'f.bin', { type: 'image/png' }))
+		form.set('design', new File([new Uint8Array([2])], 'f.bin', { type: 'image/png' }))
+		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
 			method: 'POST',
-			headers: {
-				'content-type': 'application/x-www-form-urlencoded',
-				...(await bearer()),
-			},
-			// Repeated form field, as `[FromForm] List<string>` binds it.
-			body: new URLSearchParams([
-				['customAvatarItemIds', 'a'],
-				['customAvatarItemIds', 'b'],
-			]),
+			headers: await bearer(creator),
+			body: form,
 		})
 		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+		return ((await res.json()) as { Value: { CustomAvatarItemId: string; Name: string } }).Value
+	}
+
+	/** POST the bulk lookup with `ids` as repeated form fields, as the client binds them. */
+	async function bulkLookup(
+		ids: string[],
+		as = '42'
+	): Promise<Array<{ CustomAvatarItemId: string; Name: string }>> {
+		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/x-www-form-urlencoded', ...(await bearer(as)) },
+			// Repeated form field, as `[FromForm] List<string>` binds it.
+			body: new URLSearchParams(ids.map((id) => ['customAvatarItemIds', id])),
+		})
+		expect(res.status).toBe(200)
+		return (await res.json()) as Array<{ CustomAvatarItemId: string; Name: string }>
+	}
+
+	// A BARE ARRAY of the items that matched — not the `{ Results, TotalResults }` page
+	// the sibling custom-item reads serve — resolved out of the `custom_avatar_item` table.
+	// This is what a `1.<guid>` entity in a Generic discovery row resolves through, so it
+	// answering `[]` (as it did while it was a stub) renders that row's items as nothing.
+	test('POST /api/customAvatarItems/v1/bulk resolves the posted ids against the table', async () => {
+		const first = await createCustomItem('205', { Name: 'bulk one' })
+		const second = await createCustomItem('205', { Name: 'bulk two' })
+
+		// In REQUEST order, not creation order — the client reads the array positionally.
+		const items = await bulkLookup([second.CustomAvatarItemId, first.CustomAvatarItemId])
+		expect(items.map((i) => i.CustomAvatarItemId)).toEqual([
+			second.CustomAvatarItemId,
+			first.CustomAvatarItemId,
+		])
+		expect(items[0]).toMatchObject({ Name: 'bulk two', CreatorAccountId: 205, Accessibility: 1 })
+
+		// A miss is an absent entry, not an error: the client reads the items it got back
+		// rather than the ids it asked for, so an unknown id must not cost it the rest.
+		const mixed = await bulkLookup([
+			'00000000-0000-0000-0000-000000000000',
+			first.CustomAvatarItemId,
+		])
+		expect(mixed.map((i) => i.CustomAvatarItemId)).toEqual([first.CustomAvatarItemId])
+
+		// Ids also ride comma-separated inside one field, and on the query string — the
+		// client's exact encoding here isn't pinned down, so all three spellings are read.
+		const commas = await bulkLookup([`${first.CustomAvatarItemId},${second.CustomAvatarItemId}`])
+		expect(commas).toHaveLength(2)
+		const queried = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/bulk?customAvatarItemIds=${first.CustomAvatarItemId}`,
+			{ method: 'POST', headers: await bearer() }
+		)
+		expect(((await queried.json()) as unknown[]).length).toBe(1)
+
+		// Over 100 ids answers EMPTY without touching the table. The client has been seen posting
+		// far more than a screen could draw, and empty is safe precisely because a miss here is
+		// already not an error. Empty rather than the first 100: the client reads the items it got
+		// back, not the ids it asked about, so it cannot tell a truncated batch from a batch of
+		// misses and would cache the difference.
+		const padding = Array.from({ length: 99 }, () => '00000000-0000-0000-0000-000000000000')
+		expect(await bulkLookup([first.CustomAvatarItemId, ...padding])).toHaveLength(1)
+		expect(
+			await bulkLookup([first.CustomAvatarItemId, second.CustomAvatarItemId, ...padding])
+		).toEqual([])
 	})
 
-	// The ids are never parsed (nothing could match), so a missing body is still a 200
-	// rather than the 400 a body-reading handler would produce.
-	test('POST /api/customAvatarItems/v1/bulk ignores the body', async () => {
+	// Unpublished items are held back from everyone but their creator — the same rule the
+	// featured/hot feeds and the creator shelf apply, so this route can't surface an item
+	// the feeds hide.
+	test('POST /api/customAvatarItems/v1/bulk hides unpublished items from everyone but the creator', async () => {
+		const hidden = await createCustomItem('206', { Name: 'unpublished', Accessibility: 0 })
+
+		expect(await bulkLookup([hidden.CustomAvatarItemId], '42')).toEqual([])
+		const own = await bulkLookup([hidden.CustomAvatarItemId], '206')
+		expect(own.map((i) => i.Name)).toEqual(['unpublished'])
+	})
+
+	// A missing body is a 200 with an empty array rather than a 400: nothing was asked for,
+	// so nothing matched — the same shape as asking for ids that all miss.
+	test('POST /api/customAvatarItems/v1/bulk answers an empty array for an empty body', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1/bulk`, {
 			method: 'POST',
 			headers: await bearer(),
@@ -1546,6 +1851,87 @@ describe('public endpoints', () => {
 		])
 	})
 
+	test('POST /api/customAvatarItems/v1/:id/report files a report against the item’s creator', async () => {
+		// 205 makes an item; 42 reports it. The creator is derived FROM the item — the client
+		// sends `ReportedPlayerId: null` because it does not know who made it.
+		const item = await createCustomItem('205', { Name: 'Reportable Hat' })
+
+		const res = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}/report`,
+			{
+				method: 'POST',
+				headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({
+					ReportCategory: 2,
+					Details: 'tesfsfsdf',
+					ReportedPlayerId: null,
+				}),
+			}
+		)
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true, error: '' })
+
+		// One row in the shared report table, marked as an item report by `custom_avatar_item_id`.
+		// `room_id` stays null — an item isn't tied to one room the way an event is — and the
+		// other two id columns stay null, which is what tells the kinds apart.
+		const row = await env.DB.prepare('SELECT * FROM report WHERE custom_avatar_item_id = ?1')
+			.bind(item.CustomAvatarItemId)
+			.first<Record<string, unknown>>()
+		expect(row).toMatchObject({
+			reporter_player_id: 42,
+			reported_player_id: 205, // the item's creator
+			report_category: 2,
+			details: 'tesfsfsdf',
+			custom_avatar_item_id: item.CustomAvatarItemId,
+			invention_id: null,
+			event_id: null,
+			room_id: null,
+			banned: 0, // filed unbanned, like any report
+		})
+
+		// A body naming SOMEONE ELSE is ignored: the reported player is read off the item either
+		// way. Letting a client name who a report is against would let it point one at anybody.
+		await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}/report`,
+			{
+				method: 'POST',
+				headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ ReportCategory: 1, ReportedPlayerId: 999 }),
+			}
+		)
+		const reported = await env.DB.prepare(
+			'SELECT reported_player_id FROM report WHERE custom_avatar_item_id = ?1'
+		)
+			.bind(item.CustomAvatarItemId)
+			.all<{ reported_player_id: number }>()
+		// Nothing dedupes: two reports of the same item are two rows, both against the creator.
+		expect(reported.results.map((r) => r.reported_player_id)).toEqual([205, 205])
+
+		// An item that does not exist is refused rather than filed against nobody — the row's
+		// reported player has to be someone.
+		const unknown = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/00000000-0000-0000-0000-000000000000/report`,
+			{
+				method: 'POST',
+				headers: { ...(await bearer('42')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ ReportCategory: 0 }),
+			}
+		)
+		expect(unknown.status).toBe(404)
+		expect(await unknown.json()).toEqual({ success: false, error: 'No such item' })
+
+		// Auth-gated: the reporter comes from the token, so there is no filing one signed out.
+		const anon = await exports.default.fetch(
+			`${ORIGIN}/api/customAvatarItems/v1/${item.CustomAvatarItemId}/report`,
+			{
+				method: 'POST',
+				headers: { 'Content-Type': 'application/json' },
+				body: JSON.stringify({ ReportCategory: 0 }),
+			}
+		)
+		expect(anon.status).toBe(401)
+	})
+
 	test('POST /api/inventions/v1/report files a report row against the invention', async () => {
 		// 5150 saves an invention; 42 reports it. The creator is derived from the invention,
 		// so the reporter never gets to name who the report is against.
@@ -1859,6 +2245,82 @@ describe('public endpoints', () => {
 		expect(await miss.json()).toEqual([])
 	})
 
+	test('GET /api/inventions/v2/search filters and pages in SQL, and does not search tags', async () => {
+		const published = (id: number, name: string, description: string, tags: string[]) =>
+			({
+				InventionId: id,
+				ReplicationId: crypto.randomUUID(),
+				CreatorPlayerId: 8081,
+				Name: name,
+				Description: description,
+				ImageName: '',
+				CurrentVersionNumber: 1,
+				CurrentVersion: { InventionId: id, VersionNumber: 1, BlobName: '' },
+				IsPublished: true,
+				HideFromPlayer: false,
+				CreatedAt: `2026-09-0${id - 200}T00:00:00Z`,
+				Tags: tags.map((Tag) => ({ Tag, Type: 2 })),
+			}) as unknown as SavedInvention
+
+		for (const inv of [
+			published(201, 'Devin Cube', 'i dont even know lol', ['small']),
+			published(202, 'Devin Cube 2', 'No description yet', ['small', 'dormanchor']),
+			published(203, 'Recflarian Flag', 'idk..... lol', ['medium']),
+			published(204, 'Smallest Table', 'a small table', ['medium']),
+			// Name holds LIKE metacharacters, for the escaping below.
+			published(205, '100% Cube_Thing', '', []),
+		]) {
+			await env.DB.prepare('INSERT INTO invention (data) VALUES (?1)')
+				.bind(JSON.stringify(inv))
+				.run()
+		}
+
+		const ids = async (query: string) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/search?${query}`)
+			expect(res.status, query).toBe(200)
+			return ((await res.json()) as SavedInvention[])
+				.map((i) => i.InventionId)
+				.filter((id) => id >= 201)
+		}
+
+		// Newest first, matched against name OR description, case-insensitively.
+		expect(await ids('value=cube&skip=0&take=100')).toEqual([205, 202, 201])
+		expect(await ids('value=CUBE&skip=0&take=100')).toEqual([205, 202, 201])
+		expect(await ids('value=small&skip=0&take=100')).toEqual([204])
+		expect(await ids('value=lol&skip=0&take=100')).toEqual([203, 201])
+
+		// Terms are ANDed, so more words narrow rather than widen.
+		expect(await ids(`value=${encodeURIComponent('devin cube')}&skip=0&take=100`)).toEqual([
+			202, 201,
+		])
+		expect(await ids(`value=${encodeURIComponent('devin flag')}&skip=0&take=100`)).toEqual([])
+
+		// LIKE metacharacters are escaped: unescaped, `%` would match everything and `_` any
+		// single character, so searching for "100%" would return the whole catalogue.
+		expect(await ids('value=%25&skip=0&take=100')).toEqual([205])
+		expect(await ids('value=cube_thing&skip=0&take=100')).toEqual([205])
+
+		// TAGS ARE NOT SEARCHED. The browse screen's chips send `#small`, and no name or
+		// description contains it, so the term matches nothing — the tag is on 201 and 202, and a
+		// tag search would have returned them. Deliberate for now: matching tags needs them out of
+		// the JSON blob and into something indexable, and doing it in memory would mean reading
+		// every row to answer one page.
+		expect(await ids(`value=${encodeURIComponent('#small')}&skip=0&take=100`)).toEqual([])
+
+		// Paged in SQL: consecutive pages neither repeat nor skip a row. The `id` tiebreak in the
+		// ordering is what guarantees that when two inventions share a `CreatedAt`.
+		const page1 = await ids('value=cube&skip=0&take=2')
+		const page2 = await ids('value=cube&skip=2&take=2')
+		expect(page1).toEqual([205, 202])
+		expect(page2).toEqual([201])
+		expect(page1.some((id) => page2.includes(id))).toBe(false)
+		expect(await ids('value=cube&skip=99&take=10')).toEqual([])
+
+		// Cleaned up: the feeds and the tag-filter chips are derived from EVERY published
+		// invention, so rows left behind here would change what those tests see.
+		await env.DB.prepare('DELETE FROM invention WHERE id >= 201 AND id <= 205').run()
+	})
+
 	test('GET /api/inventions/v1/tagfilters ranks the tags in use', async () => {
 		// Two published inventions tagged `furniture`, one `bed` — plus a tagged draft,
 		// whose tags must not leak into the public filter chips.
@@ -2071,7 +2533,27 @@ describe('public endpoints', () => {
 			InstantiationCost: 42,
 		})
 
-		// Only the current version exists; anything else 404s, as does an unknown id.
+		// `version=0` means "whichever is current" rather than a number to match, and gets the
+		// same version 1 back. Nothing has a version 0 — a fresh save is version 1 — so a caller
+		// sending it does not know which version it wants, and matching it literally would 404 an
+		// invention that exists.
+		const v0 = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=0`
+		)
+		expect(v0.status).toBe(200)
+		expect(await v0.json()).toMatchObject({
+			InventionId: Invention.InventionId,
+			VersionNumber: 1,
+			BlobName: '2026-07-12/lamp.inv',
+		})
+
+		// The 0 shortcut does NOT make up an invention: an unknown id still 404s at 0.
+		const zeroUnknown = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/version?inventionId=999999&version=0`
+		)
+		expect(zeroUnknown.status).toBe(404)
+
+		// Only the current version exists; any other NUMBER still 404s, as does an unknown id.
 		const v2 = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v1/version?inventionId=${Invention.InventionId}&version=2`
 		)
@@ -5722,6 +6204,7 @@ describe('openapi', () => {
 			'DELETE /api/customAvatarItems/v1/{id}',
 			'DELETE /api/images/v1/deletesaved',
 			'DELETE /api/playerevents/v2/delete/{eventId}',
+			'GET /api/CircuitChipLists/{list}',
 			'GET /api/PlayerReporting/v1/moderationBlockDetails',
 			'GET /api/PlayerReporting/v1/voteToKickReasons',
 			'GET /api/activities/charades/v1/words/{activity}',
@@ -5738,6 +6221,7 @@ describe('openapi', () => {
 			'GET /api/customAvatarItems/v1/isCreationEnabled',
 			'GET /api/customAvatarItems/v1/isRenderingEnabled',
 			'GET /api/customAvatarItems/v1/minPriceForPublicItem',
+			'GET /api/customAvatarItems/v1/search',
 			'GET /api/customAvatarItems/v2/fromCreator/{accountId}',
 			'GET /api/equipment/v2/getUnlocked',
 			'GET /api/gameconfigs/v1/all',
@@ -5824,6 +6308,7 @@ describe('openapi', () => {
 			'POST /api/customAvatarItems/GetCustomAvatarItemCurrentSavesForLegacyAvatarItems',
 			'POST /api/customAvatarItems/v1',
 			'POST /api/customAvatarItems/v1/bulk',
+			'POST /api/customAvatarItems/v1/{id}/report',
 			'POST /api/gamesight/event',
 			'POST /api/images/v1/cheer',
 			'POST /api/images/v4/uploadsaved',

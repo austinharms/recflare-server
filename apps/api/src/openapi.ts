@@ -577,7 +577,7 @@ export const BulkCustomAvatarItemsRequest = z.object({
 		.describe('The ids to resolve; repeat the field once per id'),
 })
 
-/** A paginated custom-avatar-item page (no storage yet, so always empty). */
+/** A paginated custom-avatar-item page, out of the `custom_avatar_item` table. */
 export const CustomAvatarItemsPage = z.object({
 	Results: CustomAvatarItemList,
 	TotalResults: z.int(),
@@ -972,6 +972,24 @@ export const PlayerEventReportRequest = z.object({
  * body: it's the bearer token's player, and neither is the invention's creator, who is
  * read from the invention.
  */
+/**
+ * `POST /api/customAvatarItems/v1/{id}/report` JSON body. The item is named by the PATH, not
+ * the body, and `ReportedPlayerId` arrives NULL — the client does not know who made the item,
+ * so the creator is read off the item instead.
+ */
+export const CustomAvatarItemReportRequest = z.object({
+	ReportCategory: z
+		.int()
+		.optional()
+		.describe('The reason picked in the report UI. Stored verbatim; unmapped'),
+	Details: z.string().optional().describe('The free-text description the reporter typed'),
+	ReportedPlayerId: z
+		.int()
+		.nullable()
+		.optional()
+		.describe('Sent as null and IGNORED — the reported player is the item’s creator'),
+})
+
 export const InventionReportRequest = z.object({
 	InventionId: z.int().describe('The invention being reported'),
 	ReportCategory: z
