@@ -17,13 +17,8 @@ import {
 	setOutfit,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetRoles } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetRoles, validateAndGetVersion } from '@repo/jwt'
 
-// Invention storage (owned by the `api` worker, on this same `recflare` database).
-// Imported directly rather than copied: these are plain D1 helpers with no bindings of
-// their own, and buyInvention has to read the very rows `api` writes.
-// Custom avatar items likewise live in an `api`-owned table; the UGC-purchasable bulk
-// lookup is the store's view of those rows.
 import {
 	getCustomAvatarItems,
 	toUgcPurchasable,
@@ -40,6 +35,7 @@ import { censorSwears } from '../../api/src/sanitize'
 import { BalanceAddType } from '../../notify/src/notification-payloads'
 import { NotificationType } from '../../notify/src/notification-types'
 import adCarouselItems from '../static/ad-carousel-items.json'
+import avatarItemCatalog from '../static/db/avatar-items.json'
 import defaultAvatarItems from '../static/default-avatar-items.json'
 import defaultAvatar from '../static/default-avatar.json'
 import defaultBaseAvatarItems from '../static/default-base-avatar-items.json'
@@ -55,6 +51,13 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
+import {
+	CATALOG_ID_BASE,
+	CatalogKind,
+	isSellableRarity,
+	priceForRarity,
+	subscriberPriceFor,
+} from './catalog-load'
 import { claimChallengeGift, getChallengeStatuses, recordChallengeProgress } from './challenge-db'
 import { buildRotation, rotationMapId, withWeeklyGift } from './challenge-rotation'
 import {
@@ -90,10 +93,13 @@ import {
 	GameRewardRequest,
 	InfluencerIdsResponse,
 	InfluencerTierResponse,
+	ItemPurchaseInfoList,
+	ItemPurchaseInfosRequest,
 	json,
 	JsonArray,
 	jsonBody,
 	JsonObject,
+	LockedItemsBulkRequest,
 	MakerAiFreeTrialEligibilityResponse,
 	OpaqueJsonBody,
 	OPTIONAL_AUTHED,
@@ -113,11 +119,13 @@ import { claimReward } from './reward-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Outfit, Progression, StoredGift, XpGrant } from '@repo/domain'
+import type { CustomAvatarItem } from '../../api/src/custom-avatar-items-db'
 import type {
 	BalanceResponsePayload,
 	PurchaseBalanceModificationPayload,
 } from '../../notify/src/notification-payloads'
 import type { Avatar } from './avatar-db'
+import type { CatalogRow } from './catalog-db'
 import type {
 	ChallengeGiftBlock,
 	EquipmentGift,
@@ -127,6 +135,12 @@ import type { ConsumeResult } from './consumables-db'
 import type { App } from './context'
 import type { Equipment } from './equipment-db'
 import type { AvatarItem } from './inventory-db'
+
+// Invention storage (owned by the `api` worker, on this same `recflare` database).
+// Imported directly rather than copied: these are plain D1 helpers with no bindings of
+// their own, and buyInvention has to read the very rows `api` writes.
+// Custom avatar items likewise live in an `api`-owned table; the UGC-purchasable bulk
+// lookup is the store's view of those rows.
 
 /**
  * Economy Worker. Hosts the avatar/economy endpoints the game client calls on
@@ -156,6 +170,31 @@ async function authedId(c: Context<App>): Promise<number | null> {
 async function authedRoles(c: Context<App>): Promise<string[] | null> {
 	return validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
 }
+
+/**
+ * The client build this request's token was minted for (`rn.ver`), as a comparable NUMBER —
+ * the leading `YYYYMMDD` of e.g. `20250718.01`, whose `.01` is a same-day rebuild and not a
+ * version to order by. `null` when there is no valid token, when it carries no `rn.ver` (an
+ * older token, issued before the claim did), or when the claim isn't a build at all.
+ *
+ * Unverified — a client can claim any build — which is fine for what it gates here: a build
+ * lying about itself only changes which storefront its own player is shown.
+ */
+async function authedBuild(c: Context<App>): Promise<number | null> {
+	const version = await validateAndGetVersion(c.req.raw, await c.env.JWT_SECRET.get())
+	if (version === null) return null
+	const build = Number.parseInt(version.split('.')[0] ?? '', 10)
+	return Number.isInteger(build) ? build : null
+}
+
+/**
+ * The last client build treated as the 2023-era one. `GAME_VERSION` — what the rest of the
+ * stack targets and reports for itself — so it and anything older keep exactly what they had,
+ * and only a LATER build gets anything served differently.
+ *
+ * Compared with {@link authedBuild}, which reads the build off the token's `rn.ver`.
+ */
+const LEGACY_CLIENT_BUILD = 20230414
 
 /** Results.Unauthorized() equivalent — 401 with empty body. */
 function unauthorized(c: Context<App>) {
@@ -593,15 +632,73 @@ interface GiftRequest {
 }
 
 /**
- * Read a storefront catalog (`sf{type}.json`) from the ASSETS binding. Null when there is
- * no such storefront.
+ * Storefront ids that are served ANOTHER storefront's catalog, because no capture of their
+ * own exists yet. Placeholder: an alias here is a storefront this server hasn't got, not one
+ * it has decided is a duplicate, so a line should come OUT again the moment `static/storefronts`
+ * grows the real `sf{id}.json` — the alias silently wins over a file of that name.
+ *
+ * Resolved in {@link storefrontAssetPath} rather than at the route, so an aliased storefront
+ * is aliased for BUYING too. Browsing and purchasing read the same catalog by id, and an
+ * alias applied to only the browse side would show a page of items whose every purchase
+ * 404s as "no such storefront".
+ */
+const STOREFRONT_ALIASES: Record<string, string> = {
+	// Empty. 1704 was here, served sf3's catalog, until `static/storefronts/sf1704.json` was
+	// generated — see `runx storefront build`. Its line came out the moment the file appeared,
+	// exactly as the note above says it must: an alias silently beats a real file of that name,
+	// so leaving it would have kept serving sf3 from a storefront that now has its own catalog.
+}
+
+/**
+ * Storefronts that have a SECOND file for newer clients, keyed by the id the client asks for
+ * and naming the file a build past {@link LEGACY_CLIENT_BUILD} is served instead.
+ *
+ * `3` is the general store. The 2023 client keeps `sf3.json` exactly as captured; a later one
+ * gets `sf3-2025.json`, which is that same file plus every sellable row of the item catalog
+ * (see `runx storefront build`). One storefront id either way — the client asks for 3 in both
+ * cases and neither knows there are two files — so nothing about the request changes and no
+ * item is renumbered. The two id spaces do not collide, which is what makes the merge safe.
+ *
+ * Resolved in {@link storefrontAssetPath}, which BOTH the listing route and
+ * {@link loadStorefront} go through, so browsing and buying always read the same file. That is
+ * the whole reason it is not done at the route: a newer client shown the merged store and then
+ * charged against the captured one would have every catalog item 404 as "no such storefront".
+ */
+const STOREFRONT_BY_BUILD: Record<string, string> = {
+	'3': 'sf3-2025',
+}
+
+/**
+ * The ASSETS path a storefront id reads from, following any {@link STOREFRONT_ALIASES} entry
+ * and any {@link STOREFRONT_BY_BUILD} variant. The id arrives as a path param, so it is a
+ * string here rather than a number: both tables are matched on what the client asked for.
+ *
+ * `build` is the caller's `rn.ver` (see {@link authedBuild}), or null when there is no readable
+ * one. Null gets the captured file: an unversioned token is the OLD client, so treating "can't
+ * prove its version" as "newer" would swap the store out from under the build that needs it.
+ */
+function storefrontAssetPath(id: string, build: number | null): string {
+	const aliased = STOREFRONT_ALIASES[id] ?? id
+	const variant = STOREFRONT_BY_BUILD[aliased]
+	if (variant !== undefined && build !== null && build > LEGACY_CLIENT_BUILD) {
+		return `/${variant}.json`
+	}
+	return `/sf${aliased}.json`
+}
+
+/**
+ * Read a storefront catalog from the ASSETS binding — WHICH file depending on the caller's
+ * build, see {@link storefrontAssetPath}. Null when there is no such storefront.
  *
  * Separate from {@link findStoreItem} so a caller resolving SEVERAL items from one
- * storefront reads (and parses) it once: sf3 alone is over a thousand items, and a bulk
- * purchase carries up to `BULK_PURCHASE_CAP` lines.
+ * storefront reads (and parses) it once: sf3 alone is over a thousand items and the merged
+ * sf3-2025 is four, and a bulk purchase carries up to `BULK_PURCHASE_CAP` lines.
  */
 async function loadStorefront(c: Context<App>, storefrontType: number): Promise<Storefront | null> {
-	const res = await c.env.ASSETS.fetch(new URL(`/sf${storefrontType}.json`, c.req.url))
+	const build = await authedBuild(c)
+	const res = await c.env.ASSETS.fetch(
+		new URL(storefrontAssetPath(String(storefrontType), build), c.req.url)
+	)
 	if (!res.ok) return null
 	return (await res.json()) as Storefront
 }
@@ -619,6 +716,92 @@ async function findStoreItem(
 	const storefront = await loadStorefront(c, storefrontType)
 	if (storefront === null) return null
 	return storefront.StoreItems.find((it) => it.PurchasableItemId === purchasableItemId) ?? null
+}
+
+/**
+ * How one item may be bought, as `POST /api/items/purchaseInfos` answers it. The store row
+ * holds ids only, so everything a price tag needs comes from here.
+ *
+ * `ItemId` re-uses the request's reference verbatim — camelCase members under a PascalCase
+ * key. It reads like a mistake and is not one: the client's decoder names the members that
+ * way on both legs, and PascalCasing them here loses the id.
+ *
+ * `PurchaseMethodId` names WHICH listing sells the item, and is a tagged union of the two
+ * kinds of id a listing can have: `Type` 1 carries a `Guid` (a UGC item, keyed by its own
+ * guid) and leaves `NumberId` null; a storefront's numbered `PurchasableItemId` would be the
+ * other side. Nothing here sells anything under a second listing, so the guid is the item's own.
+ */
+interface ItemPurchaseInfo {
+	ItemId: { itemType: number; itemId: string }
+	PurchaseMethodId: { Type: number; NumberId: number | null; Guid: string | null }
+	Prices: Array<{
+		CurrencyType: number
+		Price: number
+		StorefrontSaleData: {
+			SalePercent: number
+			SaleStartDate: string | null
+			SaleEndDate: string | null
+		} | null
+	}>
+	NewUntil: string | null
+	AvailableAt: string | null
+	AvailableUntil: string | null
+	CanBeGifted: boolean
+	CanApplySubscriberDiscount: boolean
+	SubscribersOnly: boolean
+	IsFeatured: boolean
+}
+
+/** The `PurchaseMethodId.Type` that carries a `Guid` rather than a `NumberId`. */
+const PURCHASE_METHOD_TYPE_GUID = 1
+
+/**
+ * The purchase-info projection of a custom avatar item.
+ *
+ * The price is in `RecCenterTokens` because that is what a UGC item costs: the creation UI's
+ * floor (`api`'s `/api/customAvatarItems/v1/minPriceForPublicItem`) is a token price, and the
+ * `price` column it writes is the same number. It must NOT be a room currency — those are
+ * scoped to a room this endpoint knows nothing about, and the client holds no balance to pay
+ * one with, so the item would draw a price it can never meet.
+ *
+ * The rest is what the row can honestly say:
+ *  - `AvailableAt` is the item's creation — the moment it began being sellable. There is no
+ *    scheduled listing here, so `AvailableUntil` is null: on sale until the creator pulls it.
+ *  - `NewUntil` is null rather than derived from `CreatedAt`: nothing has ever defined how long
+ *    “new” lasts here, and guessing draws the pip on items that are not.
+ *  - `StorefrontSaleData` is a zero-percent sale rather than null, since nothing discounts UGC
+ *    items yet and a present-but-empty sale is the shape the client always gets to read.
+ *  - `SubscribersOnly`/`CanApplySubscriberDiscount` are false: subscriber pricing is a
+ *    storefront-catalog feature (`sf{N}.json`'s `SubscriberPrices`) and no UGC item has one.
+ *  - `IsFeatured` is the row's own flag, the same one the featured feed reads.
+ *
+ * `CanBeGifted` is true because the reference let players gift UGC items — but nothing here
+ * buys a custom avatar item yet, gift or otherwise, so the button it draws leads nowhere until
+ * that exists. It is the flag to flip if a dead gift button is worse than a missing one.
+ */
+function toItemPurchaseInfo(item: CustomAvatarItem): ItemPurchaseInfo {
+	return {
+		ItemId: { itemType: UGC_ITEM_TYPE_CUSTOM_AVATAR_ITEM, itemId: item.CustomAvatarItemId },
+		PurchaseMethodId: {
+			Type: PURCHASE_METHOD_TYPE_GUID,
+			NumberId: null,
+			Guid: item.CustomAvatarItemId,
+		},
+		Prices: [
+			{
+				CurrencyType: CurrencyType.RecCenterTokens,
+				Price: item.Price,
+				StorefrontSaleData: { SalePercent: 0, SaleStartDate: null, SaleEndDate: null },
+			},
+		],
+		NewUntil: null,
+		AvailableAt: item.CreatedAt,
+		AvailableUntil: null,
+		CanBeGifted: true,
+		CanApplySubscriberDiscount: false,
+		SubscribersOnly: false,
+		IsFeatured: item.IsFeatured,
+	}
 }
 
 /** Build the owned avatar-item DTO granted into the buyer's inventory from a gift-drop. */
@@ -1284,6 +1467,62 @@ function toPurchaseMethodId(raw: Partial<PurchaseMethodId> | null | undefined): 
 }
 
 /**
+ * Catalog rows as STORE ITEMS, so a bag can be resolved against the `catalog` table the same
+ * way it is resolved against an `sf{N}.json` file.
+ *
+ * The generated storefront (sf1704) is built from these very rows with this very pricing, so an
+ * item bought here costs exactly what that file lists it at. That is not a nicety: `priceCheck`
+ * refuses a line whose posted `RequestedPrice` doesn't match, so two pricings would 409 every
+ * purchase the client made from the page it was shown.
+ *
+ * SKINS come through too, keyed the way a gift-drop keys equipment (`EquipmentPrefabName` +
+ * `EquipmentModificationGuid`) rather than as an avatar item — which is what lets a skin be
+ * bought at all, since no generated storefront file lists one.
+ *
+ * {@link isSellableRarity} is applied here as well as in the generator: the developer tier is
+ * absent from the file, and resolving a bag straight off the table would otherwise sell items
+ * the store never offered.
+ */
+async function catalogStoreItems(db: D1Database, catalogIds: number[]): Promise<StoreItem[]> {
+	if (catalogIds.length === 0) return []
+	const placeholders = catalogIds.map((_, i) => `?${i + 1}`).join(', ')
+	const { results } = await db
+		.prepare(`SELECT * FROM catalog WHERE catalog_id IN (${placeholders})`)
+		.bind(...catalogIds)
+		.all<CatalogRow>()
+
+	return results
+		.filter((row) => row.catalog_id !== null && isSellableRarity(row.rarity))
+		.map((row) => {
+			const skin = row.kind === CatalogKind.Skin
+			const price = priceForRarity(row.rarity)
+			return {
+				GiftDrop: {
+					FriendlyName: row.friendly_name,
+					// The client's field is a string; the catalog keeps NULL and "" apart.
+					Tooltip: row.tooltip ?? '',
+					ConsumableItemDesc: '',
+					// `item_key` IS the desc for an avatar item and the modification guid for a skin —
+					// one key column, read into whichever field its kind belongs in.
+					AvatarItemDesc: skin ? '' : row.item_key,
+					AvatarItemType: skin ? 0 : (row.avatar_item_type ?? 0),
+					EquipmentPrefabName: skin ? (row.prefab_name ?? '') : '',
+					EquipmentModificationGuid: skin ? row.item_key : '',
+					Rarity: row.rarity,
+					Context: 0,
+					Currency: 0,
+					CurrencyType: 0,
+				},
+				Prices: [{ CurrencyType: CurrencyType.RecCenterTokens, Price: price }],
+				SubscriberPrices: [
+					{ CurrencyType: CurrencyType.RecCenterTokens, Price: subscriberPriceFor(price) },
+				],
+				PurchasableItemId: row.catalog_id as number,
+			}
+		})
+}
+
+/**
  * Resolve one line against the bag's catalog: what it wants, how many, and at what price.
  * Returns the failure — with the `UpdateResponse` its entry will carry — instead when the
  * line can't be bought.
@@ -1720,6 +1959,45 @@ const app = new Hono<App>({ strict: false })
 
 	.onError(withOnError())
 	.notFound(withNotFound())
+
+	// A batch lookup of LOCKED avatar items — the client posts the descs it is about to draw
+	// and expects back the ones it must grey out, as a BARE ARRAY.
+	//
+	// A TEST STUB: it answers the whole bundled catalogue regardless of what was posted, so
+	// every item the client can see comes back locked. Two consequences to know before reading
+	// anything into what the client does with it:
+	//
+	//  - The posted `AvatarItemDescriptions` are NOT read, so nothing is echoed. The reference
+	//    answers per requested desc; a client that matches responses to its request will find
+	//    entries it never asked for and none of the ones it did.
+	//  - It is the whole catalogue every call — 3098 items, about a megabyte — which is fine for
+	//    a stub and is not what a real implementation should send.
+	//
+	// The real thing resolves each posted desc against what the player has NOT unlocked. The
+	// `catalog` table is keyed by `AvatarItemDesc` (`item_key`), so the lookup is already there
+	// to build on; what is missing is anything recording a lock.
+	//
+	// NOTE: the `api` worker has a route of this same path that answers `[]` — it predates this
+	// one and is left alone deliberately. The client asks THIS host, so that one is unreached;
+	// they must be reconciled before either is taken for real behaviour.
+	.post(
+		'/api/avatar/v1/lockeditems/bulk',
+		describeRoute({
+			tags: ['Avatar'],
+			summary: 'Locked avatar items in bulk (test stub)',
+			description: [
+				'Resolves a batch of `AvatarItemDescriptions` to the items that are LOCKED for the',
+				'caller, as a bare array.',
+				'TEST STUB: the posted descs are ignored and the whole bundled catalogue comes back,',
+				'so the client renders everything as locked. Nothing records a lock yet, and nothing',
+				'is echoed — a real implementation answers one entry per posted desc, carrying that',
+				'desc verbatim.',
+			].join(' '),
+			requestBody: jsonBody(LockedItemsBulkRequest, 'The descs to resolve (currently ignored)'),
+			responses: { 200: json(JsonArray, 'The locked items — currently the whole catalogue') },
+		}),
+		(c) => c.json(avatarItemCatalog)
+	)
 
 	// Default-unlocked avatar items, served from the bundled static JSON.
 	.get(
@@ -2423,6 +2701,53 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
+	// How the items in a store row may be BOUGHT — the counterpart of the bulk lookup above.
+	// The row itself carries only ids; the client asks this for the price tag, the sale
+	// banner, the “new” pip and whether the gift button is drawn. It answers one entry per
+	// RESOLVED id, in request order, dropping ids it doesn't know exactly as the bulk lookup
+	// does — an item with no purchase info renders as not-for-sale rather than at price zero.
+	//
+	// Two shapes meet in one object here and neither may be tidied into the other: the
+	// request's `{ itemType, itemId }` reference is camelCase, and the response nests THAT
+	// object, members unchanged, under a PascalCase `ItemId` beside PascalCase siblings.
+	.post(
+		'/api/items/purchaseInfos',
+		describeRoute({
+			tags: ['Storefront'],
+			summary: 'Purchase info for a bag of items',
+			description: [
+				'Resolves `Ids[]` (`{ itemType, itemId }`) against the `custom_avatar_item` table and',
+				'answers how each may be bought: its price in RecCenterTokens, its availability window',
+				'and the flags the store row draws. Only `itemType` 3 (custom avatar item) is served;',
+				'other types and unknown ids are dropped, so the response is one entry per RESOLVED',
+				'id in request order — never a positional match for `Ids[]`.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: jsonBody(ItemPurchaseInfosRequest, 'The ids to price'),
+			responses: {
+				200: json(ItemPurchaseInfoList, 'The resolved items’ purchase info (unknown ids omitted)'),
+				400: json(ErrorResponse, 'Malformed body'),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (!body || !Array.isArray(body.Ids)) return c.json({ error: 'Ids is required' }, 400)
+			const ids = (body.Ids as unknown[]).flatMap((ref) => {
+				if (!ref || typeof ref !== 'object') return []
+				const { itemType, itemId } = ref as Record<string, unknown>
+				return itemType === UGC_ITEM_TYPE_CUSTOM_AVATAR_ITEM && typeof itemId === 'string'
+					? [itemId]
+					: []
+			})
+			const items = await getCustomAvatarItems(c.env.DB, ids)
+			return c.json(items.map(toItemPurchaseInfo))
+		}
+	)
+
 	// Unlocked consumables. [Authorize]. The consumables the player has bought (from
 	// `buyItem`, stored in the `consumable` table), grouped by item into the client's
 	// unlocked-consumable DTO. A player who has bought none gets an empty list.
@@ -2538,13 +2863,25 @@ const app = new Hono<App>({ strict: false })
 	)
 
 	// Gift-drop storefront. Serves `static/storefronts/sf{id}.json` for the requested
-	// storefront id via the ASSETS binding; 404s when no such catalog exists.
+	// storefront id via the ASSETS binding; 404s when no such catalog exists. A few ids are
+	// stand-ins for another storefront's catalog (see `STOREFRONT_ALIASES`) — resolved through
+	// the same helper `buyItem` uses, so an aliased storefront can be bought from as well as
+	// browsed.
 	.get(
 		'/api/storefronts/v3/giftdropstore/:id',
 		describeRoute({
 			tags: ['Storefront'],
 			summary: 'Gift-drop storefront catalog',
-			description: 'Serves the `sf{id}.json` catalog via the ASSETS binding. 404 when none exists.',
+			description: [
+				'Serves the `sf{id}.json` catalog via the ASSETS binding. 404 when none exists. An id',
+				'with no capture of its own may stand in for another storefront’s catalog (see',
+				'`STOREFRONT_ALIASES`, currently empty), and such an alias applies to purchases from',
+				'that storefront too, not just to this listing. Which FILE a storefront reads from can',
+				'also depend on the caller’s build (`rn.ver`): storefront `3` serves the captured',
+				'`sf3.json` to builds up to 20230414 and the merged `sf3-2025.json` — that same store',
+				'plus every sellable row of the item catalog — to later ones. The id does not change,',
+				'and the same resolution applies to purchases, so what is browsed is what is charged.',
+			].join(' '),
 			parameters: [
 				{
 					name: 'id',
@@ -2561,7 +2898,10 @@ const app = new Hono<App>({ strict: false })
 		}),
 		async (c) => {
 			const id = c.req.param('id')
-			const res = await c.env.ASSETS.fetch(new URL(`/sf${id}.json`, c.req.url))
+			// The same resolution `loadStorefront` uses, so what is browsed is what a purchase is
+			// checked against — see `storefrontAssetPath`.
+			const path = storefrontAssetPath(id, await authedBuild(c))
+			const res = await c.env.ASSETS.fetch(new URL(path, c.req.url))
 			if (!res.ok) return c.notFound()
 			return c.json(await res.json())
 		}
@@ -2806,9 +3146,33 @@ const app = new Hono<App>({ strict: false })
 
 			// One catalog read for the bag; every line resolves against it in memory.
 			const storefront = await loadStorefront(c, storefrontType as number)
+
+			// Past LEGACY_CLIENT_BUILD the bag may also name CATALOG rows — the ids the generated
+			// storefront and the discovery rows hand out (10000 and up) — so those are looked up in
+			// the `catalog` table and appended. One extra query for the whole bag.
+			//
+			// Appended rather than replacing the file: the two id spaces do not overlap
+			// (`CATALOG_ID_BASE` is above every captured id), so a bag may mix them and a newer
+			// client buying from a captured storefront still works. An older build is not offered
+			// catalog ids anywhere, so it is left resolving exactly what it always did.
+			const build = await authedBuild(c)
+			const catalogItems =
+				build !== null && build > LEGACY_CLIENT_BUILD
+					? await catalogStoreItems(
+							c.env.DB,
+							lines.flatMap((line) => {
+								const numberId = toPurchaseMethodId(line.ItemPurchaseMethodId).NumberId
+								return numberId !== null && numberId >= CATALOG_ID_BASE ? [numberId] : []
+							})
+						)
+					: []
+			const bagCatalog: Storefront | null =
+				catalogItems.length === 0
+					? storefront
+					: { StoreItems: [...(storefront?.StoreItems ?? []), ...catalogItems] }
 			const subscriber = await isSubscriber(c)
 			const resolved = lines.map((line) =>
-				resolveBulkLine(line, storefront, currencyType as number, subscriber)
+				resolveBulkLine(line, bagCatalog, currencyType as number, subscriber)
 			)
 			const buyable = resolved.filter(isBulkLine)
 

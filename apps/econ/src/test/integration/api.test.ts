@@ -23,6 +23,17 @@ import { SCHEMA_DDL as INVENTION_SCHEMA_DDL } from '../../../../api/src/inventio
 // The notification-type ids the hub carries, from the worker that owns them — asserting
 // against the enum rather than a copied number is what keeps these frames honest.
 import { NotificationType } from '../../../../notify/src/notification-types'
+// The catalog's two migrations and the captures the loader reads, imported so the tests at the
+// bottom can check the schema they build against `CATALOG_SCHEMA_DDL`. `?raw` because they are
+// SQL, not modules: they are never executed here, only read.
+import catalogStructureSql from '../../../migrations/0015_catalog.sql?raw'
+import catalogIdSql from '../../../migrations/0016_catalog_id.sql?raw'
+import avatarItemsJson from '../../../static/db/avatar-items.json'
+import skinsJson from '../../../static/db/skins.json'
+import sf32025 from '../../../static/storefronts/sf3-2025.json'
+// The merged 2025 general store, read as a FILE: which file the route serves depends on the
+// caller's build, and these assertions are about the file's CONTENTS.
+import sf3 from '../../../static/storefronts/sf3.json'
 import { SCHEMA_DDL } from '../../avatar-db'
 import {
 	BALANCE_SCHEMA_DDL,
@@ -31,6 +42,24 @@ import {
 	getBalance,
 	spendCurrency,
 } from '../../balance-db'
+import {
+	baseAsset,
+	buildCatalogLoad,
+	CATALOG_INSERT_COLUMNS,
+	CATALOG_SCHEMA_DDL,
+	CatalogKind,
+	countCatalog,
+	getAvatarItem,
+	getAvatarItemsByTag,
+	getCatalogItem,
+	getCatalogItemById,
+	getCatalogItems,
+	getSkin,
+	getSkinsForPrefab,
+	searchCatalog,
+	toCatalogSkin,
+} from '../../catalog-db'
+import { CATALOG_ID_BASE } from '../../catalog-load'
 import { CHALLENGE_GIFT_SCHEMA_DDL, CHALLENGE_STATUS_SCHEMA_DDL } from '../../challenge-db'
 // The live weekly rotation, generated the same way the worker generates it, so the challenge
 // tests exercise whatever this week actually holds instead of ids from a rotation that has
@@ -41,7 +70,19 @@ import { EQUIPMENT_SCHEMA_DDL, grantEquipment } from '../../equipment-db'
 import { INVENTORY_SCHEMA_DDL } from '../../inventory-db'
 import { REWARD_STATUS_SCHEMA_DDL } from '../../reward-db'
 
+import type { CatalogLoadRow, CatalogRow, CatalogValue } from '../../catalog-db'
 import type { Env } from '../../context'
+
+/**
+ * The half of the merged store that came from the item CATALOG — nothing in the file marks
+ * which half a row is from, so it is whatever sf3 does not already contain.
+ *
+ * NOT `id >= CATALOG_ID_BASE`, which looks equivalent and is not: sf3 carries one id far above
+ * that range (20756767), so an id test counts it as a catalog row and every count comes out one
+ * too high. Membership in sf3's own ids is the question actually being asked.
+ */
+const sf3Ids = new Set(sf3.StoreItems.map((i) => i.PurchasableItemId))
+const catalogItems = () => sf32025.StoreItems.filter((i) => !sf3Ids.has(i.PurchasableItemId))
 
 declare module 'cloudflare:test' {
 	interface ProvidedEnv extends Env {}
@@ -74,6 +115,7 @@ beforeAll(async () => {
 	for (const stmt of INVENTORY_INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of INVENTION_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	for (const stmt of CUSTOM_AVATAR_ITEM_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	for (const stmt of CATALOG_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	await env.DB.prepare('INSERT OR IGNORE INTO account (data) VALUES (?1)')
 		.bind(JSON.stringify({ accountId: 42, username: 'Tester', displayName: 'Tester' }))
 		.run()
@@ -176,10 +218,16 @@ function b64url(input: ArrayBuffer | string): string {
  * account's flags — pass `['gameClient', 'developer']` for an elevated account; the default
  * is no claim at all, which reads as no roles.
  */
-async function bearer(sub = '42', roles?: string[]): Promise<Record<string, string>> {
+async function bearer(
+	sub = '42',
+	roles?: string[],
+	/** The client build to stamp as `rn.ver` — omitted, like a token minted before the claim. */
+	version?: string
+): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
-	const claims =
-		roles === undefined ? { sub, exp: now + 3600 } : { sub, exp: now + 3600, role: roles }
+	const claims: Record<string, unknown> = { sub, exp: now + 3600 }
+	if (roles !== undefined) claims.role = roles
+	if (version !== undefined) claims['rn.ver'] = version
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
 		JSON.stringify(claims)
 	)}`
@@ -737,6 +785,234 @@ describe('econ endpoints', () => {
 		expect(anon.status).toBe(401)
 	})
 
+	test('bulkpurchase resolves catalog ids for newer builds, at the storefront’s price', async () => {
+		// A catalog row the generated storefront would list at 600 (rarity 10) and a skin the
+		// storefront lists nowhere at all — both bought straight off the `catalog` table.
+		const AVATAR_ID = 20_001
+		const SKIN_ID = 20_002
+		const DEV_ID = 20_003
+		await env.DB.prepare(
+			`INSERT INTO catalog (item_key, catalog_id, kind, friendly_name, tooltip, rarity, platform_mask, avatar_item_type)
+			 VALUES ('bulk-buy-desc,,,', ?1, 'avatar_item', 'Bulk Buy Hat', '', 10, -1, 0)`
+		)
+			.bind(AVATAR_ID)
+			.run()
+		await env.DB.prepare(
+			`INSERT INTO catalog (item_key, catalog_id, kind, friendly_name, tooltip, rarity, platform_mask, prefab_name)
+			 VALUES ('bulk-buy-guid', ?1, 'skin', 'Bulk Buy Skin', '', 0, -1, '[MakerPen]')`
+		)
+			.bind(SKIN_ID)
+			.run()
+		// Rarity -1 is the developer tier: in the catalog, absent from the storefront, and so not
+		// for sale here either — resolving straight off the table must not sell what the store
+		// never offered.
+		await env.DB.prepare(
+			`INSERT INTO catalog (item_key, catalog_id, kind, friendly_name, tooltip, rarity, platform_mask, avatar_item_type)
+			 VALUES ('bulk-buy-dev,,,', ?1, 'avatar_item', 'Bulk Buy Dev Item', '', -1, -1, 0)`
+		)
+			.bind(DEV_ID)
+			.run()
+
+		const buy = async (
+			version: string | undefined,
+			lines: Array<{ id: number; price: number }>,
+			sub = '46'
+		) =>
+			exports.default.fetch(`${ORIGIN}/api/items/bulkpurchase`, {
+				method: 'POST',
+				headers: {
+					...((await bearer(sub, undefined, version)) as Record<string, string>),
+					'Content-Type': 'application/json',
+				},
+				body: JSON.stringify({
+					StorefrontType: 3,
+					CurrencyType: 2,
+					AllowPartialSuccess: false,
+					PurchaseItemRequests: lines.map((l) => ({
+						ItemPurchaseMethodId: { Type: 0, NumberId: l.id, Guid: null },
+						RequestedPrice: l.price,
+					})),
+				}),
+			})
+
+		// 150 (rarity 0) and 600 (rarity 10) are the generated storefront's own prices. They MUST
+		// match: `priceCheck` refuses a line whose posted price differs, so a server pricing a buy
+		// differently from the file it listed would 409 every purchase.
+		const res = await buy('20250718.01', [
+			{ id: AVATAR_ID, price: 600 },
+			{ id: SKIN_ID, price: 150 },
+		])
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { Success: boolean; Value: { Balance: number } | null }
+		expect(body.Success).toBe(true)
+
+		// A price the storefront does not list is refused, not quietly charged.
+		const wrongPrice = await buy('20250718.01', [{ id: AVATAR_ID, price: 1 }])
+		expect(((await wrongPrice.json()) as { Success: boolean }).Success).toBe(false)
+
+		// The developer-tier row is not for sale.
+		const dev = await buy('20250718.01', [{ id: DEV_ID, price: 150 }])
+		expect(((await dev.json()) as { Success: boolean }).Success).toBe(false)
+
+		// An OLD build is left resolving exactly what it always did — the storefront file — so a
+		// catalog id means nothing to it. Nothing offers those ids to that build anyway.
+		const legacy = await buy('20230414', [{ id: AVATAR_ID, price: 600 }])
+		expect(((await legacy.json()) as { Success: boolean }).Success).toBe(false)
+		const unversioned = await buy(undefined, [{ id: AVATAR_ID, price: 600 }])
+		expect(((await unversioned.json()) as { Success: boolean }).Success).toBe(false)
+
+		// The two id spaces do not overlap, so a bag may MIX a captured storefront's item with a
+		// catalog row. Item 73 is sf3's "Bowtie (White)" at 450.
+		const mixed = await buy('20250718.01', [
+			{ id: 73, price: 450 },
+			{ id: SKIN_ID, price: 150 },
+		])
+		expect(((await mixed.json()) as { Success: boolean }).Success).toBe(true)
+
+		// Cleaned up: the `catalog` block below counts every row in the table, so rows left behind
+		// here would change what it sees.
+		await env.DB.prepare('DELETE FROM catalog WHERE catalog_id BETWEEN ?1 AND ?2')
+			.bind(AVATAR_ID, DEV_ID)
+			.run()
+	})
+
+	test('POST /api/avatar/v1/lockeditems/bulk returns the catalogue as a bare array', async () => {
+		const res = await exports.default.fetch(`${ORIGIN}/api/avatar/v1/lockeditems/bulk`, {
+			method: 'POST',
+			headers: { ...(await bearer()), 'content-type': 'application/json' },
+			body: JSON.stringify({
+				AvatarItemDescriptions: [
+					'c70005d5-6276-4a98-acb3-6a77bc19379a,OBcu3bf1NEio_7t9smqGag',
+					'4eaaad39-aa44-4791-8b67-2eafa8305850',
+				],
+			}),
+		})
+		expect(res.status).toBe(200)
+
+		// A BARE ARRAY, no envelope.
+		const body = (await res.json()) as Array<{
+			AvatarItemType: number
+			AvatarItemDesc: string
+			FriendlyName: string
+			Rarity: number
+		}>
+		expect(Array.isArray(body)).toBe(true)
+
+		// TEST STUB: the whole bundled catalogue, whatever was posted. Pinned so the day this
+		// grows real lock logic, the change is visible here rather than silently altering what a
+		// client is told is locked.
+		expect(body).toHaveLength(avatarItemsJson.length)
+		expect(body[0]).toMatchObject({
+			AvatarItemDesc: avatarItemsJson[0]!.AvatarItemDesc,
+			FriendlyName: avatarItemsJson[0]!.FriendlyName,
+		})
+
+		// Every entry carries the shape the client reads, including the four fields the
+		// `defaultunlocked` catalogue leaves out.
+		for (const key of [
+			'AvatarItemType',
+			'AvatarItemDesc',
+			'FriendlyName',
+			'Tooltip',
+			'Rarity',
+			'AvatarItemId',
+			'IsBaseAvatarItem',
+			'ThumbnailImage',
+			'CreatedAt',
+		]) {
+			expect(Object.keys(body[0] as object), key).toContain(key)
+		}
+
+		// Nothing is echoed: the posted descs are not read, so what comes back is unrelated to
+		// what was asked for. A real implementation answers one entry per posted desc.
+		expect(body.map((i) => i.AvatarItemDesc)).not.toEqual([
+			'c70005d5-6276-4a98-acb3-6a77bc19379a,OBcu3bf1NEio_7t9smqGag',
+			'4eaaad39-aa44-4791-8b67-2eafa8305850',
+		])
+
+		// No auth needed, and a body it cannot read is not an error — the answer does not depend
+		// on either.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/avatar/v1/lockeditems/bulk`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({}),
+		})
+		expect(anon.status).toBe(200)
+		expect(((await anon.json()) as unknown[]).length).toBe(avatarItemsJson.length)
+	})
+
+	test('POST /api/items/purchaseInfos prices custom avatar items in tokens', async () => {
+		const item = await createCustomAvatarItem(env.DB, {
+			customAvatarItemId: crypto.randomUUID(),
+			creatorAccountId: 206,
+			name: 'Chrome Jacket',
+			description: '',
+			price: 425,
+			baseAvatarItemId: 1,
+			baseAvatarItemColor: '#000',
+			designFilename: 'design_pi.bin',
+			thumbnailImageFilename: 'thumb_pi.png',
+			accessibility: 1,
+		})
+		const res = await exports.default.fetch(`${ORIGIN}/api/items/purchaseInfos`, {
+			method: 'POST',
+			headers: { ...(await bearer()), 'content-type': 'application/json' },
+			body: JSON.stringify({
+				Ids: [
+					{ itemType: 3, itemId: item.CustomAvatarItemId },
+					// Dropped, both of them: an id nothing owns, and a type this doesn't serve. The
+					// response is one entry per RESOLVED id, so it is SHORTER than `Ids` rather than
+					// carrying a null in their places — the client must not read it positionally.
+					{ itemType: 3, itemId: crypto.randomUUID() },
+					{ itemType: 1, itemId: item.CustomAvatarItemId },
+				],
+			}),
+		})
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual([
+			{
+				// The reference echoed back verbatim: camelCase members under a PascalCase key. The
+				// client names them that way on both legs and PascalCasing them here loses the id.
+				ItemId: { itemType: 3, itemId: item.CustomAvatarItemId },
+				// A UGC listing is keyed by guid, so `Type` 1 and `NumberId` null. A storefront's
+				// numbered `PurchasableItemId` would be the other side of the union.
+				PurchaseMethodId: { Type: 1, NumberId: null, Guid: item.CustomAvatarItemId },
+				// RecCenterTokens (2) — the currency the creation UI's price floor is denominated
+				// in, and the one the client actually holds a balance in. A room currency (300)
+				// would draw a price nothing can pay.
+				Prices: [
+					{
+						CurrencyType: 2,
+						Price: 425,
+						StorefrontSaleData: { SalePercent: 0, SaleStartDate: null, SaleEndDate: null },
+					},
+				],
+				NewUntil: null,
+				AvailableAt: item.CreatedAt,
+				AvailableUntil: null,
+				CanBeGifted: true,
+				CanApplySubscriberDiscount: false,
+				SubscribersOnly: false,
+				IsFeatured: false,
+			},
+		])
+	})
+
+	test('POST /api/items/purchaseInfos 400s without Ids and 401s without a token', async () => {
+		const bad = await exports.default.fetch(`${ORIGIN}/api/items/purchaseInfos`, {
+			method: 'POST',
+			headers: { ...(await bearer()), 'content-type': 'application/json' },
+			body: JSON.stringify({}),
+		})
+		expect(bad.status).toBe(400)
+		const anon = await exports.default.fetch(`${ORIGIN}/api/items/purchaseInfos`, {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ Ids: [] }),
+		})
+		expect(anon.status).toBe(401)
+	})
+
 	test('GET /econ/roomEconConfig/:roomId echoes the room and disables sorting tabs', async () => {
 		const anon = await exports.default.fetch(`${ORIGIN}/econ/roomEconConfig/92`)
 		expect(anon.status).toBe(401)
@@ -917,6 +1193,162 @@ describe('econ endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/3`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toBeTruthy()
+	})
+
+	// TEMPORARY, alongside the probe in `econ.app.ts`: the storefront ids are swapped so it can
+	// be seen from the client which one the 2025 store actually reads. Delete this with the
+	// probe.
+	test('storefront 3 serves sf3 to old builds and the merged sf3-2025 to newer ones', async () => {
+		const store = async (headers: Record<string, string>) => {
+			const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/3`, {
+				headers,
+			})
+			expect(res.status).toBe(200)
+			return (await res.json()) as { StorefrontType: number; StoreItems: unknown[] }
+		}
+		const at = async (version: string) =>
+			(await bearer('42', undefined, version)) as Record<string, string>
+
+		// 20230414 is GAME_VERSION — what the rest of the stack targets — so the cutoff is
+		// INCLUSIVE and that build keeps the captured sf3 exactly as it has always had it.
+		const legacy = await store(await at('20230414'))
+		expect(legacy.StoreItems).toHaveLength(sf3.StoreItems.length)
+		// A same-day rebuild sorts by its DATE, not the `.NN` suffix.
+		expect((await store(await at('20230414.02'))).StoreItems).toHaveLength(sf3.StoreItems.length)
+
+		// A caller with no readable build gets the captured file too: an unversioned token is the
+		// OLD client, so treating "can't prove its version" as "newer" would swap the store out
+		// from under the build that needs it.
+		expect((await store({})).StoreItems).toHaveLength(sf3.StoreItems.length)
+		expect((await store(await bearer())).StoreItems).toHaveLength(sf3.StoreItems.length)
+		expect((await store(await at('not-a-build'))).StoreItems).toHaveLength(sf3.StoreItems.length)
+
+		// Later builds get the merged store — bigger than either half, and still storefront 3.
+		for (const version of ['20230616', '20250424.01', '20250718.01']) {
+			const merged = await store(await at(version))
+			expect(merged.StorefrontType, version).toBe(3)
+			expect(merged.StoreItems.length, version).toBe(sf32025.StoreItems.length)
+			expect(merged.StoreItems.length, version).toBeGreaterThan(sf3.StoreItems.length)
+		}
+
+		// The id does not change and nothing is renumbered: sf3's own items are in the merged file
+		// unchanged, so a newer client buying one is charged the same as an older client would be.
+		const bowtie = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await at('20250718.01')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: 73, // sf3's "Bowtie (White)", 450 tokens
+				CurrencyType: 2,
+				RequestedPrice: 450,
+			}),
+		})
+		expect(bowtie.status).toBe(200)
+
+		// And a CATALOG item can be bought from storefront 3 by a newer build — the half a
+		// listing-only swap breaks. `findStoreItem` resolves the purchase through the same
+		// build-aware path the listing does, so an item on the page is an item that can be bought.
+		// From the catalog half — see `catalogItems`, which is why this is not an id comparison.
+		const catalogItem = catalogItems()[0]
+		expect(catalogItem).toBeDefined()
+		const bought = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await at('20250718.01')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: catalogItem!.PurchasableItemId,
+				CurrencyType: 2,
+				RequestedPrice: catalogItem!.Prices[0]!.Price,
+			}),
+		})
+		expect(bought.status).toBe(200)
+
+		// The SAME item is not for sale to an old build, because its store does not list it.
+		const refused = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
+			method: 'POST',
+			headers: { ...(await at('20230414')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				StorefrontType: 3,
+				PurchasableItemId: catalogItem!.PurchasableItemId,
+				CurrencyType: 2,
+				RequestedPrice: catalogItem!.Prices[0]!.Price,
+			}),
+		})
+		expect(refused.status).toBe(404)
+	})
+
+	test('sf3-2025 merges sf3 with the catalog, priced by rarity', async () => {
+		// The general store as the 2025 client sees it. Asserted against the FILE rather than the
+		// endpoint, because which file the route serves depends on the caller's build and this is
+		// about the file's contents.
+		//
+		// It reports storefront 3, not an id of its own: the client asks for 3 either way and
+		// neither half knows there are two files.
+		expect(sf32025.StorefrontType).toBe(3)
+
+		// sf3's own items are carried through UNCHANGED — the merge adds to the store the older
+		// client knows rather than restating it.
+		const base = new Map(sf3.StoreItems.map((i) => [i.PurchasableItemId, i]))
+		expect(sf32025.StoreItems.length).toBe(sf3.StoreItems.length + catalogItems().length)
+		for (const [id, item] of base) {
+			expect(
+				sf32025.StoreItems.find((i) => i.PurchasableItemId === id),
+				String(id)
+			).toEqual(item)
+		}
+
+		// The subscriber discount is expressed ONLY in `SubscriberPrices`. The top-level
+		// `SubscriberDiscountPercent` stays 0 so a client cannot take the 10% a second time off an
+		// already-discounted price and post 19% off, which falls through the server's own
+		// subscriber floor and is refused as "Price has changed".
+		expect(sf32025.SubscriberDiscountPercent).toBe(0)
+
+		const priceByRarity = new Map([
+			[0, 150],
+			[10, 600],
+			[20, 700],
+			[30, 800],
+			[50, 3000],
+		])
+		// Rarity -1 is the developer/unreleased tier and is EXCLUDED rather than priced. An item
+		// listed here can be bought — `findStoreItem` resolves a purchase against this very file —
+		// so leaving them in at any price would put them on sale.
+		expect(catalogItems().filter((i) => i.GiftDrop.Rarity === -1)).toEqual([])
+
+		for (const item of catalogItems()) {
+			const expected = priceByRarity.get(item.GiftDrop.Rarity)
+			expect(expected, `rarity ${item.GiftDrop.Rarity}`).toBeDefined()
+			expect(item.Prices[0]).toMatchObject({ CurrencyType: 2, Price: expected })
+			// Floored, matching the server's own `subscriberFloor`. Every tier here divides evenly.
+			expect(item.SubscriberPrices[0]).toMatchObject({
+				CurrencyType: 2,
+				Price: Math.floor((expected! * 90) / 100),
+			})
+		}
+
+		// Every item is an avatar item with a real desc, and its id is in the GENERATED range,
+		// echoed in `GiftDropId` the way sf3 does on all 1161 of its own items. Ids must be unique
+		// or a purchase resolves the wrong row.
+		const ids = catalogItems().map((i) => i.PurchasableItemId)
+		expect(new Set(ids).size).toBe(ids.length)
+
+		// The id IS the `catalog_id` — one number, no second numbering and no arithmetic between
+		// them. Catalog ids start at 10000 precisely so this is safe: every captured storefront's
+		// own ids are 2764 or below, and numbering from 1 would have collided with sf3's head-on,
+		// making one id mean two different items depending on which storefront it came from.
+		expect(Math.min(...ids)).toBe(CATALOG_ID_BASE)
+		expect(ids.every((id) => id >= CATALOG_ID_BASE)).toBe(true)
+		expect(catalogItems().every((i) => i.GiftDrop.GiftDropId === i.PurchasableItemId)).toBe(true)
+		expect(catalogItems().every((i) => i.GiftDrop.AvatarItemDesc.length > 0)).toBe(true)
+
+		// An id with neither a capture nor an alias still 404s.
+		const missing = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/1705`)
+		expect(missing.status).toBe(404)
+
+		// 1704 is gone: it was a stand-in for a store that turned out to belong inside sf3, so
+		// nothing answers that id any more.
+		const gone = await exports.default.fetch(`${ORIGIN}/api/storefronts/v3/giftdropstore/1704`)
+		expect(gone.status).toBe(404)
 	})
 
 	// Item 73 in sf3.json — "Bowtie (White)", 450 RecCenterTokens (CurrencyType 2).
@@ -3238,6 +3670,7 @@ describe('econ endpoints', () => {
 			'GET /econ/roomOffer/room/{roomId}',
 			'GET /econ/roomOffer/room/{roomId}/purchaseCounts',
 			'POST /api/CampusCard/v1/UpdateAndGetSubscription',
+			'POST /api/avatar/v1/lockeditems/bulk',
 			'POST /api/avatar/v2/gifts/consume',
 			'POST /api/avatar/v2/set',
 			'POST /api/avatar/v3/saved/set',
@@ -3249,6 +3682,7 @@ describe('econ endpoints', () => {
 			'POST /api/equipment/v1/update',
 			'POST /api/gamerewards/v1/request',
 			'POST /api/items/bulkpurchase',
+			'POST /api/items/purchaseInfos',
 			'POST /api/objectives/v1/cleargroup',
 			'POST /api/objectives/v1/updateobjective',
 			'POST /api/storefronts/v2/buyItem',
@@ -3261,5 +3695,522 @@ describe('econ endpoints', () => {
 		for (const ops of Object.values(spec.paths)) {
 			for (const op of Object.values(ops)) expect(op.summary).toBeTruthy()
 		}
+	})
+})
+
+// The item catalog. Loaded by migration, not written at runtime, so these exercise the SHAPE of
+// the table and its query helpers against a handful of hand-seeded rows; the drift test at the
+// end is what pins the thousands of real ones.
+describe('catalog', () => {
+	// One row of each kind, plus the cases that decided the schema: an avatar_item_id shared by
+	// two rows and absent from a third, and keys that are alpha strings rather than GUIDs.
+	beforeAll(async () => {
+		const insert = (row: unknown[]) =>
+			env.DB.prepare(
+				`INSERT INTO catalog (
+					item_key, catalog_id, kind, friendly_name, tooltip, rarity, platform_mask,
+					thumbnail_image, avatar_item_type, avatar_item_id, is_base_avatar_item, tag_list,
+					created_at, prefab_name, unlocked_level
+				) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)`
+			)
+				.bind(...row)
+				.run()
+
+		// `catalog_id` is handed out by the loader as 1..N over the captures. These seeds number
+		// themselves the same way but from a base far above N, so a test that inserts a REAL
+		// capture row (which carries its own low id) cannot collide with a seed — the constraint
+		// under test should only ever fire on something the test meant to collide.
+		let nextId = 900_001
+
+		/** An avatar item: `item_key` is its `AvatarItemDesc`, the skin columns stay null. */
+		const avatarItem = (
+			desc: string,
+			name: string,
+			tooltip: string | null,
+			rarity: number,
+			type: number,
+			id: number | null,
+			tag: string | null,
+			createdAt: string | null,
+			thumb: string | null
+		) =>
+			insert([
+				desc,
+				nextId++,
+				'avatar_item',
+				name,
+				tooltip,
+				rarity,
+				-1,
+				thumb,
+				type,
+				id,
+				0,
+				tag,
+				createdAt,
+				null,
+				null,
+			])
+
+		/** A skin: `item_key` is its `ModificationGuid`, the avatar columns stay null. */
+		const skin = (guid: string, name: string, tooltip: string | null, prefab: string) =>
+			insert([
+				guid,
+				nextId++,
+				'skin',
+				name,
+				tooltip,
+				0,
+				-1,
+				'',
+				null,
+				null,
+				null,
+				null,
+				null,
+				prefab,
+				0,
+			])
+
+		await avatarItem(
+			'_OWVy3z6iU-M3-zbQgSLig,,,',
+			'Vampire Hunter Gloves (Blue)',
+			// NULL, not '' — the two are different values in the capture and the client's DTO serves
+			// the difference through.
+			null,
+			10,
+			0,
+			835,
+			null,
+			'2018-11-01T17:51:50.733Z',
+			'cimomkml6k4toyowd1voh7hqm.png'
+		)
+		await avatarItem(
+			'002a0f2f-1a24-4439-b578-470818ef8325,,,',
+			'Turkey Sweater',
+			'',
+			50,
+			0,
+			1570,
+			'thanksgiving',
+			'2020-10-28T00:37:27.263Z',
+			'4g2r02n1g5w09re7hl1ba2yyi.png'
+		)
+		// These two share avatar_item_id 9503 — the reason that column keys nothing.
+		await avatarItem(
+			'c5010738-41fa-4eca-aeac-e24adaa29789,',
+			'Helmet Hair',
+			'',
+			-1,
+			0,
+			9503,
+			null,
+			null,
+			null
+		)
+		await avatarItem(
+			'60067e91-18b8-43ab-ae20-a8ea74c757bf,KUAMuM41hk-YLZoqTiKncA',
+			'Green Cheer Sash',
+			'',
+			-1,
+			0,
+			9503,
+			null,
+			null,
+			null
+		)
+		// A hair dye: AvatarItemType 1, NO avatar_item_id at all, and a desc that is a bare alpha
+		// string with no commas. Still perfectly keyed.
+		await avatarItem(
+			'pQNfh-3DsEGWfiIls6Qf6g',
+			'Permanent Hair Dye (Pirate Gold)',
+			'',
+			0,
+			1,
+			null,
+			null,
+			null,
+			null
+		)
+
+		await skin('19ef59c7-f74b-4c63-935a-1d4b1abd8518', 'Disc (Coop)', '', '[DiscGolfDisc]')
+		// An alpha-string key, from before the game moved to GUIDs.
+		await skin('bfrFOdnHzEaIwHqem2dXkg', 'Confetti Gun (Gold)', null, '[PaintballGun] Confetti')
+	})
+
+	test('an avatar item reads back by its desc, nullable fields intact', async () => {
+		const item = await getAvatarItem(env.DB, '_OWVy3z6iU-M3-zbQgSLig,,,')
+		expect(item).toEqual({
+			AvatarItemDesc: '_OWVy3z6iU-M3-zbQgSLig,,,',
+			AvatarItemType: 0,
+			PlatformMask: -1,
+			FriendlyName: 'Vampire Hunter Gloves (Blue)',
+			// The one the column may never be defaulted to '' for.
+			Tooltip: null,
+			Rarity: 10,
+			TagList: null,
+			AvatarItemId: 835,
+			IsBaseAvatarItem: false,
+			CreatedAt: '2018-11-01T17:51:50.733Z',
+			ThumbnailImage: 'cimomkml6k4toyowd1voh7hqm.png',
+		})
+		expect(await getAvatarItem(env.DB, 'nothing-has-this-desc')).toBeNull()
+	})
+
+	test('a skin reads back by its guid, and an alpha-string key is just as good', async () => {
+		expect(await getSkin(env.DB, '19ef59c7-f74b-4c63-935a-1d4b1abd8518')).toEqual({
+			PrefabName: '[DiscGolfDisc]',
+			ModificationGuid: '19ef59c7-f74b-4c63-935a-1d4b1abd8518',
+			UnlockedLevel: 0,
+			// The catalog does not store this: it is a PLAYER's flag, and the capture recorded one
+			// account's. It is overwritten from the player's own `equipment` row.
+			Favorited: false,
+			PlatformMask: -1,
+			FriendlyName: 'Disc (Coop)',
+			Tooltip: '',
+			Rarity: 0,
+			ThumbnailImage: '',
+		})
+
+		// 191 of the skins are keyed by the short alpha-string ids the game used before GUIDs. The
+		// column is TEXT and compared as text, so these need no special handling — which is exactly
+		// why nothing here parses or validates a key's shape.
+		const gold = await getSkin(env.DB, 'bfrFOdnHzEaIwHqem2dXkg')
+		expect(gold?.FriendlyName).toBe('Confetti Gun (Gold)')
+		// Skins carry NULL tooltips too, so the projection must not flatten them to ''.
+		expect(gold?.Tooltip).toBeNull()
+
+		expect((await getSkinsForPrefab(env.DB, '[DiscGolfDisc]')).map((s) => s.FriendlyName)).toEqual([
+			'Disc (Coop)',
+		])
+		expect(await getSkin(env.DB, 'no-such-guid')).toBeNull()
+	})
+
+	test('one key spans both kinds, and asking for the wrong kind gets null, not a mangled row', async () => {
+		// The lookup the inventory wants: a player's owned things are ids of exactly this shape and
+		// the row says which kind each turned out to be. No join, no guessing.
+		const owned = await getCatalogItems(env.DB, [
+			'19ef59c7-f74b-4c63-935a-1d4b1abd8518',
+			'_OWVy3z6iU-M3-zbQgSLig,,,',
+			// Unknown keys are SKIPPED rather than left as holes, so the result is shorter than the
+			// input and must never be read positionally.
+			'nothing-owns-this',
+		])
+		expect(owned.map((r) => [r.kind, r.friendly_name])).toEqual([
+			['skin', 'Disc (Coop)'],
+			['avatar_item', 'Vampire Hunter Gloves (Blue)'],
+		])
+		expect(await getCatalogItems(env.DB, [])).toEqual([])
+
+		// A key is unique across BOTH kinds, so a typed accessor handed the other kind's key answers
+		// null rather than projecting a skin into an avatar item's shape.
+		expect(await getAvatarItem(env.DB, '19ef59c7-f74b-4c63-935a-1d4b1abd8518')).toBeNull()
+		expect(await getSkin(env.DB, '_OWVy3z6iU-M3-zbQgSLig,,,')).toBeNull()
+		expect(() => toCatalogSkin({ ...(owned[1] as CatalogRow) })).toThrow(/not a skin/)
+	})
+
+	test('avatar_item_id is carried as data and keys nothing', async () => {
+		// Two seeded rows share 9503 (five real ones do), and the hair dye has no id at all. Keying
+		// the table on it would have silently dropped four of those five at load time, which is why
+		// it is stored, not indexed, and never looked up by.
+		const shared = await searchCatalog(env.DB, CatalogKind.AvatarItem, 'a')
+		expect(shared.filter((r) => r.avatar_item_id === 9503)).toHaveLength(2)
+		const dye = await getAvatarItem(env.DB, 'pQNfh-3DsEGWfiIls6Qf6g')
+		expect(dye?.AvatarItemId).toBeNull()
+		expect(dye?.AvatarItemType).toBe(1)
+	})
+
+	test('search is case-insensitive, scoped to one kind, and takes wildcards literally', async () => {
+		const hits = await searchCatalog(env.DB, CatalogKind.AvatarItem, 'HAIR')
+		expect(hits.map((r) => r.friendly_name)).toEqual([
+			'Helmet Hair',
+			'Permanent Hair Dye (Pirate Gold)',
+		])
+
+		// `kind` scopes it: the same needle against skins finds nothing, so a skin search can never
+		// surface a wearable.
+		expect(await searchCatalog(env.DB, CatalogKind.Skin, 'hair')).toEqual([])
+		expect(
+			(await searchCatalog(env.DB, CatalogKind.Skin, 'disc')).map((r) => r.prefab_name)
+		).toEqual(['[DiscGolfDisc]'])
+
+		// A needle of LIKE metacharacters matches them literally rather than everything — the escape
+		// is what stops a player typing `%` from pulling the whole catalog back.
+		expect(await searchCatalog(env.DB, CatalogKind.AvatarItem, '%')).toEqual([])
+		expect(await searchCatalog(env.DB, CatalogKind.AvatarItem, '_')).toEqual([])
+		// A hit that really does contain the character still matches, so escaping didn't break it.
+		expect((await searchCatalog(env.DB, CatalogKind.AvatarItem, 'cheer')).length).toBe(1)
+	})
+
+	test('seasonal rows come back by tag, and counts are per kind', async () => {
+		expect((await getAvatarItemsByTag(env.DB, 'thanksgiving')).map((i) => i.FriendlyName)).toEqual([
+			'Turkey Sweater',
+		])
+		expect(await getAvatarItemsByTag(env.DB, 'halloween')).toEqual([])
+		expect(await countCatalog(env.DB)).toEqual({ avatar_item: 5, skin: 2 })
+	})
+
+	test('the key is unique across both kinds, so a collision is refused', async () => {
+		// A second avatar item with the same desc...
+		await expect(
+			env.DB.prepare(
+				`INSERT INTO catalog (item_key, kind, friendly_name, rarity, platform_mask)
+				 VALUES ('_OWVy3z6iU-M3-zbQgSLig,,,', 'avatar_item', 'Impostor', 0, -1)`
+			).run()
+		).rejects.toThrow()
+
+		// ...a second skin with the same guid...
+		await expect(
+			env.DB.prepare(
+				`INSERT INTO catalog (item_key, kind, friendly_name, rarity, platform_mask, prefab_name)
+				 VALUES ('bfrFOdnHzEaIwHqem2dXkg', 'skin', 'Impostor', 0, -1, '[PaintballGun]')`
+			).run()
+		).rejects.toThrow()
+
+		// ...and a skin claiming an avatar item's key. The kinds share ONE key space, which is what
+		// lets an owned id be resolved without first knowing what kind of thing it is.
+		await expect(
+			env.DB.prepare(
+				`INSERT INTO catalog (item_key, kind, friendly_name, rarity, platform_mask, prefab_name)
+				 VALUES ('_OWVy3z6iU-M3-zbQgSLig,,,', 'skin', 'Impostor', 0, -1, '[MakerPen]')`
+			).run()
+		).rejects.toThrow()
+
+		expect(await countCatalog(env.DB)).toEqual({ avatar_item: 5, skin: 2 })
+	})
+
+	test('baseAsset takes the first field of an AvatarItemDesc', async () => {
+		// `<baseAsset>,<color>,<texture>,` — the base asset is what decides whether the client can
+		// draw an item at all, so it is read off the key rather than stored twice.
+		expect(baseAsset('_OWVy3z6iU-M3-zbQgSLig,,,')).toBe('_OWVy3z6iU-M3-zbQgSLig')
+		expect(baseAsset('60067e91-18b8-43ab-ae20-a8ea74c757bf,KUAMuM41hk-YLZoqTiKncA')).toBe(
+			'60067e91-18b8-43ab-ae20-a8ea74c757bf'
+		)
+		// A dye's desc is a bare alpha string with no commas at all; it is still the base asset.
+		expect(baseAsset('pQNfh-3DsEGWfiIls6Qf6g')).toBe('pQNfh-3DsEGWfiIls6Qf6g')
+	})
+
+	// The migration builds the TABLE; `runx catalog load` fills it. These two are the seam
+	// between them: the schema the tests build must be the schema the migration builds, and the
+	// loader must produce rows that schema accepts.
+	test('the migrations and CATALOG_SCHEMA_DDL build the same table', async () => {
+		// Both migrations together: 0015 builds the table, 0016 adds `catalog_id`. They are
+		// separate because 0015 was already applied, and an edit there would never re-run — which
+		// is exactly the drift this test exists to catch. `CATALOG_SCHEMA_DDL` declares the end
+		// state in one CREATE, so it is compared against the pair.
+		const migrations = `${catalogStructureSql}\n${catalogIdSql}`
+
+		// Compared on identifiers rather than text, since the two are formatted differently, and
+		// `catalog_id` arrives via ALTER rather than inside the CREATE.
+		for (const column of CATALOG_INSERT_COLUMNS) {
+			expect(migrations, column).toContain(column)
+			expect(CATALOG_SCHEMA_DDL[0], column).toContain(`\t\t${column} `)
+		}
+		expect(catalogStructureSql).toContain('item_key TEXT PRIMARY KEY')
+		expect(CATALOG_SCHEMA_DDL[0]).toContain('item_key TEXT PRIMARY KEY')
+		expect(catalogIdSql).toContain('ALTER TABLE catalog ADD COLUMN catalog_id INTEGER')
+		for (const index of [
+			'idx_catalog_name',
+			'idx_catalog_prefab',
+			'idx_catalog_tag',
+			'idx_catalog_id',
+		]) {
+			expect(migrations, index).toContain(index)
+			expect(CATALOG_SCHEMA_DDL.join('\n'), index).toContain(index)
+		}
+
+		// STRUCTURE ONLY. The catalog's contents change as the game's item list does, which is not
+		// a schema change — rows here would mean a migration and a deploy per refresh. If this
+		// fails, someone put data back into a migration instead of reloading it.
+		expect(migrations).not.toContain('INSERT INTO catalog')
+		expect(migrations).not.toContain('DELETE FROM catalog')
+	})
+
+	test('the loader maps both captures onto the columns it declares', async () => {
+		const { rows, collisions } = buildCatalogLoad(avatarItemsJson, skinsJson)
+
+		// Every row carries exactly one value per declared column, in that order — the loader
+		// renders them positionally, so a column added to one side and not the other is a silent
+		// mis-load rather than an error.
+		expect(rows.every((r) => r.values.length === CATALOG_INSERT_COLUMNS.length)).toBe(true)
+		const keyAt = CATALOG_INSERT_COLUMNS.indexOf('item_key')
+		const kindAt = CATALOG_INSERT_COLUMNS.indexOf('kind')
+		expect(rows.every((r) => r.values[keyAt] === r.key)).toBe(true)
+
+		// One key space, both kinds, no collisions between them.
+		expect(new Set(rows.map((r) => r.key)).size).toBe(rows.length)
+		const kinds = rows.map((r) => r.values[kindAt])
+		expect(kinds.filter((k) => k === 'avatar_item')).toHaveLength(avatarItemsJson.length)
+
+		// Skins are the one place the counts may legitimately differ: the capture holds five guids
+		// twice. A repeat is a defect rather than something the table models, so the loader keeps
+		// the first and RETURNS the rest for the caller to report — dropping them silently is the
+		// exact failure the single key exists to prevent.
+		const distinctSkinKeys = new Set(skinsJson.map((s) => s.ModificationGuid)).size
+		expect(kinds.filter((k) => k === 'skin')).toHaveLength(distinctSkinKeys)
+		expect(collisions).toHaveLength(skinsJson.length - distinctSkinKeys)
+		expect(collisions.every((c) => c.kept !== c.dropped)).toBe(true)
+
+		// And the rows really do go in: the same table these tests built accepts a sample of the
+		// real load unchanged, so a capture that would be rejected in production fails here. Rows
+		// this file already seeded are skipped — they are real capture rows too, and re-inserting
+		// one would trip the key constraint on the seed rather than on anything under test.
+		const sample: CatalogLoadRow[] = []
+		for (const row of [rows[0], rows[1], rows[rows.length - 2], rows[rows.length - 1]]) {
+			if (row && (await getCatalogItem(env.DB, row.key)) === null) sample.push(row)
+		}
+		expect(sample.length).toBeGreaterThan(0)
+		for (const row of sample) {
+			await env.DB.prepare(
+				`INSERT INTO catalog (${CATALOG_INSERT_COLUMNS.join(', ')})
+				 VALUES (${CATALOG_INSERT_COLUMNS.map((_, i) => `?${i + 1}`).join(', ')})`
+			)
+				.bind(...row.values.map((v) => v ?? null))
+				.run()
+			expect((await getCatalogItem(env.DB, row.key))?.friendly_name).toBe(
+				row.values[CATALOG_INSERT_COLUMNS.indexOf('friendly_name')]
+			)
+			await env.DB.prepare('DELETE FROM catalog WHERE item_key = ?1').bind(row.key).run()
+		}
+
+		// The row the capture had a skin pasted over. It is an avatar item, and the skin that
+		// overwrote its name lives in skins.json where it belongs.
+		expect(avatarItemsJson.filter((i) => i.FriendlyName === 'Disc (Coop)')).toEqual([])
+		expect(skinsJson.filter((s) => s.FriendlyName === 'Disc (Coop)')).toHaveLength(1)
+	})
+
+	test('catalog_id is a contiguous, unique, load-order handle from 10000', async () => {
+		const { rows } = buildCatalogLoad(avatarItemsJson, skinsJson)
+
+		// BASE..BASE+N-1 with no gaps, in capture order — avatar items first, then skins. Numbered
+		// AFTER de-duplication, so a dropped duplicate must not burn a number and leave a hole.
+		//
+		// From 10000 rather than 1 because a generated storefront lists a row under this very
+		// number as its `PurchasableItemId`, and every captured storefront's ids are 2764 or below
+		// — numbering from 1 would have made one id mean two different items.
+		expect(rows.map((r) => r.id)).toEqual(rows.map((_, i) => CATALOG_ID_BASE + i))
+		expect(Math.min(...rows.map((r) => r.id))).toBe(CATALOG_ID_BASE)
+		expect(new Set(rows.map((r) => r.id)).size).toBe(rows.length)
+
+		// The id in the row object and the id in the values it renders are the same number — the
+		// loader binds `values` positionally, so a mismatch would write one and report the other.
+		const idAt = CATALOG_INSERT_COLUMNS.indexOf('catalog_id')
+		expect(rows.every((r) => r.values[idAt] === r.id)).toBe(true)
+
+		// It reads back by number, and the number is NOT the item's identity: `item_key` is. A
+		// caller that stored an id across a load would resolve to a different item or to nothing,
+		// which is why nothing may persist it.
+		const seeded = await getCatalogItemById(env.DB, 900_001)
+		expect(seeded?.item_key).toBe('_OWVy3z6iU-M3-zbQgSLig,,,')
+		expect(await getCatalogItemById(env.DB, 12_345_678)).toBeNull()
+
+		// Unique where set. Two rows may not share a handle — a number that names two items is
+		// useless as a handle.
+		await expect(
+			env.DB.prepare(
+				`INSERT INTO catalog (item_key, catalog_id, kind, friendly_name, rarity, platform_mask)
+				 VALUES ('id-collision-probe', 900001, 'skin', 'Impostor', 0, -1)`
+			).run()
+		).rejects.toThrow()
+
+		// But NULL is allowed any number of times: the index is partial, because a row is
+		// un-numbered in the window between existing and a load numbering it, and the loader
+		// clears every id before handing out new ones so a merge cannot collide with stale ones.
+		for (const key of ['unnumbered-a', 'unnumbered-b']) {
+			await env.DB.prepare(
+				`INSERT INTO catalog (item_key, kind, friendly_name, rarity, platform_mask)
+				 VALUES (?1, 'skin', 'Not Yet Numbered', 0, -1)`
+			)
+				.bind(key)
+				.run()
+		}
+		expect((await getCatalogItem(env.DB, 'unnumbered-a'))?.catalog_id).toBeNull()
+		expect((await getCatalogItem(env.DB, 'unnumbered-b'))?.catalog_id).toBeNull()
+		await env.DB.prepare("DELETE FROM catalog WHERE item_key LIKE 'unnumbered-%'").run()
+	})
+
+	// `runx catalog load` MERGES by default so a partial capture can add a few items without
+	// wiping the rest, and REPLACES only when told to. Both halves of that live in the CLI's SQL,
+	// so this exercises the upsert itself — the CLI's own statement, built from the same column
+	// list, against the same schema.
+	//
+	// MUST STAY LAST in this block: the replace half empties the table, including the rows the
+	// other catalog tests are seeded with.
+	test('a merge inserts, refreshes and preserves; a replace removes', async () => {
+		const columns = CATALOG_INSERT_COLUMNS.join(', ')
+		const binds = CATALOG_INSERT_COLUMNS.map((_, i) => `?${i + 1}`).join(', ')
+		// Every column but the conflict target, derived from the column list exactly as the CLI
+		// derives it.
+		const conflictUpdate = CATALOG_INSERT_COLUMNS.filter((c) => c !== 'item_key')
+			.map((c) => `${c} = excluded.${c}`)
+			.join(', ')
+
+		/** The CLI's statement: a full-width insert that upserts on the key. */
+		const upsert = (values: CatalogValue[]) =>
+			env.DB.prepare(
+				`INSERT INTO catalog (${columns}) VALUES (${binds})
+				 ON CONFLICT(item_key) DO UPDATE SET ${conflictUpdate}`
+			)
+				.bind(...values.map((v) => v ?? null))
+				.run()
+
+		/** A skin row in column order, so a column added to the table lands here too. */
+		const skinValues = (key: string, name: string, rarity: number): CatalogValue[] =>
+			CATALOG_INSERT_COLUMNS.map((c) =>
+				c === 'item_key'
+					? key
+					: c === 'kind'
+						? CatalogKind.Skin
+						: c === 'friendly_name'
+							? name
+							: c === 'rarity'
+								? rarity
+								: c === 'platform_mask'
+									? -1
+									: c === 'prefab_name'
+										? '[MakerPen]'
+										: null
+			)
+
+		// A row nothing in a later load will mention — the one that proves a merge is not a wipe.
+		await upsert(skinValues('untouched-by-any-load', 'Hand-Added Sentinel', 0))
+
+		// Insert: a key the table has never seen.
+		await upsert(skinValues('merge-test-new', 'Freshly Datamined', 7))
+		expect((await getCatalogItem(env.DB, 'merge-test-new'))?.friendly_name).toBe(
+			'Freshly Datamined'
+		)
+
+		// Refresh: the SAME key again with different values updates in place rather than either
+		// erroring on the key or piling up a second row.
+		const before = await countCatalog(env.DB)
+		await upsert(skinValues('merge-test-new', 'Renamed By Refresh', 42))
+		const refreshed = await getCatalogItem(env.DB, 'merge-test-new')
+		expect(refreshed?.friendly_name).toBe('Renamed By Refresh')
+		expect(refreshed?.rarity).toBe(42)
+		expect(await countCatalog(env.DB)).toEqual(before)
+
+		// Preserve: neither of those touched the sentinel. This is the whole point of the default
+		// — a capture holding two items must not delete the other three thousand.
+		expect((await getCatalogItem(env.DB, 'untouched-by-any-load'))?.friendly_name).toBe(
+			'Hand-Added Sentinel'
+		)
+
+		// Every column but the key is carried by the refresh. Derived rather than written out, so
+		// a column added to the table and forgotten would silently stop being merged.
+		for (const column of CATALOG_INSERT_COLUMNS) {
+			expect(conflictUpdate.includes(`${column} = excluded.${column}`), column).toBe(
+				column !== 'item_key'
+			)
+		}
+
+		// Replace: `DELETE FROM catalog` first, and the sentinel goes with everything else. That is
+		// why it is opt-in — pointed at a partial capture it removes whatever the file omits.
+		const { rows } = buildCatalogLoad(avatarItemsJson, skinsJson)
+		await env.DB.prepare('DELETE FROM catalog').run()
+		await upsert((rows[0] as CatalogLoadRow).values)
+		expect(await getCatalogItem(env.DB, 'untouched-by-any-load')).toBeNull()
+		expect(await getCatalogItem(env.DB, 'merge-test-new')).toBeNull()
+		expect(await countCatalog(env.DB)).toEqual({ avatar_item: 1 })
 	})
 })
