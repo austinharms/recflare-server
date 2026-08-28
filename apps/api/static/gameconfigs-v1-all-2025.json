@@ -6060,5 +6060,19 @@
 		 "ActiveExperiments": null,
 		 "StartTime": null,
 		 "EndTime": null
+	},
+	{
+		"Key": "DataCollection.Enabled",
+		"Value": "false",
+		"ActiveExperiments": null,
+		"StartTime": null,
+		"EndTime": null
+	},
+	{
+		"Key": "Backtrace.SampleRate",
+		"Value": "0",
+		"ActiveExperiments": null,
+		"StartTime": null,
+		"EndTime": null
 	}
 ]
