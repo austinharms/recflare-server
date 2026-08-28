@@ -8,7 +8,7 @@
  */
 
 /** The community Discord — the join instructions and the build both live there. */
-export const DISCORD_INVITE = 'https://discord.gg/C9z9dW7au'
+export const DISCORD_INVITE = 'https://join.recflare.net'
 
 /** Where the stage's "Download for PC" button goes: the client's release listing. */
 export const DOWNLOAD_URL = 'https://github.com/recflare/client/releases'
