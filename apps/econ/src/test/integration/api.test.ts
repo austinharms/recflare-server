@@ -785,6 +785,74 @@ describe('econ endpoints', () => {
 		expect(anon.status).toBe(401)
 	})
 
+	test('bulkpurchase buys a merged-store catalog item from storefront 3', async () => {
+		// The exact request the client sends, verbatim: a catalog id under storefront 3, which is
+		// what the merged sf3-2025 lists it as. It resolves because `loadStorefront` picks the file
+		// by the caller's build, so what the store page offered is what the purchase is checked
+		// against.
+		const res = await exports.default.fetch(`${ORIGIN}/api/items/bulkpurchase`, {
+			method: 'POST',
+			headers: {
+				...((await bearer('4801', undefined, '20250718.01')) as Record<string, string>),
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				PurchaseItemRequests: [
+					{
+						ItemPurchaseMethodId: { Type: 0, NumberId: 10222, Guid: null },
+						RequestedPrice: 3000,
+						Gift: null,
+						CouponConsumablePlayerMappingId: null,
+						DuplicateItemCount: 1,
+					},
+				],
+				StorefrontType: 3,
+				CurrencyType: 2,
+				BypassGiftPackages: false,
+				AllowPartialSuccess: true,
+				ShoppingBagId: null,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as {
+			Success: boolean
+			Error: string
+			Value: { Balance: number } | null
+		}
+		// It used to answer `{ Success: false, Error: "Item not found" }` — storefront 3 resolved
+		// to the captured sf3, which has no id in the catalog range.
+		expect(body.Error).not.toBe('Item not found')
+		expect(body.Success).toBe(true)
+
+		// 10222 is "Maker Pen Shirt", rarity 50, which the shared pricing puts at 3000 — the same
+		// number the client posted, because the file it browsed was generated from that pricing.
+		const item = sf32025.StoreItems.find((i) => i.PurchasableItemId === 10222)
+		expect(item?.Prices[0]?.Price).toBe(3000)
+
+		// The SAME request from an old build still fails: its storefront 3 is the captured sf3,
+		// which does not list the item, and nothing offers it that id anyway.
+		const legacy = await exports.default.fetch(`${ORIGIN}/api/items/bulkpurchase`, {
+			method: 'POST',
+			headers: {
+				...((await bearer('4802', undefined, '20230414')) as Record<string, string>),
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				PurchaseItemRequests: [
+					{
+						ItemPurchaseMethodId: { Type: 0, NumberId: 10222, Guid: null },
+						RequestedPrice: 3000,
+						DuplicateItemCount: 1,
+					},
+				],
+				StorefrontType: 3,
+				CurrencyType: 2,
+				AllowPartialSuccess: true,
+			}),
+		})
+		expect(((await legacy.json()) as { Success: boolean }).Success).toBe(false)
+	})
+
 	test('bulkpurchase resolves catalog ids for newer builds, at the storefront’s price', async () => {
 		// A catalog row the generated storefront would list at 600 (rarity 10) and a skin the
 		// storefront lists nowhere at all — both bought straight off the `catalog` table.

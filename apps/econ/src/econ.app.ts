@@ -643,10 +643,11 @@ interface GiftRequest {
  * 404s as "no such storefront".
  */
 const STOREFRONT_ALIASES: Record<string, string> = {
-	// Empty. 1704 was here, served sf3's catalog, until `static/storefronts/sf1704.json` was
-	// generated — see `runx storefront build`. Its line came out the moment the file appeared,
-	// exactly as the note above says it must: an alias silently beats a real file of that name,
-	// so leaving it would have kept serving sf3 from a storefront that now has its own catalog.
+	// Empty. 1704 was here for a while, standing in for a 2025 gift-drop storefront nobody had
+	// captured; the items it was meant to sell turned out to belong in the general store, so
+	// they are in `sf3-2025.json` and served as storefront 3 — see {@link STOREFRONT_BY_BUILD}.
+	// That is a per-BUILD variant of one storefront rather than an alias between two ids, which
+	// is why nothing is listed here.
 }
 
 /**
@@ -1470,12 +1471,15 @@ function toPurchaseMethodId(raw: Partial<PurchaseMethodId> | null | undefined): 
  * Catalog rows as STORE ITEMS, so a bag can be resolved against the `catalog` table the same
  * way it is resolved against an `sf{N}.json` file.
  *
- * The generated storefront (sf1704) is built from these very rows with this very pricing, so an
- * item bought here costs exactly what that file lists it at. That is not a nicety: `priceCheck`
- * refuses a line whose posted `RequestedPrice` doesn't match, so two pricings would 409 every
- * purchase the client made from the page it was shown.
+ * The generated storefront (`sf3-2025.json`) is built from these very rows with this very
+ * pricing, so an item bought here costs exactly what that file lists it at. That is not a
+ * nicety: `priceCheck` refuses a line whose posted `RequestedPrice` doesn't match, so two
+ * pricings would 409 every purchase the client made from the page it was shown.
  *
- * SKINS come through too, keyed the way a gift-drop keys equipment (`EquipmentPrefabName` +
+ * Mostly redundant now that the merged store carries every sellable AVATAR ITEM — a newer
+ * build's bag resolves those straight out of the file. What it still reaches that the file does
+ * not is SKINS, which the generator leaves out, keyed the way a gift-drop keys equipment
+ * (`EquipmentPrefabName` +
  * `EquipmentModificationGuid`) rather than as an avatar item — which is what lets a skin be
  * bought at all, since no generated storefront file lists one.
  *
