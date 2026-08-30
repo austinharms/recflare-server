@@ -40,6 +40,7 @@ import defaultAvatarItems from '../static/default-avatar-items.json'
 import defaultAvatar from '../static/default-avatar.json'
 import defaultBaseAvatarItems from '../static/default-base-avatar-items.json'
 import myProgress from '../static/my-progress.json'
+import questRewards from '../static/quest-rewards.json'
 import { getAvatar, setAvatar } from './avatar-db'
 import {
 	ALL_PLATFORMS,
@@ -51,6 +52,7 @@ import {
 	isSpendable,
 	spendCurrency,
 } from './balance-db'
+import { getCatalogItem } from './catalog-db'
 // `LEGACY_CLIENT_BUILD` is shared with the storefront generator rather than restated: it picks
 // which store FILE a caller is served here, and which ITEMS go in that file there. The two must
 // name the same moment or a build gets a store built to a different cutoff.
@@ -1719,6 +1721,87 @@ function toGameRewardDrop(): StoreGiftDrop {
 		Context: GIFT_CONTEXT_GAME_REWARDS,
 		Currency: 0,
 		CurrencyType: 0,
+		Xp: GAME_REWARD_XP,
+	}
+}
+
+/**
+ * One row of `static/quest-rewards.json`: the reward table of the live game's activities,
+ * keyed by the `giftContext` the client posts with a game-reward ask (`Dodgeball`,
+ * `Quest_Goblin_S`, `Paintball_Dam`, …). Each row is the gift-drop as the game's own reward
+ * server shaped it — a comma-laden `AvatarItemDesc` (the catalog's `item_key`), or for the
+ * Laser Tag entry a currency payout — with `GiftRarity` and the activity's own `Context`
+ * (8000 for dodgeball, 4003 for the goblin quest's S rank) spelled the way the client's box
+ * reads them. Untyped fields (`Id`, `Level`, `Message`) are carried but unused.
+ */
+interface QuestReward {
+	AvatarItemDesc: string
+	ConsumableItemDesc: string
+	EquipmentPrefabName: string
+	EquipmentModificationGuid: string
+	CurrencyType: number
+	Currency: number
+	Xp: number
+	GiftRarity: number
+	Context: number
+}
+
+const QUEST_REWARDS: Record<string, QuestReward[]> = questRewards
+
+/**
+ * The reward an activity pays, when `giftContext` names an entry in `quest-rewards.json`:
+ * one row drawn at random from that key's list, among the rows the player DOESN'T ALREADY
+ * OWN — the table is "what this activity can give you", and handing over a duplicate gives
+ * nothing (the inventory is a set). A currency row is never "owned", so it always stays in
+ * the pool.
+ *
+ * Null for a context the table doesn't know (or one whose every reward the player already
+ * has), which the caller pays as the plain XP box — the cooldown key is the same string
+ * either way, so an unknown or exhausted context is still rate-limited.
+ */
+async function pickQuestReward(
+	db: D1Database,
+	accountId: number,
+	giftContext: string
+): Promise<QuestReward | null> {
+	if (!Object.hasOwn(QUEST_REWARDS, giftContext)) return null
+	const rows = QUEST_REWARDS[giftContext] ?? []
+	if (rows.length === 0) return null
+	const ownedItems = new Set((await getInventory(db, accountId)).map((i) => i.AvatarItemDesc))
+	const ownedGuids = new Set((await getEquipment(db, accountId)).map((e) => e.ModificationGuid))
+	const pool = rows.filter(
+		(r) =>
+			!(r.AvatarItemDesc !== '' && ownedItems.has(r.AvatarItemDesc)) &&
+			!(r.EquipmentModificationGuid !== '' && ownedGuids.has(r.EquipmentModificationGuid))
+	)
+	if (pool.length === 0) {
+		logger.info('quest rewards exhausted for player', { accountId, giftContext })
+		return null
+	}
+	return pool[Math.floor(Math.random() * pool.length)] ?? null
+}
+
+/**
+ * A quest reward as the gift-drop `grantGiftDrop` hands over. The item fields come off the
+ * row, so the item IS granted — unlike {@link toGameRewardDrop}'s empty box. The catalog
+ * row for the item, when it resolves, supplies what the table doesn't carry (name, tooltip,
+ * `AvatarItemType`), so the inventory entry reads like a bought one rather than blank.
+ * The XP is the flat game-reward amount, not the row's (always 0): the reward is the item,
+ * and the XP is the same pat on the back every claim gets.
+ */
+function toQuestRewardDrop(reward: QuestReward, catalog: CatalogRow | null): StoreGiftDrop {
+	return {
+		FriendlyName: catalog?.friendly_name ?? '',
+		Tooltip: catalog?.tooltip ?? '',
+		ConsumableItemDesc: reward.ConsumableItemDesc,
+		AvatarItemDesc: reward.AvatarItemDesc,
+		AvatarItemType: catalog?.avatar_item_type ?? null,
+		EquipmentPrefabName: reward.EquipmentPrefabName,
+		EquipmentModificationGuid: reward.EquipmentModificationGuid,
+		Rarity: reward.GiftRarity,
+		Context: reward.Context,
+		Currency: reward.Currency,
+		CurrencyType: reward.CurrencyType,
 		Xp: GAME_REWARD_XP,
 	}
 }
@@ -3737,6 +3820,11 @@ const app = new Hono<App>({ strict: false })
 	// activity of the day is per ACTIVITY, so a player who moves from Soccer to Paintball is
 	// owed another reward while a second Soccer match inside the hour is not. An ask that
 	// sends no context keys on `''`.
+	//
+	// It also picks the PRIZE: a context that is a key of `static/quest-rewards.json`
+	// (`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity's rewards — an avatar item
+	// granted into the inventory, or Laser Tag's ticket payout — and the box carries it, with
+	// the activity's own `GiftContext`. A context the table doesn't know gets the XP-only box.
 	.post(
 		'/api/gamerewards/v1/request',
 		describeRoute({
@@ -3746,8 +3834,10 @@ const app = new Hono<App>({ strict: false })
 				'Claims one reward of `rewardType` in `giftContext` per hour per player, recorded in',
 				'`reward_status`. The cooldown is per (type, activity), so a different activity is',
 				'owed another reward while the same one is not; an ask with no `giftContext` keys on',
-				'the empty context. The reward rides in a gift box, so a claim and a rejected',
-				'(on-cooldown) ask both answer `[]`.',
+				'the empty context. A `giftContext` that names an activity in `quest-rewards.json`',
+				'(`Dodgeball`, `Quest_Goblin_S`, …) draws one of that activity’s rewards and grants it;',
+				'any other claim pays XP only. The reward rides in a gift box, so a claim and a',
+				'rejected (on-cooldown) ask both answer `[]`.',
 			].join(' '),
 			security: AUTHED,
 			requestBody: form(GameRewardRequest, 'The reward type and its display message'),
@@ -3774,7 +3864,30 @@ const app = new Hono<App>({ strict: false })
 			// Bank the XP first: it is the reward, and the box is the wrapper the client shows.
 			// A failure here must not leave a box promising XP that was never credited.
 			const { progression, levelsGained } = await addXp(c.env.DB, id, GAME_REWARD_XP)
-			const granted = await grantGiftDrop(c, id, toGameRewardDrop(), message)
+			// An activity the reward table knows pays one of ITS rewards the player lacks — the
+			// item rides in the box and is granted with it. Anything else gets the plain XP box.
+			const questReward = await pickQuestReward(c.env.DB, id, giftContext)
+			const itemKey = questReward?.AvatarItemDesc || questReward?.EquipmentModificationGuid
+			const drop =
+				questReward === null
+					? toGameRewardDrop()
+					: toQuestRewardDrop(questReward, itemKey ? await getCatalogItem(c.env.DB, itemKey) : null)
+			// A currency reward (Laser Tag's tickets) is credited here: `grantGiftDrop` grants
+			// items, not balances. Seed the signup grant first — `creditCurrency` upserts the
+			// row, and a never-touched RecCenterTokens balance would otherwise lose it.
+			if (drop.Currency > 0 && drop.CurrencyType !== CurrencyType.Invalid) {
+				const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+				await ensureStartingBalances(c.env.DB, id, startingTokens)
+				const balance = await creditCurrency(
+					c.env.DB,
+					id,
+					drop.CurrencyType,
+					drop.Currency,
+					startingTokens
+				)
+				await pushBalanceUpdate(c, id, drop.CurrencyType, balance)
+			}
+			const granted = await grantGiftDrop(c, id, drop, message)
 			await pushGiftReceived(c, id, granted, message, COACH_ACCOUNT_ID)
 			// Every grant moves the bar, whether or not it crossed a level.
 			await pushProgressionUpdate(c, id, progression)

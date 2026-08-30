@@ -592,7 +592,9 @@ export const GameRewardRequest = z.object({
 	giftContext: z
 		.string()
 		.optional()
-		.describe('The activity it came from, e.g. `Soccer` — part of the cooldown key'),
+		.describe(
+			'The activity it came from, e.g. `Soccer` — part of the cooldown key. A key of `quest-rewards.json` (`Dodgeball`, `Quest_Goblin_S`, …) also picks the prize from that activity’s table'
+		),
 })
 
 /**
