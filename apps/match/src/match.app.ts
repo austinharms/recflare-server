@@ -598,6 +598,63 @@ function crossBuildRefusal(
 }
 
 /**
+ * The 2023 client build, as its token's `rn.ver` date stamps it (`20230414`, or a point
+ * release of it). See {@link persistenceVersionRefusal}.
+ */
+const BUILD_2023 = 20230414
+
+/**
+ * The first scene persistence version the 2023 client cannot load. A room whose published
+ * scene was saved at this version or later was built on a newer client; the old one fails
+ * to deserialize it.
+ */
+const MIN_UNLOADABLE_PERSISTENCE_VERSION_2023 = 227
+
+/**
+ * The persistence version of the scene a subroom LOADS — the published `CurrentSave`'s,
+ * the same save {@link subRoomDataBlob} serves, falling back to the flat legacy field.
+ * `null` when nothing recorded one (a fresh subroom, or one saved before the field
+ * existed): unknown is not "new".
+ */
+function subRoomPersistenceVersion(sub: Record<string, unknown> | undefined): number | null {
+	const save = sub?.CurrentSave
+	if (save && typeof save === 'object') {
+		const v = (save as Record<string, unknown>).PersistenceVersion
+		if (typeof v === 'number') return v
+	}
+	return typeof sub?.PersistenceVersion === 'number' ? sub.PersistenceVersion : null
+}
+
+/**
+ * Whether a player on `callerVersion` may enter `room` at all — `null` when they may,
+ * otherwise the code to refuse with.
+ *
+ * A caller on the 2023 build ({@link BUILD_2023}) is refused any room with a subroom whose
+ * published scene is at persistence version {@link MIN_UNLOADABLE_PERSISTENCE_VERSION_2023}
+ * or above: that scene was saved by a newer client and the 2023 one can't load it, so
+ * the honest answer is `UpdateRequired` — "your client can't go there" — rather than
+ * handing out an instance that never finishes loading. The WHOLE room is gated, not just
+ * the requested subroom, since the client walks between subrooms without re-matchmaking.
+ *
+ * Every other build, and a token that names none, passes: the gate is about one known
+ * client, not a general ordering.
+ */
+function persistenceVersionRefusal(
+	room: Room,
+	callerVersion: string | null
+): MatchmakingErrorCode | null {
+	if (buildNumber(callerVersion) !== BUILD_2023) return null
+	const subRooms = (Array.isArray(room.SubRooms) ? room.SubRooms : []) as Array<
+		Record<string, unknown>
+	>
+	const tooNew = subRooms.some((sub) => {
+		const v = subRoomPersistenceVersion(sub)
+		return v !== null && v >= MIN_UNLOADABLE_PERSISTENCE_VERSION_2023
+	})
+	return tooNew ? MatchmakingErrorCode.UpdateRequired : null
+}
+
+/**
  * "This event isn't open to you" — the refusal on a private event the caller wasn't
  * invited to. Told plainly rather than hidden behind the opaque NoSuchRoom: a player
  * reaching this already holds the event id from somewhere that showed it to them, so
@@ -1205,6 +1262,20 @@ async function resolveRoomInstance(
 		return { instance: null, errorCode: BANNED_FROM_ROOM }
 	}
 
+	// The build this player is on, from their token. A 2023 client can't load a scene
+	// saved at a newer persistence version, so it is refused the room outright (see
+	// persistenceVersionRefusal) before any instance is created or reused.
+	const tokenVersion = await callerVersion(c)
+	const tooNew = persistenceVersionRefusal(room, tokenVersion)
+	if (tooNew !== null) {
+		logger.info('matchmake refused: room persistence version too new for client build', {
+			roomId: f.roomId,
+			ownerId,
+			gameVersion: tokenVersion,
+		})
+		return { instance: null, errorCode: tooNew }
+	}
+
 	// Never place the player back into the instance they're already in: the client
 	// keys the room transition off a changing `roomInstanceId`, so re-matchmaking into
 	// your current instance (e.g. the only public instance of a room you're already in)
@@ -1215,10 +1286,10 @@ async function resolveRoomInstance(
 	const currentInstanceId = isPrivate
 		? undefined
 		: (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
-	// The build this player is on, from their token. It scopes the search below and is
-	// stamped on the instance when one is created, which is what keeps a session to a
-	// single client version.
-	const gameVersion = await callerGameVersion(c)
+	// The same build, with GAME_VERSION standing in for a token that names none. It scopes
+	// the search below and is stamped on the instance when one is created, which is what
+	// keeps a session to a single client version.
+	const gameVersion = tokenVersion ?? GAME_VERSION
 	// Reuse an existing joinable public instance *of the same subroom and the same
 	// build* — subrooms are separate places, so joining one must never land you in
 	// another, and neither must a session running a different version of the room.

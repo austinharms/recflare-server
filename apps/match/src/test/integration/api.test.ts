@@ -3111,6 +3111,85 @@ describe('account bans', () => {
 	})
 })
 
+// A 2023 client (`rn.ver` 20230414) can't load a scene saved at persistence version 227 or
+// later, so any room with such a subroom refuses it with UpdateRequired. Every other build
+// gets in as usual.
+describe('persistence version gate for the 2023 client', () => {
+	const matchmake = async (roomId: number, sub: string, version?: string) => {
+		const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/${roomId}`, {
+			method: 'POST',
+			headers: {
+				...(await bearer(sub, version)),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: new URLSearchParams({ JoinMode: '0' }).toString(),
+		})
+		expect(res.status).toBe(200)
+		return (await res.json()) as {
+			errorCode: number
+			result: number
+			roomInstance: { roomId: number } | null
+		}
+	}
+
+	beforeAll(async () => {
+		// Published scene at 227 — the first version the 2023 client can't load.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 7227,
+			Name: 'NewFormatRoom',
+			IsDorm: false,
+			Accessibility: 1,
+			CreatorAccountId: 7300,
+			SubRooms: [
+				{ SubRoomId: 7227, UnitySceneId: RECCENTER_SCENE, MaxPlayers: 10 },
+				{
+					SubRoomId: 7228,
+					UnitySceneId: SECOND_SUBROOM_SCENE,
+					MaxPlayers: 10,
+					CurrentSave: { DataBlob: 'new.room', PersistenceVersion: 227 },
+				},
+			],
+		} as unknown as Record<string, unknown>)
+		// Published at 226 — still loadable.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 7226,
+			Name: 'OldFormatRoom',
+			IsDorm: false,
+			Accessibility: 1,
+			CreatorAccountId: 7300,
+			SubRooms: [
+				{
+					SubRoomId: 7226,
+					UnitySceneId: RECCENTER_SCENE,
+					MaxPlayers: 10,
+					CurrentSave: { DataBlob: 'old.room', PersistenceVersion: 226 },
+				},
+			],
+		} as unknown as Record<string, unknown>)
+	})
+
+	test('the 2023 build is refused a room with a subroom at 227+', async () => {
+		const res = await matchmake(7227, '7301', '20230414')
+		expect(res.errorCode).toBe(16) // UpdateRequired
+		expect(res.result).toBe(16)
+		expect(res.roomInstance).toBeNull()
+
+		// A point release of the same build is the same client.
+		expect((await matchmake(7227, '7302', '20230414.02')).errorCode).toBe(16)
+	})
+
+	test('the 2023 build still enters a room saved below 227', async () => {
+		const res = await matchmake(7226, '7303', '20230414')
+		expect(res.errorCode).toBe(0)
+		expect(res.roomInstance?.roomId).toBe(7226)
+	})
+
+	test('newer builds and unversioned tokens are not gated', async () => {
+		expect((await matchmake(7227, '7304', '20250718.01')).errorCode).toBe(0)
+		expect((await matchmake(7227, '7305')).errorCode).toBe(0)
+	})
+})
+
 // The ban follows the player past the account it was written on: a new account sharing a
 // proven platform identity or an IP with a banned one is refused the same way. See
 // bans-db.ts in the api worker for the arms and the BAN_EVASION_MATCH knob.
