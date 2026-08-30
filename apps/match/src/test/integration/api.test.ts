@@ -20,6 +20,7 @@ import {
 	ROOM_SCHEMA_DDL,
 	seedRoomWithSubRooms,
 	setPresence,
+	STAT_SCHEMA_DDL,
 	SUBROOM_SCHEMA_DDL,
 } from '@repo/domain'
 
@@ -124,6 +125,8 @@ beforeAll(async () => {
 	for (const stmt of PRESENCE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 	// Room invites (owned by this worker) — POST /invite mints a row per invite.
 	for (const stmt of ROOM_INVITE_SCHEMA_DDL) await env.DB.prepare(stmt).run()
+	// Stats (owned by this worker) — the presence cron samples the online count into it.
+	for (const stmt of STAT_SCHEMA_DDL) await env.DB.prepare(stmt).run()
 
 	// Accounts table (owned by the auth worker) — dorm creation reads the username
 	// to name the room. Seed the players the dorm tests authenticate as.
@@ -1909,6 +1912,30 @@ describe('auth-gated endpoints', () => {
 		expect((await getRoomInstance(env.DB, solo))?.isFull).toBe(false)
 	})
 
+	test('records an `online` stat sample of the live presence count on each run', async () => {
+		await env.DB.prepare('DELETE FROM stat').run()
+		const before = (await env.DB.prepare('SELECT COUNT(*) AS n FROM presence WHERE expires_at > ?1')
+			.bind(nowSeconds())
+			.first<{ n: number }>())!.n
+
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		const rows = (
+			await env.DB.prepare('SELECT stat_type, value, datetime FROM stat').all<{
+				stat_type: string
+				value: number
+				datetime: string
+			}>()
+		).results
+		expect(rows).toHaveLength(1)
+		expect(rows[0]!.stat_type).toBe('online')
+		expect(rows[0]!.value).toBe(before)
+		// Stamped with the current time, as ISO-8601.
+		expect(Math.abs(Date.parse(rows[0]!.datetime) - Date.now())).toBeLessThan(10_000)
+	})
+
 	// Age an instance past EMPTY_INSTANCE_GRACE_SECONDS by backdating its `createdAt`
 	// (the generated `created_at` column follows the blob), so the empty-instance sweep
 	// can be exercised without waiting out the grace window.
@@ -2444,9 +2471,7 @@ describe('auth-gated endpoints', () => {
 
 		// The one frame an invite from a client on `version` pushes, with the RoomInviteId
 		// the call answered — a v2 invite names it in its Data.
-		const inviteFrom = async (
-			version?: string
-		): Promise<{ frame: Sent; roomInviteId: number }> => {
+		const inviteFrom = async (version?: string): Promise<{ frame: Sent; roomInviteId: number }> => {
 			await hub().fetch('http://do/all', { method: 'DELETE' })
 			const res = await exports.default.fetch(`${ORIGIN}/invite`, {
 				method: 'POST',

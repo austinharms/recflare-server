@@ -6,6 +6,7 @@ import {
 	Accessibility,
 	areFriends,
 	canManageRoom,
+	countOnlinePlayers,
 	createRoomInstance,
 	createRoomInvite,
 	deleteEmptyRoomInstances,
@@ -35,6 +36,7 @@ import {
 	MessageType,
 	MOST_ACTIVE_CLUBHOUSE_LIMIT,
 	recordRoomVisit,
+	recordStat,
 	refreshInstanceFullness,
 	RoomInstanceType,
 	setPresence,
@@ -2903,10 +2905,14 @@ async function sweepExpiredPresence(env: Env): Promise<void> {
 	for (const instanceId of staleInstanceIds) {
 		await refreshInstanceFullness(env.DB, instanceId)
 	}
+	// Sample the player count into `stat` — taken after the purge, so it's the live
+	// rows and not the ones that just lapsed. One row per cron run: the `online` series.
+	const online = await countOnlinePlayers(env.DB)
+	await recordStat(env.DB, 'online', online)
 	// The tagged logger is request-scoped (its middleware never runs for a cron), so
 	// log plainly here — Workers observability picks it up either way.
 	console.log(
-		`presence sweep: removed ${removed} expired rows, deleted ${emptyInstanceIds.length} empty instances, refreshed ${staleInstanceIds.length} instances`
+		`presence sweep: removed ${removed} expired rows, deleted ${emptyInstanceIds.length} empty instances, refreshed ${staleInstanceIds.length} instances, ${online} online`
 	)
 }
 
