@@ -572,6 +572,42 @@ const coachMessageAll = (messageContent: string): Promise<{ sent?: number }> =>
 		authed: true,
 	})
 
+/**
+ * The same coach message to ONE player. `notify` queues it when they're offline, so
+ * `queued` (rather than a 0 delivery) is what "they weren't online" looks like here —
+ * it still arrives on their next connect, unlike the broadcast.
+ */
+const coachMessage = (
+	playerId: number,
+	messageContent: string
+): Promise<{ delivered?: number; queued?: boolean }> =>
+	call<{ delivered?: number; queued?: boolean }>(`${where().notify}/internal/coach-message`, {
+		json: { playerId, messageContent },
+		authed: true,
+	})
+
+/**
+ * Resolve an `@username` to the account id the workers address a player by.
+ *
+ * `accounts` serves no exact-name lookup, so this goes through the PREFIX search and
+ * keeps only an exact (case-insensitive) hit: a prefix match is a different player, and
+ * sending a message to whoever happened to sort first would be worse than refusing. The
+ * exact name always sorts first among its own prefixes, so it's inside the search limit
+ * whenever it exists.
+ */
+async function accountIdForUsername(input: string): Promise<number> {
+	const name = input.trim().replace(/^@/, '')
+	if (name === '') throw new Error('Enter a username to send to.')
+	const matches = await call<Array<{ accountId?: number; username?: string }>>(
+		`${where().accounts}/account/search?name=${encodeURIComponent(name)}`
+	)
+	const found = Array.isArray(matches)
+		? matches.find((m) => m.username?.toLowerCase() === name.toLowerCase())
+		: undefined
+	if (typeof found?.accountId !== 'number') throw new Error(`There's no player called @${name}.`)
+	return found.accountId
+}
+
 /** Minimal history-based router: current pathname + a navigate() that pushes state. */
 function useRouter() {
 	const [path, setPath] = useState(() => window.location.pathname)
@@ -2092,7 +2128,7 @@ function Dashboard({
 		...(isAdmin()
 			? [
 					{ id: 'maintenance', label: 'Server maintenance', render: () => <MaintenanceForm /> },
-					{ id: 'coach', label: 'Broadcast message', render: () => <CoachMessageForm /> },
+					{ id: 'coach', label: 'Coach message', render: () => <CoachMessageForm /> },
 				]
 			: []),
 	]
@@ -2227,28 +2263,61 @@ function RoomCard({
 	)
 }
 
-/** Admin-only: send a coach/system message to every online player. */
+/**
+ * Admin-only: send a coach/system message, either to one player by `@username` or to
+ * everyone online.
+ *
+ * The two go to different endpoints because they behave differently, not just in reach:
+ * the broadcast is online-only (nothing holds a message with no addressee), while a named
+ * recipient's message is queued by the hub and delivered whenever they next connect. The
+ * recipient box therefore says which of those the operator is about to do.
+ */
 function CoachMessageForm() {
+	const [recipient, setRecipient] = useState('')
 	const [message, setMessage] = useState('')
 	const { pending, error, done, run } = useAction()
+	// The `@` is how the name is written, not part of it — accepted either way, shown back
+	// with it, and sent without it.
+	const handle = recipient.trim().replace(/^@/, '')
+	const toOne = handle !== ''
 
 	return (
 		<section className="card">
-			<h2>Broadcast message</h2>
+			<h2>Coach message</h2>
 			<p className="muted">
-				Send a message from the Coach to every connected player. Players who aren&apos;t online
-				won&apos;t receive it.
+				Send a message from the Coach to one player, or leave the recipient blank to send it to
+				every connected player. A broadcast reaches only who is online right now; a message to one
+				player waits for them if they aren&apos;t.
 			</p>
 			<form
 				onSubmit={(e) => {
 					e.preventDefault()
 					void run(async () => {
-						const { sent } = await coachMessageAll(message.trim())
+						const content = message.trim()
+						if (!toOne) {
+							const { sent } = await coachMessageAll(content)
+							setMessage('')
+							return `Sent to ${sent ?? 0} online player${sent === 1 ? '' : 's'}.`
+						}
+						// Resolved before sending: the workers address players by id, and a name that
+						// matches nobody should be a refusal rather than a message into the void.
+						const { queued } = await coachMessage(await accountIdForUsername(handle), content)
 						setMessage('')
-						return `Sent to ${sent ?? 0} online player${sent === 1 ? '' : 's'}.`
+						return queued === true
+							? `@${handle} is offline — it will arrive when they next connect.`
+							: `Sent to @${handle}.`
 					})
 				}}
 			>
+				<label>
+					Send to
+					<input
+						value={recipient}
+						placeholder="@username — blank sends to everyone online"
+						autoComplete="off"
+						onChange={(e) => setRecipient(e.target.value)}
+					/>
+				</label>
 				<label>
 					Message
 					<textarea
@@ -2261,7 +2330,7 @@ function CoachMessageForm() {
 				{error && <p className="error">{error}</p>}
 				{done && <p className="ok">{done}</p>}
 				<button type="submit" disabled={pending}>
-					{pending ? 'Sending…' : 'Send to all online'}
+					{pending ? 'Sending…' : toOne ? `Send to @${handle}` : 'Send to all online'}
 				</button>
 			</form>
 		</section>
