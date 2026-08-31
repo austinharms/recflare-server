@@ -46,6 +46,18 @@ interface Hosts {
 interface SiteConfig {
 	signupEnabled: boolean
 	turnstileSiteKey: string | null
+	/**
+	 * Whether the Discord-verified benefits claim is configured. False when the operator
+	 * has no Discord app/guild/role set, in which case the claim page and its links stay
+	 * hidden — the endpoint would refuse anyway.
+	 */
+	benefitsEnabled: boolean
+	/**
+	 * The Discord consent URL to send the player to, assembled by `www` (scopes and the
+	 * redirect URI are its business, and must match what the claim will accept). Null when
+	 * benefits are off. The `state` nonce is appended here — see `startDiscordAuth`.
+	 */
+	discordAuthorizeUrl: string | null
 }
 
 /** The private self DTO from `accounts` (`GET /account/me`). */
@@ -495,6 +507,50 @@ const changePassword = (oldPassword: string, newPassword: string): Promise<unkno
 		authed: true,
 	})
 
+/** Where this account's benefits stand: `www` reads them off the account row. */
+interface BenefitsStatus {
+	/** Whether the account already has Rec Room Plus. */
+	hasPlus: boolean
+	/** Whether a Discord identity is already tied to it. Which one is deliberately not served. */
+	linked: boolean
+}
+
+/**
+ * The two ends of the benefits claim. Both live on `www` rather than on one of the game
+ * workers, because the claim needs the Discord client secret — see www.app.ts.
+ */
+const fetchBenefitsStatus = (): Promise<BenefitsStatus> =>
+	call<BenefitsStatus>('/api/benefits/status', { authed: true })
+
+/** Redeem the code Discord sent us back with. The access token never reaches this page. */
+const claimBenefits = (code: string): Promise<{ discordUsername?: string }> =>
+	call<{ discordUsername?: string }>('/api/benefits/claim', { json: { code }, authed: true })
+
+/**
+ * The per-attempt CSRF nonce for the Discord round-trip, in sessionStorage.
+ *
+ * OAuth's `state` only means anything if the same page that minted it is the one that
+ * checks it, so it can't come from the server. sessionStorage rather than localStorage:
+ * it belongs to this tab and this attempt, and it should not outlive the tab that started
+ * the flow.
+ */
+const OAUTH_STATE_KEY = 'rf_discord_state'
+
+/**
+ * Send the browser to Discord's consent screen.
+ *
+ * A real navigation, not a client-side route — Discord is another origin. The `state` is
+ * minted here and stashed for the return leg; `www` built everything else about the URL
+ * (see `/api/config`), so this only ever appends the one parameter it owns.
+ */
+function startDiscordAuth(authorizeUrl: string) {
+	const state = crypto.randomUUID()
+	sessionStorage.setItem(OAUTH_STATE_KEY, state)
+	const url = new URL(authorizeUrl)
+	url.searchParams.set('state', state)
+	window.location.assign(url.toString())
+}
+
 /**
  * Admin-only broadcasts. The token goes to `notify`, which enforces the admin-role gate
  * — so a session without the role is rejected there (403) even though the UI shows no
@@ -563,6 +619,214 @@ function Link({
 }
 
 /**
+ * The benefits claim itself: where the player stands, and the button that starts (or
+ * re-runs) the Discord round-trip.
+ *
+ * This is BOTH ends of the OAuth round-trip: it sends the player to Discord, and it is
+ * what renders when Discord sends them back. Which half is running is decided by whether
+ * the URL carries a `code`.
+ *
+ * What it never holds is a Discord access token. It forwards the one-time `code` to
+ * `www`, which does the exchange with the client secret and answers with a verdict; that
+ * is the whole reason this one feature has a server side at all.
+ *
+ * Rendered in TWO places, which is why it is a component rather than a page. Its home is
+ * the "Claim benefits" tab in the account dashboard, where someone would go looking for
+ * it. But it also has to render on `/claim`, because that path is Discord's registered
+ * redirect URI — the browser comes back to it with a `?code=`, and it is the only URL a
+ * cold load can land on mid-flow. One component means the two can't drift.
+ *
+ * The effect keys off whether the URL carries a code, so the same code covers both: on
+ * the dashboard there is none, and it just reports status.
+ */
+function BenefitsPanel({ account, config }: { account: SelfAccount; config: SiteConfig }) {
+	const [status, setStatus] = useState<BenefitsStatus | undefined>(undefined)
+	const [error, setError] = useState('')
+	const [done, setDone] = useState('')
+	const [pending, setPending] = useState(false)
+	// Shown after a successful claim only. Plus rides on the game's token as `rn.plus`,
+	// stamped at login, so the copy of it the player is holding still says they have none —
+	// and tokens last a day and are never refreshed. Without this line the claim looks like
+	// it silently did nothing, which is the single most likely support question here.
+	const [relogin, setRelogin] = useState(false)
+	// StrictMode runs effects twice in dev, and a Discord code is single-use: the second
+	// run would redeem a spent code and report a failure over a claim that just worked.
+	const redeemed = useRef(false)
+
+	useEffect(() => {
+		const params = new URLSearchParams(window.location.search)
+		const code = params.get('code')
+		const state = params.get('state')
+		const expected = sessionStorage.getItem(OAUTH_STATE_KEY)
+
+		if (code === null) {
+			// Nothing came back from Discord — either the dashboard tab, or `/claim` opened
+			// directly. Just show where they stand. Discord also returns with
+			// `?error=access_denied` when someone cancels: no code, nothing to say, and the
+			// button is right there to try again.
+			void fetchBenefitsStatus()
+				.then(setStatus)
+				.catch(() => setStatus(undefined))
+			return
+		}
+
+		// The return leg. Strip the query first, whatever happens next: the code is spent by
+		// the request below, so a reload must not carry it (and a code has no business
+		// sitting in the address bar, or in whatever the player pastes it into). replaceState
+		// rather than a route change, so Back doesn't walk into a used code either.
+		window.history.replaceState(null, '', '/claim')
+		if (redeemed.current) return
+		redeemed.current = true
+		sessionStorage.removeItem(OAUTH_STATE_KEY)
+
+		// The nonce this tab minted must be the one that came back. A mismatch means the
+		// round-trip wasn't started here, which is exactly what `state` exists to catch.
+		if (state === null || expected === null || state !== expected) {
+			setError('That Discord sign-in did not match this browser. Please start again.')
+			return
+		}
+
+		setPending(true)
+		claimBenefits(code)
+			.then((result) => {
+				setStatus({ hasPlus: true, linked: true })
+				setDone(
+					result.discordUsername
+						? `Verified as ${result.discordUsername} — Rec Room Plus is now on your account.`
+						: 'Verified — Rec Room Plus is now on your account.'
+				)
+				setRelogin(true)
+			})
+			.catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))
+			.finally(() => setPending(false))
+	}, [])
+
+	// Read into a local so the narrowing survives into the click handlers below.
+	const authorizeUrl = config.discordAuthorizeUrl
+	if (!config.benefitsEnabled || authorizeUrl === null) {
+		return (
+			<section className="card">
+				<h2>Claim benefits</h2>
+				<p className="muted">Benefit claims aren’t available on this server right now.</p>
+			</section>
+		)
+	}
+
+	const claimed = status?.hasPlus === true
+
+	return (
+		<section className="card">
+			<h2>Rec Room Plus</h2>
+			<p className="muted">
+				Members of our Discord with a supporter role get Rec Room Plus on their account. Verify with
+				Discord and we’ll check your roles — we only ever read your username and which roles you
+				hold in our server.
+			</p>
+			<p className="muted">
+				Claiming as <strong>@{account.username}</strong> (#{account.accountId}). A Discord account
+				can claim on one RecFlare account only.
+			</p>
+
+			{error && <p className="error">{error}</p>}
+			{done && <p className="ok">{done}</p>}
+			{relogin && (
+				<p className="hint">
+					Restart Rec Room and sign in again to pick it up — your game reads Rec Room Plus from the
+					session it signed in with, so it won’t show until then.
+				</p>
+			)}
+
+			{pending ? (
+				<p className="muted">Checking your Discord roles…</p>
+			) : claimed ? (
+				// Already claimed. The button stays, because a player whose roles changed (or who
+				// re-linked) can safely run it again — the claim is idempotent on their own
+				// account — but it no longer reads as the thing to do.
+				<>
+					{!done && (
+						<>
+							<p className="ok">Rec Room Plus is active on this account.</p>
+							<p className="hint">
+								If the game doesn’t show it, sign out and back in — Rec Room Plus is read from the
+								session your game signed in with.
+							</p>
+						</>
+					)}
+					<button className="linkish" onClick={() => startDiscordAuth(authorizeUrl)}>
+						Re-verify with Discord
+					</button>
+				</>
+			) : (
+				<button
+					type="button"
+					className="cta discord"
+					onClick={() => startDiscordAuth(authorizeUrl)}
+				>
+					Verify with Discord
+				</button>
+			)}
+		</section>
+	)
+}
+
+/**
+ * `/claim` — the page Discord redirects back to.
+ *
+ * Not linked from anywhere any more: the claim lives in the account dashboard's "Claim
+ * benefits" tab. This route still has to exist and still has to work on a cold load,
+ * because it is the app's registered `redirect_uri` — the browser arrives here from
+ * Discord carrying the `?code=`, with whatever session it has.
+ *
+ * Signing in comes FIRST, and not only because the grant needs an account to land on: the
+ * bearer token is what tells `www` whose row to write, so a claim without one has no
+ * subject. Hence the sign-in card rather than a redirect — someone who arrives here from a
+ * link should be told what this is before being bounced to a login form.
+ */
+function ClaimPage({
+	account,
+	config,
+	navigate,
+}: {
+	account: SelfAccount | null | undefined
+	config: SiteConfig | undefined
+	navigate: Navigate
+}) {
+	if (account === undefined || config === undefined) {
+		return (
+			<main className="shell">
+				<p className="muted">Loading…</p>
+			</main>
+		)
+	}
+
+	if (account === null) {
+		return (
+			<main className="shell">
+				<h1>Claim your benefits</h1>
+				<section className="card">
+					<h2>Sign in first</h2>
+					<p className="muted">
+						Benefits are granted to a RecFlare account, so we need to know which one is yours before
+						you verify with Discord. If you were part-way through a claim, start it again from your
+						account page once you’re signed in.
+					</p>
+					<Link to="/login" navigate={navigate} className="cta">
+						Sign in
+					</Link>
+				</section>
+			</main>
+		)
+	}
+
+	return (
+		<main className="shell">
+			<h1>Claim your benefits</h1>
+			<BenefitsPanel account={account} config={config} />
+		</main>
+	)
+}
+
+/**
  * The room id in `/rooms/<id>`, or null for any other path. Numeric rather than the
  * room's name: a name is renameable (`PUT /rooms/{id}/name`), so a link someone
  * bookmarked would rot the moment they renamed the room.
@@ -597,7 +861,12 @@ export function App() {
 					.catch(() => setAccount(null))
 			})
 			.catch(() => {
-				setConfig({ signupEnabled: false, turnstileSiteKey: null })
+				setConfig({
+					signupEnabled: false,
+					turnstileSiteKey: null,
+					benefitsEnabled: false,
+					discordAuthorizeUrl: null,
+				})
 				setAccount(null)
 			})
 	}, [])
@@ -627,7 +896,11 @@ export function App() {
 					onAuthed={setAccount}
 				/>
 			) : path === '/account' ? (
-				<AccountPage account={account} navigate={navigate} onChange={setAccount} />
+				<AccountPage account={account} config={config} navigate={navigate} onChange={setAccount} />
+			) : path === '/claim' ? (
+				// Its own page rather than a dashboard tab: this path is Discord's registered
+				// redirect URI, so it has to be one stable URL a cold load can land on.
+				<ClaimPage account={account} config={config} navigate={navigate} />
 			) : roomId !== null ? (
 				<RoomPage account={account} roomId={roomId} navigate={navigate} />
 			) : (
@@ -1030,10 +1303,12 @@ function LoginPage({
 /** The signed-in account page. Redirects to sign-in when there's no session. */
 function AccountPage({
 	account,
+	config,
 	navigate,
 	onChange,
 }: {
 	account: SelfAccount | null | undefined
+	config: SiteConfig | undefined
 	navigate: Navigate
 	onChange: (a: SelfAccount) => void
 }) {
@@ -1052,7 +1327,7 @@ function AccountPage({
 	return (
 		<main className="shell wide">
 			<h1>My account</h1>
-			<Dashboard account={account} navigate={navigate} onChange={onChange} />
+			<Dashboard account={account} config={config} navigate={navigate} onChange={onChange} />
 		</main>
 	)
 }
@@ -1382,10 +1657,10 @@ function BlobUpload({
 				<span className="badge beta">Beta</span>
 			</p>
 			<p className="muted blob-upload-caveat">
-				New and lightly tested. Nothing here checks the file — the server stores whatever it
-				is and the game finds out on load. This server runs the {CLIENT_BUILD_DATE} build, so
-				scene data from a room built on anything newer may not load at all. Download the save
-				above and keep it before replacing it.
+				New and lightly tested. Nothing here checks the file — the server stores whatever it is and
+				the game finds out on load. This server runs the {CLIENT_BUILD_DATE} build, so scene data
+				from a room built on anything newer may not load at all. Download the save above and keep it
+				before replacing it.
 			</p>
 			<label className="blob-upload-file">
 				Scene data file
@@ -1776,10 +2051,12 @@ function LoginForm({ onAuthed }: { onAuthed: (a: SelfAccount) => void }) {
 
 function Dashboard({
 	account,
+	config,
 	navigate,
 	onChange,
 }: {
 	account: SelfAccount
+	config: SiteConfig | undefined
 	navigate: Navigate
 	onChange: (a: SelfAccount) => void
 }) {
@@ -1800,6 +2077,18 @@ function Dashboard({
 			render: () => <EmailForm account={account} onChange={onChange} />,
 		},
 		{ id: 'password', label: 'Password', render: () => <PasswordForm /> },
+		// Only when the operator has Discord configured — otherwise the panel has nothing to
+		// offer and the tab is a promise the server can't keep. The claim also still lives at
+		// /claim, because that URL is Discord's registered redirect and has to keep working.
+		...(config?.benefitsEnabled
+			? [
+					{
+						id: 'benefits',
+						label: 'Claim benefits',
+						render: () => <BenefitsPanel account={account} config={config} />,
+					},
+				]
+			: []),
 		...(isAdmin()
 			? [
 					{ id: 'maintenance', label: 'Server maintenance', render: () => <MaintenanceForm /> },

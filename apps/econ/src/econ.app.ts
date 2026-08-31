@@ -17,7 +17,7 @@ import {
 	setOutfit,
 } from '@repo/domain'
 import { intVar, logger, withCleanSpec, withNotFound, withOnError } from '@repo/hono-helpers'
-import { validateAndGetAccountId, validateAndGetRoles, validateAndGetVersion } from '@repo/jwt'
+import { validateAndGetAccountId, validateAndGetPlus, validateAndGetVersion } from '@repo/jwt'
 
 import {
 	getCustomAvatarItems,
@@ -165,16 +165,6 @@ import type { AvatarItem } from './inventory-db'
  */
 async function authedId(c: Context<App>): Promise<number | null> {
 	return validateAndGetAccountId(c.req.raw, await c.env.JWT_SECRET.get())
-}
-
-/**
- * The `role` claim from a Bearer token — the operator-granted roles the auth worker stamps
- * from the account's flags, so a plain player's token is just `['gameClient']`. `null` when
- * the request carries no valid token; an empty array means a valid token with no roles.
- * Shaped to mirror {@link authedId}.
- */
-async function authedRoles(c: Context<App>): Promise<string[] | null> {
-	return validateAndGetRoles(c.req.raw, await c.env.JWT_SECRET.get())
 }
 
 /**
@@ -415,20 +405,32 @@ async function pushBalancePurchase(
  */
 const NOT_AN_INFLUENCER = 0
 
-/** The operator-granted role that comes with a complimentary subscription. */
-const DEVELOPER_ROLE = 'developer'
-
 /**
- * Whether the caller currently holds a Rec Room Plus subscription — the ONE definition,
- * shared by `UpdateAndGetSubscription` (which reports it) and the storefront buys (which
- * price off it via `SubscriberPrices`). Nothing sells subscriptions here, so holding the
- * `developer` role IS the subscription; if a real subscription store ever lands, this is
- * the only place that has to learn about it. Read from the token's `role` claim, never the
- * body; no or an invalid token is "not subscribed".
+ * Whether the caller holds a Rec Room Plus subscription — the ONE definition, shared by
+ * `UpdateAndGetSubscription` (which reports it) and the storefront buys (which price off
+ * it via `SubscriberPrices`). Those two must never disagree: a subscriber whose client
+ * applied the discount itself and then had the buy refused as a price mismatch is exactly
+ * what one definition prevents.
+ *
+ * Nothing SELLS subscriptions here. Plus is `account.hasPlus`, claimed on the website by
+ * proving a qualifying role in the community Discord (`www` `POST /api/benefits/claim`),
+ * and it reaches this worker as the token's `rn.plus` claim — stamped by `auth` at login
+ * from that flag. So this is a pure token read: no database, no binding, nothing to load.
+ *
+ * The cost is FRESHNESS, deliberately accepted. The claim is only as current as the token,
+ * which lasts a day and is never refreshed (see TOKEN_TTL_SECONDS), so a player who claims
+ * on the website has to sign in again — and restart the game — before Plus applies. The
+ * website's claim page says so.
+ *
+ * The `developer` role does NOT grant Plus. It used to, as a stand-in while nothing else
+ * could confer it; now that the Discord claim exists, Plus is one thing with one source.
+ * An operator who wants a developer to have it sets `hasPlus` on their account like
+ * anyone else's.
+ *
+ * Never read from the body. No token, or an invalid one, is "not subscribed".
  */
 async function isSubscriber(c: Context<App>): Promise<boolean> {
-	const roles = await authedRoles(c)
-	return roles?.includes(DEVELOPER_ROLE) ?? false
+	return validateAndGetPlus(c.req.raw, await c.env.JWT_SECRET.get())
 }
 
 /** `SubscriptionLevel.Gold`. 1 is Platinum. */
@@ -448,20 +450,21 @@ const SUBSCRIPTION_PLATFORM_ALL = -1
 const STUB_SUBSCRIPTION_ID = 1
 
 /**
- * The complimentary subscription a `developer` account reports — Rec Room Plus, which the
- * client's API calls a `CampusCard`.
+ * The complimentary subscription a subscriber reports — Rec Room Plus, which the client's
+ * API calls a `CampusCard`. See `isSubscriber` for who counts as one: a `developer`, or a
+ * player who claimed `hasPlus` with a Discord role on the website.
  *
- * Nothing here sells subscriptions, so holding the role IS the subscription: it's how the
- * paid-tier surfaces get exercised without a store. Every field is computed per call and
- * none of it is persisted, so this is not a record of anything — revoking the role revokes
- * the subscription, and no expiry sweep or renewal exists.
+ * Nothing here sells subscriptions, so holding one of those IS the subscription. Every
+ * field is computed per call and none of it is persisted, so this is not a record of
+ * anything — dropping the role or the flag drops the subscription, and no expiry sweep or
+ * renewal exists.
  *
  * `ExpirationDate` is a year out from THIS call rather than a fixed date: a hard-coded one
  * lapses on a day nobody is expecting, and the client would start showing an expired
  * subscription with no way to renew it. `IsAutoRenewing` tells the client the same thing.
  * The dates are milliseconds-precision ISO like the rest of this worker's timestamps.
  */
-function developerSubscription(accountId: number) {
+function plusSubscription(accountId: number) {
 	const now = new Date()
 	// Calendar arithmetic, not now + 365 days: setUTCFullYear lands on the same date next
 	// year whether or not a leap day falls in between.
@@ -3097,8 +3100,8 @@ const app = new Hono<App>({ strict: false })
 			summary: 'Buy a storefront item',
 			description: [
 				'Looks the item up in its storefront catalog, confirms the client’s `RequestedPrice`',
-				'still matches the `Prices` entry — a Rec Room Plus subscriber (the same check as',
-				'`UpdateAndGetSubscription`) may pay anywhere from that down to 10% off, since their',
+				'still matches the `Prices` entry — a Rec Room Plus subscriber (the same `rn.plus`',
+				'check as `UpdateAndGetSubscription`) may pay anywhere from that down to 10% off, since their',
 				'client applies the discount itself and not to every item — debits the buyer atomically,',
 				'grants the item (into the inventory or',
 				'consumable table), and returns a gift box. A `Gift` block routes the item — and its',
@@ -3947,26 +3950,29 @@ const app = new Hono<App>({ strict: false })
 	)
 
 	// Subscription lookup (Rec Room Plus, the client's `CampusCard`). There is no store to
-	// buy one from, so the `developer` role stands in for a paid subscription: a developer
-	// reports an active Gold year, everyone else reports none. Nothing is stored — see
-	// `developerSubscription`.
+	// buy one from: Plus is claimed on the website by proving a Discord role, and reaches
+	// this worker as the token's `rn.plus` claim. A caller carrying it reports an active
+	// Gold year; everyone else reports none. Nothing about the subscription itself is
+	// stored, and nothing here reads the database — see `isSubscriber` and `plusSubscription`.
 	//
 	// Auth is OPTIONAL, and a missing or invalid token answers "no subscription" rather than
 	// 401: the client posts this while loading, so an error here can stall its load
 	// orchestration, and "you aren't subscribed" is the truthful answer for an anonymous
-	// caller anyway. The role is read from the token's `role` claim, never from the body.
+	// caller anyway. Never read from the body.
 	.post(
 		'/api/CampusCard/v1/UpdateAndGetSubscription',
 		describeRoute({
 			tags: ['Econ'],
 			summary: 'Subscription lookup',
 			description: [
-				'The caller’s Rec Room Plus subscription. Nothing sells subscriptions here, so the',
-				'operator-granted `developer` role stands in for one: a developer’s token reports an',
-				'active Gold (`Level` 0) yearly (`Period` 1) subscription on `PlatformType` -1 (All),',
-				'expiring a year from the call, and every other caller gets `{}`. Auth is optional —',
-				'a missing or invalid token reads as “not subscribed”, not 401. Nothing is persisted:',
-				'the role IS the subscription, so revoking it revokes this.',
+				'The caller’s Rec Room Plus subscription. Nothing sells subscriptions here: Plus is',
+				'claimed on the website by proving a qualifying role in the community Discord, and',
+				'arrives as the token’s `rn.plus` claim. A token carrying it reports an active Gold',
+				'(`Level` 0) yearly (`Period` 1) subscription on `PlatformType` -1 (All), expiring a',
+				'year from the call; every other caller gets `{}`. The `developer` role does NOT',
+				'confer it. Auth is optional — a missing or invalid token reads as “not subscribed”,',
+				'not 401. The subscription itself is not persisted, and because the claim is stamped',
+				'at login, a player who has just claimed must sign in again before it appears.',
 			].join(' '),
 			responses: {
 				200: json(SubscriptionResponse, 'The subscription, or `{}` for no subscription'),
@@ -3977,7 +3983,7 @@ const app = new Hono<App>({ strict: false })
 			const id = await authedId(c)
 			if (id === null) return c.json({})
 			return c.json({
-				Subscription: developerSubscription(id),
+				Subscription: plusSubscription(id),
 				PlatformAccountSubscribedPlayerId: null,
 			})
 		}

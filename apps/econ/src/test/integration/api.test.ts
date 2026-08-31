@@ -285,12 +285,21 @@ async function bearer(
 	sub = '42',
 	roles?: string[],
 	/** The client build to stamp as `rn.ver` — omitted, like a token minted before the claim. */
-	version?: string
+	version?: string,
+	/**
+	 * Stamp `rn.plus`, as auth does for an account with `hasPlus`. This is the ONLY thing
+	 * that makes a caller a Rec Room Plus subscriber — the `developer` role does not — so
+	 * every subscriber-priced test passes it.
+	 */
+	plus = false
 ): Promise<Record<string, string>> {
 	const now = Math.floor(Date.now() / 1000)
 	const claims: Record<string, unknown> = { sub, exp: now + 3600 }
 	if (roles !== undefined) claims.role = roles
 	if (version !== undefined) claims['rn.ver'] = version
+	// Omitted when false, exactly as generateToken omits it — so these tokens match the
+	// shape of a real non-subscriber's.
+	if (plus) claims['rn.plus'] = true
 	const signingInput = `${b64url(JSON.stringify({ alg: 'HS256', typ: 'JWT' }))}.${b64url(
 		JSON.stringify(claims)
 	)}`
@@ -1770,7 +1779,7 @@ describe('econ endpoints', () => {
 
 	test('POST /api/storefronts/v2/buyItem charges a subscriber the SubscriberPrices entry', async () => {
 		await drainFrames()
-		const res = await buy2263(await bearer('322', ['gameClient', 'developer']), 85)
+		const res = await buy2263(await bearer('322', ['gameClient'], undefined, true), 85)
 		expect(res.status).toBe(200)
 		expect(((await res.json()) as { Balance: number }).Balance).toBe(-85)
 		const bal = await exports.default.fetch(`${ORIGIN}/api/storefronts/v4/balance/2`, {
@@ -1785,7 +1794,7 @@ describe('econ endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: {
-				...(await bearer('325', ['gameClient', 'developer'])),
+				...(await bearer('325', ['gameClient'], undefined, true)),
 				'Content-Type': 'application/json',
 			},
 			body: JSON.stringify({
@@ -1807,7 +1816,7 @@ describe('econ endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/storefronts/v2/buyItem`, {
 			method: 'POST',
 			headers: {
-				...(await bearer('326', ['gameClient', 'developer'])),
+				...(await bearer('326', ['gameClient'], undefined, true)),
 				'Content-Type': 'application/json',
 			},
 			body: JSON.stringify({
@@ -1828,10 +1837,10 @@ describe('econ endpoints', () => {
 	})
 
 	test('POST /api/storefronts/v2/buyItem 409s a subscriber below the discount band', async () => {
-		const res = await buy2263(await bearer('323', ['gameClient', 'developer']), 84)
+		const res = await buy2263(await bearer('323', ['gameClient'], undefined, true), 84)
 		expect(res.status).toBe(409)
 		// …and above it: a made-up price is a mismatch in either direction.
-		const over = await buy2263(await bearer('323', ['gameClient', 'developer']), 96)
+		const over = await buy2263(await bearer('323', ['gameClient'], undefined, true), 96)
 		expect(over.status).toBe(409)
 	})
 
@@ -3593,7 +3602,9 @@ describe('econ endpoints', () => {
 				"DELETE FROM reward_status WHERE account_id = 83 AND gift_context = 'Dodgeball'"
 			).run()
 			expect((await request('rewardType=PostGameActivity&giftContext=Dodgeball')).status).toBe(200)
-			const latest = (await giftBoxes('83')).findLast((b) => b.GiftContext === 8000 || b.GiftContext === 50)
+			const latest = (await giftBoxes('83')).findLast(
+				(b) => b.GiftContext === 8000 || b.GiftContext === 50
+			)
 			if (i < 3) handed.push(latest?.AvatarItemDesc as string)
 			else expect(latest).toMatchObject({ AvatarItemDesc: '', GiftContext: 50 })
 		}
@@ -3745,7 +3756,7 @@ describe('econ endpoints', () => {
 	})
 
 	test('POST /api/CampusCard/v1/UpdateAndGetSubscription gives a developer a Gold year', async () => {
-		const res = await getSubscription(await bearer('205', ['gameClient', 'developer']))
+		const res = await getSubscription(await bearer('205', ['gameClient'], undefined, true))
 		expect(res.status).toBe(200)
 		const body = (await res.json()) as {
 			Subscription: Record<string, unknown>
@@ -3777,7 +3788,7 @@ describe('econ endpoints', () => {
 	})
 
 	test('POST /api/CampusCard/v1/UpdateAndGetSubscription is {} without the developer role', async () => {
-		// A plain player's token: valid, but no elevated role.
+		// A plain player's token: valid, no elevated role, and no `hasPlus` on the account.
 		expect(await (await getSubscription(await bearer('206', ['gameClient']))).json()).toEqual({})
 		// A token with no `role` claim at all.
 		expect(await (await getSubscription(await bearer('206'))).json()).toEqual({})
@@ -3785,6 +3796,56 @@ describe('econ endpoints', () => {
 		const anon = await getSubscription()
 		expect(anon.status).toBe(200)
 		expect(await anon.json()).toEqual({})
+	})
+
+	// Plus reaches this worker as the token's `rn.plus` claim, which `auth` stamps from
+	// `account.hasPlus` at login. Nothing here reads the account, so this is the whole
+	// mechanism — and the reason a player who claims on the website has to sign in again.
+	//
+	// The token carries only `gameClient`, exactly as a game client's does.
+	test('POST /api/CampusCard/v1/UpdateAndGetSubscription honours the rn.plus claim', async () => {
+		const res = await getSubscription(await bearer('9208', ['gameClient'], undefined, true))
+		expect(res.status).toBe(200)
+		const body = (await res.json()) as { Subscription: Record<string, unknown> }
+		expect(body.Subscription).toMatchObject({
+			SubscriptionId: 1,
+			RecNetPlayerId: 9208,
+			PlatformType: -1,
+			Level: 0,
+			Period: 1,
+			IsAutoRenewing: true,
+		})
+	})
+
+	// The `developer` role used to BE the subscription, as a stand-in while nothing else
+	// could confer one. Now that Plus has a real source it is one thing with one source, and
+	// an elevated account is not a subscriber unless it also holds `rn.plus`. Pinned because
+	// nothing else would fail if the old shortcut came back: it would silently hand Plus (and
+	// the 10% discount) to every operator account.
+	test('the developer role alone is not a Rec Room Plus subscription', async () => {
+		const dev = await getSubscription(await bearer('9210', ['gameClient', 'developer']))
+		expect(dev.status).toBe(200)
+		expect(await dev.json()).toEqual({})
+
+		// …and it buys nothing at the subscriber price either, so the report and the buy path
+		// agree. 85 is the SubscriberPrices entry for sf300's 2263; 95 is the list price.
+		const discounted = await buy2263(await bearer('9211', ['gameClient', 'developer']), 85)
+		expect(discounted.status).toBe(409)
+	})
+
+	// Plus is priced, not just displayed: the same claim gates the subscriber discount band
+	// on a buy. A subscriber whose client applied the discount itself and then had the
+	// purchase refused as a price mismatch is exactly what one definition prevents, so the
+	// CampusCard report and the buy must never disagree.
+	test('an rn.plus token is charged the subscriber price', async () => {
+		const res = await buy2263(await bearer('9326', ['gameClient'], undefined, true), 85)
+		expect(res.status).toBe(200)
+		expect(((await res.json()) as { Balance: number }).Balance).toBe(-85)
+
+		// The same request without the claim is refused, so the discount really comes from
+		// `rn.plus` and not from the band being open to everyone.
+		const plain = await buy2263(await bearer('9327', ['gameClient']), 85)
+		expect(plain.status).toBe(409)
 	})
 
 	test('unknown path returns 404', async () => {
