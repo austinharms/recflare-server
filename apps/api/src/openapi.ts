@@ -666,6 +666,24 @@ export const PublishInventionRequest = z.object({
 		.describe('Price in tokens; null leaves it as it is, and a negative one is ignored'),
 })
 
+/** `POST /api/inventions/v2/delete` JSON body — the id and nothing else. */
+export const DeleteInventionRequest = z.object({
+	InventionId: z.int().describe('The invention to delete; the caller must have created it'),
+})
+
+/**
+ * What `v2/delete` answers — the same `{ Value, Success, Error, error_id }` envelope the
+ * other newer-client invention routes use, with `Value` always null. The invention is
+ * gone, so there is nothing for the client to redraw from: it reads `Success`, and
+ * `Error` when that is false.
+ */
+export const InventionDeleteResult = z.object({
+	Value: z.null().describe('Always null — the invention no longer exists'),
+	Success: z.boolean(),
+	Error: z.string().nullable().describe('The refusal message; null on success'),
+	error_id: z.string().nullable().describe('Always null'),
+})
+
 /** `POST /api/inventions/v1/updateprice` JSON body. */
 export const UpdatePriceRequest = z.object({
 	InventionId: z.int(),

@@ -27,6 +27,7 @@ import {
 import { authedId, unauthorized } from '../http'
 import {
 	createInvention,
+	deleteInvention,
 	getFeaturedInventions,
 	getInventionById,
 	getInventionsByIds,
@@ -37,6 +38,7 @@ import {
 	getMyInventions,
 	getTopInventions,
 	INVENTION_TAG_RESULT,
+	inventionDeleteResult,
 	inventionSaveV9Failure,
 	normalizeInventionTags,
 	ownsAllInventions,
@@ -59,12 +61,14 @@ import {
 	CustomAvatarItemReportRequest,
 	CustomAvatarItemResponse,
 	CustomAvatarItemsPage,
+	DeleteInventionRequest,
 	ErrorResponse,
 	form,
 	GeneratedGift,
 	GenerateGiftRequest,
 	idParam,
 	intQuery,
+	InventionDeleteResult,
 	InventionDetails,
 	InventionDto,
 	InventionPersonalDetails,
@@ -2028,5 +2032,65 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			})
 			if (published === null) return c.json(inventionSaveV9Failure('No such invention'))
 			return c.json(toSaveResultV9(published, published.Tags ?? []))
+		}
+	)
+
+	// Delete an invention. The newer client's shape: a POST with a PascalCase body
+	// carrying nothing but the id. Auth-gated, creator only — the only thing that may
+	// remove an invention is the account that made it, not a co-owner and not a buyer.
+	//
+	// The record and everything inside it (versions, tags, referenced-invention lists)
+	// go in one DELETE; the data blob in R2 and the `inventory_invention` rows of
+	// players who bought it are left alone. See `deleteInvention` for why.
+	.post(
+		'/api/inventions/v2/delete',
+		describeRoute({
+			tags: ['Inventions'],
+			summary: 'Delete an invention',
+			description:
+				'Creator only — a buyer or a co-owner cannot delete someone else’s invention. ' +
+				'The record goes entirely: its versions, tags and referenced-invention lists live ' +
+				'in the same row.\n\n' +
+				'What survives is deliberate. The data blob stays in storage, because nothing ' +
+				'here knows whether another record still points at that filename. The ownership ' +
+				'rows of players who bought it stay too — a delete must not rewrite what someone ' +
+				'else paid for — and they fall out of every list on their own, since an owned id ' +
+				'with no invention row behind it is skipped.\n\n' +
+				'Answers the `{ Value, Success, Error, error_id }` envelope the other v2+ ' +
+				'invention routes use, with `Value` NULL: the invention is gone, so there is ' +
+				'nothing to redraw from and the client reads only `Success`. Refusals — an ' +
+				'unknown invention and someone else’s alike — are `Success: false` with a ' +
+				'message, not a bare error body that client cannot parse.',
+			security: AUTHED,
+			requestBody: jsonBody(DeleteInventionRequest, 'The invention to delete'),
+			responses: {
+				200: json(InventionDeleteResult, 'The delete envelope, `Value` null either way'),
+				401: json(InventionDeleteResult, 'The same envelope, refused — not an empty body'),
+			},
+		}),
+		async (c) => {
+			const body = (await c.req.json().catch(() => null)) as Record<string, unknown> | null
+			if (body === null) return c.json(inventionDeleteResult('Invalid request body'))
+
+			// The id rides in the body, as it does on `v2/metadata` and `v4/publish`.
+			const gate = await creatorsInventionResult(
+				c,
+				typeof body.InventionId === 'number' ? body.InventionId : Number.NaN
+			)
+			// As on those two: only a missing token is a transport failure. An unknown
+			// invention or someone else's is a domain answer the client reads out of the
+			// envelope, where the message reaches a human.
+			if ('rejection' in gate) {
+				return gate.status === 401
+					? c.json(inventionDeleteResult(gate.rejection), 401)
+					: c.json(inventionDeleteResult(gate.rejection))
+			}
+
+			// The gate already loaded the row, so a null here is a race — someone deleted it
+			// between the two reads — and lands where the client would put it anyway: gone.
+			const deleted = await deleteInvention(c.env.DB, gate.invention.InventionId)
+			return c.json(
+				deleted === null ? inventionDeleteResult('No such invention') : inventionDeleteResult()
+			)
 		}
 	)

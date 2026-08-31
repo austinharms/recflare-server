@@ -2365,6 +2365,147 @@ describe('public endpoints', () => {
 		})
 	})
 
+	test('POST /api/inventions/v2/delete removes the creator’s invention', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5180')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({
+				name: 'Delete Me',
+				inventionDataFilename: 'delete-me.inv',
+				tagsRequest: { AutoTags: ['small'], CustomTags: null },
+			}),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+		expect(inventionId).toBeGreaterThan(0)
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5180')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId }),
+		})
+		expect(res.status).toBe(200)
+		// `Value` is null even on success — there is no invention left to redraw from.
+		expect(await res.json()).toEqual({ Value: null, Success: true, Error: null, error_id: null })
+
+		// Gone from the read and from the creator's shelf.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect(one.status).toBe(404)
+		const mine = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+			headers: await bearer('5180'),
+		})
+		expect(((await mine.json()) as SavedInvention[]).map((i) => i.InventionId)).not.toContain(
+			inventionId
+		)
+
+		// And the row itself, tags and all, rather than a hidden record still taking the id.
+		const row = await env.DB.prepare('SELECT COUNT(*) AS n FROM invention WHERE id = ?1')
+			.bind(inventionId)
+			.first<{ n: number }>()
+		expect(row?.n).toBe(0)
+
+		// Deleting it twice is a refusal, not a second success: the id resolves to nothing.
+		const again = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5180')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId }),
+		})
+		expect(await again.json()).toEqual({
+			Value: null,
+			Success: false,
+			Error: 'No such invention',
+			error_id: null,
+		})
+	})
+
+	test('POST /api/inventions/v2/delete refuses anyone but the creator, in-band', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5181')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Not Yours To Bin', inventionDataFilename: 'not-yours.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+
+		// 5182 BOUGHT it — owning a copy is still not the right to delete it.
+		await grantInvention(env.DB, 5182, inventionId as number)
+		const theirs = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5182')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId }),
+		})
+		expect(theirs.status).toBe(200)
+		expect(await theirs.json()).toEqual({
+			Value: null,
+			Success: false,
+			Error: 'Not your invention',
+			error_id: null,
+		})
+
+		const missing = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5181')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: 987_655 }),
+		})
+		expect(missing.status).toBe(200)
+		expect(await missing.json()).toEqual({
+			Value: null,
+			Success: false,
+			Error: 'No such invention',
+			error_id: null,
+		})
+
+		// A missing token is the one refusal that stays a transport failure — and it still
+		// answers the envelope rather than a bare error body.
+		const anon = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId }),
+		})
+		expect(anon.status).toBe(401)
+		expect(await anon.json()).toMatchObject({ Value: null, Success: false })
+
+		// Still there throughout.
+		const one = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
+		)
+		expect(one.status).toBe(200)
+	})
+
+	test('POST /api/inventions/v2/delete leaves a buyer’s ownership row behind', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5183')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Sold Then Binned', inventionDataFilename: 'sold.inv' }),
+		})
+		const inventionId = ((await save.json()) as InventionSaveV9Result).Value?.Invention
+			.InventionId as number
+		await grantInvention(env.DB, 5184, inventionId)
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5183')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId }),
+		})
+		expect((await res.json()) as { Success: boolean }).toMatchObject({ Success: true })
+
+		// The purchase record is not rewritten by someone else's delete...
+		const owned = await env.DB.prepare(
+			'SELECT COUNT(*) AS n FROM inventory_invention WHERE invention_id = ?1'
+		)
+			.bind(inventionId)
+			.first<{ n: number }>()
+		expect(owned?.n).toBe(1)
+
+		// ...but with no invention row behind it, it drops out of the buyer's shelf anyway.
+		const mine = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+			headers: await bearer('5184'),
+		})
+		expect(((await mine.json()) as SavedInvention[]).map((i) => i.InventionId)).not.toContain(
+			inventionId
+		)
+	})
+
 	test('GET /api/inventions/v2/mine lists bought inventions alongside the caller’s own', async () => {
 		// Account 6100 creates one; 6101 buys it (the econ worker's buyInvention writes
 		// exactly this row) and also creates one of their own.
@@ -6874,6 +7015,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
+			'POST /api/inventions/v2/delete',
 			'POST /api/inventions/v4/publish',
 			'POST /api/inventions/v6/save',
 			'POST /api/inventions/v9/save',

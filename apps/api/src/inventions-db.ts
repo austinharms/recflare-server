@@ -973,6 +973,55 @@ export async function setInventionPrice(
 	return updated
 }
 
+/**
+ * Delete an invention (`v2/delete`), returning the record that was removed, or null
+ * when there's no such row. The whole invention lives in the one JSON blob, so its
+ * versions, tags and referenced-invention lists go with it in a single DELETE.
+ *
+ * Two things are deliberately LEFT behind.
+ *
+ * The data blob in R2 stays: it is named by the file the creator uploaded through the
+ * `storage` worker, and nothing here knows whether another record still points at that
+ * name (a converted invention carries the same lineage, and a save that reuses a
+ * filename reuses the object). An orphan blob costs storage; a missing one breaks
+ * whatever still references it.
+ *
+ * The `inventory_invention` rows stay too — deleting a creator's invention must not
+ * rewrite what other players bought. They already fall out of every list on their own:
+ * `getMyInventions` resolves owned ids against this table and an id with no row left
+ * simply drops out, and `ownsAllInventions` reads a missing row as not-owned. Purging
+ * them would also erase the acquisition history that ranks the "top today" feed.
+ */
+export async function deleteInvention(
+	db: D1Database,
+	inventionId: number
+): Promise<SavedInvention | null> {
+	const invention = await getInventionById(db, inventionId)
+	if (invention === null) return null
+	await db.prepare('DELETE FROM invention WHERE id = ?1').bind(inventionId).run()
+	return invention
+}
+
+/**
+ * What `v2/delete` answers: the same `{ Value, Success, Error, error_id }` envelope the
+ * other newer-client invention routes use, with `Value` always NULL — the invention is
+ * gone, so there is nothing for the client to redraw from and it reads only `Success`
+ * (and `Error`, the one string that reaches a human). This is why the delete does not
+ * borrow {@link InventionSaveV9Result}: that envelope's `Value` carries an invention the
+ * client dereferences, and a delete has none to give.
+ */
+export interface InventionDeleteResult {
+	Value: null
+	Success: boolean
+	Error: string | null
+	error_id: string | null
+}
+
+/** The delete envelope: a refusal when given a message, success when given null. */
+export function inventionDeleteResult(error: string | null = null): InventionDeleteResult {
+	return { Value: null, Success: error === null, Error: error, error_id: null }
+}
+
 /** The tag filter chips the client offers when browsing inventions. */
 export interface InventionTagFilters {
 	PinnedFilters: string[]
