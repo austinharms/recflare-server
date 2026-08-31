@@ -1091,7 +1091,7 @@ function Stage({
 				    trademark stays out of the headline and appears lower down, in
 				    plain nominative use next to the disclaimer. */}
 				<h1 className="stage-title">
-					Play like it&apos;s <em>2023</em>.
+					Play <em>today</em>!
 				</h1>
 				<p className="stage-lede">
 					The servers you remember, rebuilt and running — free, open source, and up right now.
@@ -1186,7 +1186,7 @@ function About({ slides, error }: { slides: Slide[] | null; error: string }) {
 	return (
 		<section className="about">
 			<div>
-				<h2 className="about-title">An open source rebuild of the 2023 servers</h2>
+				<h2 className="about-title">A cloud architected server for the 2023/2025 game clients</h2>
 				<p className="about-lede">
 					A free fan project, made by players who missed it. Aiming to be{' '}
 					<strong>feature-complete</strong> and infinitely scalable —{' '}
