@@ -2,7 +2,7 @@
 
 <img width="1063" height="409" alt="image" src="https://github.com/user-attachments/assets/521d5b11-fb93-4900-9158-71d51d2343ae" />
 
-![example branch parameter](https://github.com/djdevin/recflare/actions/workflows/test.yml/badge.svg?branch=main)
+![badge](https://github.com/djdevin/recflare/actions/workflows/test.yml/badge.svg?branch=main)
 
 RecFlare is a scalable implementation of RecNet — the Rec Room backend — built on
 Cloudflare Workers. It implements the network services the Rec Room client talks
@@ -36,15 +36,24 @@ resulting in bugs getting fixed faster. I hope.
 
 ## Game client
 
-See [RecFlare Client](https://github.com/djdevin/recflare-client)
+See [RecFlare Client](https://github.com/djdevin/recflare-client) for the official RecFlare build.
 
-RecFlare is compatible with the
-[RecNet Plugin](https://github.com/djdevin/recnet-plugin) and the build of Rec
-Room with manifest `7859140924515540835` (around 2023). Other client or game versions may expect
-different endpoints and response shapes and are not supported.
+These game builds are supported:
+
+| Build         | Manifest              | Support                                                                                 |
+| ------------- | --------------------- | --------------------------------------------------------------------------------------- |
+| `20230414`    | `7859140924515540835` | **Default**, official — the 2023 build the rest of the stack targets                    |
+| `20250718.01` | `1151455856673601091` | **Beta**, official — use the [patch-2025](https://github.com/recflare/patch-2025) patch |
+| `20250424.01` |                       | Alpha                                                                                   |
+| `20231207`    |                       | Alpha                                                                                   |
+| `20230616`    |                       | Alpha                                                                                   |
+
+Alpha builds get past the version check and largely work, but nothing else in the
+stack targets them, so expect protocol differences. Other client or game versions
+may expect different endpoints and response shapes and are not supported.
 
 Generally speaking any client that effectively rewrites the nameserver with the
-right mods can be used with this server.
+right mods (see [RecNet Plugin](https://github.com/djdevin/recnet-plugin), [2025 patch](https://github.com/recflare/patch-2025)) can be used with this server.
 
 ## Services
 
@@ -58,9 +67,11 @@ Want to run it yourself? See [DEPLOYING.md](DEPLOYING.md)
 
 ### What year is this for?
 
-This works with 2023 clients. It has been tested with manifest `7859140924515540835`. Other clients may not work.
+Most 2023 and 2025 clients. A few older builds work at
+alpha quality — see the table in the "Game client" section above. Other clients may not
+work.
 
-See the "Client" section above for instructions on how to modify a client to connect to this server.
+See the "Game client" section above for instructions on how to modify a client to connect to this server.
 
 ### Can I run this locally on my PC?
 
@@ -70,11 +81,13 @@ See "Run the development microservices" above. It may be possible later as Wrang
 
 ### Can I use this to make my own server?
 
-Yes, that's the point. Just set your custom domain and deploy it.
+Yes, that's the point. See [DEPLOYING.md](DEPLOYING.md)
 
 ### Is there an admin panel?
 
-Not yet. But there could be.
+Yes, the server comes bundled with a simple web panel with more functionality being added.
+
+There are also [CLI tools](CLI.md) you can use for admin tasks like granting roles.
 
 ### Can I copy this project and modify it?
 
@@ -89,15 +102,20 @@ keeps those in sync: `pnpm` workspaces share dependencies, `@repo/` packages
 share code, Turborepo runs build/test/lint with a single cached task graph, and
 cross-service changes land in one atomic commit.
 
+This makes it easier to deploy the whole stack at once or a smaller selection
+of microservices to avoid downtime events.
+
 ## Credits
 
-I started this after the official servers shut down, so I could only see the
+I started this soon after the official servers shut down when I saw there were
+only monolithic servers usually running on one server. I could only see the
 request shapes coming from the game client. I used many different projects as
 resources to get response shapes, logic examples, enums, etc. They all had
 missing pieces. Again, another reason to come together on one project and
 stop gatekeeping.
 
-Unfortunately, they were all leaked code except for
-[CannedNet](https://github.com/CannedNet/CannedNet), [DorkNet](https://github.com/DorkSquadRR/DorkNet), and jordanparki7's postman
-collection of RecNet APIs which is gone for some reason. So I will not list the
-leaks publicly.
+- [CannedNet](https://github.com/CannedNet/CannedNet)
+- [DorkNet](https://github.com/DorkSquadRR/DorkNet)
+- jordanparki7's postman collection of RecNet APIs which is gone for some reason.
+- Leaked C# projects I won't list (for response shapes)
+- Claude and my [wire shapes skill](https://github.com/recflare/skills/blob/main/.claude/skills/wire-shapes/SKILL.md)
