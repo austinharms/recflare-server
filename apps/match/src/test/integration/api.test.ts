@@ -1247,8 +1247,9 @@ describe('auth-gated endpoints', () => {
 				// The room the client is told to join has to be the one matchmaking placed
 				// them in, or they end up alone in a room of their own.
 				photonRoomId: matchmaked.roomInstance.photonRoomId,
-				// Empty strings, not nulls — unlike the presence payload's connection fields,
-				// which stay null (they never carry credentials).
+				// No TACHYON_HOST_PORT pool configured, so there is no server to name. Empty
+				// strings, not nulls — unlike the presence payload's connection fields, which
+				// stay null (they never carry credentials).
 				voiceConnectionInfo: '',
 				voiceServerId: '',
 				experiments: {
@@ -1375,6 +1376,84 @@ describe('auth-gated endpoints', () => {
 		})
 		const body = (await res.json()) as { value: { photonRoomId: string } }
 		expect(body.value.photonRoomId).toBe('')
+	})
+
+	test('the Tachyon server is assigned per room instance, not per request', async () => {
+		// tachyon-1/-2 and tachyon-4/-5 are slots on one host apiece: a server id names a
+		// slot, which is why it's generated from the entry's position and not from its
+		// address. The blank entry and the stray spaces below are dropped — a list edited
+		// by hand shouldn't hand anyone an empty address.
+		const pool = [
+			{ voiceConnectionInfo: '198.51.100.10:7777', voiceServerId: 'tachyon-1' },
+			{ voiceConnectionInfo: '198.51.100.10:7778', voiceServerId: 'tachyon-2' },
+			{ voiceConnectionInfo: '198.51.100.11:7777', voiceServerId: 'tachyon-3' },
+			{ voiceConnectionInfo: '203.0.113.20:7777', voiceServerId: 'tachyon-4' },
+			{ voiceConnectionInfo: '203.0.113.20:7778', voiceServerId: 'tachyon-5' },
+		]
+		const original = env.TACHYON_HOST_PORT
+		try {
+			env.TACHYON_HOST_PORT =
+				'198.51.100.10:7777, 198.51.100.10:7778 ,,198.51.100.11:7777,203.0.113.20:7777,203.0.113.20:7778'
+
+			const voiceFor = async (player: string, roomInstanceId?: number) => {
+				const res = await exports.default.fetch(
+					roomInstanceId === undefined
+						? `${ORIGIN}/player/connection-info`
+						: `${ORIGIN}/player/connection-info?roomInstanceId=${roomInstanceId}`,
+					{ headers: await bearer(player) }
+				)
+				const body = (await res.json()) as {
+					value: { voiceConnectionInfo: string; voiceServerId: string }
+				}
+				return {
+					voiceConnectionInfo: body.value.voiceConnectionInfo,
+					voiceServerId: body.value.voiceServerId,
+				}
+			}
+
+			// The player who opened the session reads their server off their presence...
+			const instance = await createRoomInstance(env.DB, {
+				ownerAccountId: 970,
+				roomId: 2,
+				photonRoomId: 'tachyon-instance-a',
+				maxCapacity: 12,
+			})
+			await setPresence(env.DB, {
+				accountId: 970,
+				roomInstance: instance,
+				statusVisibility: 0,
+				deviceClass: 0,
+				vrMovementMode: 1,
+				platform: 0,
+				appVersion: GAME_VERSION,
+			})
+			const assigned = pool[instance.roomInstanceId % pool.length]!
+			expect(await voiceFor('970')).toEqual(assigned)
+
+			// ...and a joiner asking by instance id, before their own presence has landed,
+			// is sent to the same one. Two players in a session on two servers is the whole
+			// failure this is arranged to avoid.
+			expect(await voiceFor('971', instance.roomInstanceId)).toEqual(assigned)
+
+			// The next session opened goes to the next server along — instance ids are
+			// sequential, so the pool is walked round-robin as instances are created.
+			const next = await createRoomInstance(env.DB, {
+				ownerAccountId: 972,
+				roomId: 2,
+				photonRoomId: 'tachyon-instance-b',
+				maxCapacity: 12,
+			})
+			expect(next.roomInstanceId).toBe(instance.roomInstanceId + 1)
+			const alongside = await voiceFor('972', next.roomInstanceId)
+			expect(alongside).toEqual(pool[next.roomInstanceId % pool.length])
+			expect(alongside.voiceServerId).not.toBe(assigned.voiceServerId)
+
+			// A player in no instance gets no server, pool or no pool — there is nothing for
+			// them to be on the same server as, and the fields stay empty strings.
+			expect(await voiceFor('973')).toEqual({ voiceConnectionInfo: '', voiceServerId: '' })
+		} finally {
+			env.TACHYON_HOST_PORT = original
+		}
 	})
 
 	test('re-matchmaking into your current room returns a different instance (id must change)', async () => {
@@ -3073,9 +3152,7 @@ describe('auth-gated endpoints', () => {
 
 		// Unauthenticated is a 401, not a refusal code.
 		expect(
-			(
-				await exports.default.fetch(`${ORIGIN}/matchmake/v2/player/8811`, { method: 'POST' })
-			).status
+			(await exports.default.fetch(`${ORIGIN}/matchmake/v2/player/8811`, { method: 'POST' })).status
 		).toBe(401)
 	})
 

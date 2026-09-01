@@ -206,8 +206,9 @@ export const ConnectionExperiments = z.object({
  * recflare; what varies per caller is `photonAuthToken` (minted for them on the spot)
  * and `photonRoomId`, the Photon room of the instance their presence says they're in
  * — the same name every other player in that instance is handed. The voice fields name
- * the Tachyon voice server (`TACHYON_HOST_PORT`/`TACHYON_NAME` vars), empty when none
- * is configured. `photonRegion` matches the one stamped
+ * the Tachyon server that instance was assigned out of the `TACHYON_HOST_PORT` pool —
+ * likewise the same for everyone in the session — and are empty when the pool is unset
+ * or the caller is in no instance. `photonRegion` matches the one stamped
  * on every room instance, so the two can't disagree.
  */
 export const ConnectionInfo = z.object({
@@ -219,8 +220,10 @@ export const ConnectionInfo = z.object({
 	photonRoomId: z.string().describe('The caller’s current instance; empty when they’re in none'),
 	voiceConnectionInfo: z
 		.string()
-		.describe('The Tachyon voice server, `host:port`; empty when none is configured'),
-	voiceServerId: z.string().describe('The Tachyon voice server id; empty when none is configured'),
+		.describe('The instance’s Tachyon server, `host:port`; empty when none is configured'),
+	voiceServerId: z
+		.string()
+		.describe('That server’s generated id (`tachyon-1`, …); cosmetic, empty when there is none'),
 	experiments: ConnectionExperiments,
 })
 

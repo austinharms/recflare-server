@@ -167,6 +167,66 @@ function instancePhotonRegion(env: Env): string {
 }
 
 /**
+ * One Tachyon server this deployment can put a session on: where the client connects
+ * (`host:port`) and the cosmetic id it displays for it.
+ */
+interface TachyonServer {
+	hostPort: string
+	serverId: string
+}
+
+/**
+ * The Tachyon servers sessions are spread across, from `TACHYON_HOST_PORT` — a
+ * comma-separated list of `host:port` entries. EMPTY when the var is unset: recflare
+ * runs no Tachyon server of its own, and a client handed an address that answers
+ * nothing is worse off than one told there is no voice server at all.
+ *
+ * An entry's POSITION in the list is its identity: `voiceServerId` is generated from it
+ * (`tachyon-1`, `tachyon-2`, …) rather than configured, so the same host may appear
+ * twice and count as two servers — which is what one box running several server slots
+ * looks like from here. The id is cosmetic (the client connects to the address and
+ * never sends the id anywhere), but it is positional, so inserting an entry renames
+ * every server after it.
+ */
+function tachyonPool(env: Env): TachyonServer[] {
+	return varOr(env.TACHYON_HOST_PORT, '')
+		.split(',')
+		.map((entry) => entry.trim())
+		.filter((entry) => entry !== '')
+		.map((hostPort, i) => ({ hostPort, serverId: `tachyon-${i + 1}` }))
+}
+
+/** What the connection info carries when there is no Tachyon server to name. */
+const NO_TACHYON_SERVER: TachyonServer = { hostPort: '', serverId: '' }
+
+/**
+ * The Tachyon server a room instance runs on — the whole of the distributed selection,
+ * and deliberately a pure function of the instance id rather than a stored assignment.
+ *
+ * The point of a server assignment is that everyone in one instance is handed the SAME
+ * one: the player whose matchmake created the instance and everyone who joins it later
+ * each call `GET /player/connection-info` separately, so an assignment made per REQUEST
+ * (random, round-robin over a counter, least-loaded) would scatter one session across
+ * the pool. Deriving it from the instance id instead makes every caller compute the same
+ * answer without coordinating, needs no column to persist and no cleanup when the
+ * instance is swept, and answers for instances created before this existed.
+ *
+ * Instance ids are sequential ({@link createRoomInstance} allocates `MAX(id) + 1`), so
+ * the modulo hands successive instances to successive servers: a plain round-robin over
+ * instances, which is the spread a real allocator would aim for anyway. Changing the
+ * pool DOES move live instances — the list is the assignment — so add entries to the
+ * end and expect a session mid-flight to be told a different server when you don't.
+ *
+ * `roomInstanceId` 0 means the caller resolved to no instance at all (they're in no
+ * room, or named one that doesn't exist); they get no server rather than server one.
+ */
+function tachyonServerFor(env: Env, roomInstanceId: number): TachyonServer {
+	const pool = tachyonPool(env)
+	if (pool.length === 0 || roomInstanceId <= 0) return NO_TACHYON_SERVER
+	return pool[roomInstanceId % pool.length] ?? NO_TACHYON_SERVER
+}
+
+/**
  * Networking feature flags the client reads off its connection info. Verbatim from
  * the reference server — the client changes how it replicates based on these, so they
  * are not free to tune. The load-bearing one is `shouldUseGameServerNetworking`:
@@ -2693,6 +2753,10 @@ const app = new Hono<App>()
 	// reads presence and nothing else; we fall back to looking the `roomInstanceId` query
 	// param up when presence has no room (it expires on a TTL, and the client sometimes
 	// asks before matchmaking has landed), and to an empty string when neither resolves.
+	//
+	// The Tachyon server is resolved from the same instance ({@link tachyonServerFor}), so
+	// the player who created the session and everyone who joins it later are all sent to
+	// one server without this endpoint having to remember what it told the first caller.
 	.get(
 		'/player/connection-info',
 		describeRoute({
@@ -2703,9 +2767,11 @@ const app = new Hono<App>()
 				'`{ success, value, error }` envelope: a freshly minted `photonAuthToken`, the',
 				'Photon application ids, and the `photonRoomId` of the instance the caller is in',
 				'(from their presence, falling back to the `roomInstanceId` query param). The voice',
-				'fields carry the Tachyon voice server (`TACHYON_HOST_PORT`/`TACHYON_NAME`),',
-				'empty when none is configured. `experiments` carries the',
-				'client’s networking flags.',
+				'fields name the Tachyon server that instance was assigned — one entry out of the',
+				'`TACHYON_HOST_PORT` pool, chosen by instance id so every player in a session is',
+				'handed the same one, with a generated `voiceServerId` (`tachyon-1`, `tachyon-2`,',
+				'…). Both are empty when the pool is unset or the caller is in no instance.',
+				'`experiments` carries the client’s networking flags.',
 			].join(' '),
 			security: AUTHED,
 			parameters: [
@@ -2729,14 +2795,22 @@ const app = new Hono<App>()
 			const apps = photonApps(c.env)
 			const presence = await getPresence<RoomInstance>(c.env.DB, id)
 			// Presence first (it's the instance the player is actually in); the query param
-			// only stands in when there's no live presence to read.
+			// only stands in when there's no live presence to read. The instance id travels
+			// with the Photon room because the Tachyon server is derived from it — resolving
+			// one without the other would hand a joiner the right Photon room on a different
+			// game server than the rest of their session.
+			let roomInstanceId = presence?.roomInstance?.roomInstanceId ?? 0
 			let photonRoomId = presence?.roomInstance?.photonRoomId ?? ''
 			if (!photonRoomId) {
 				const requested = Number.parseInt(c.req.query('roomInstanceId') ?? '', 10)
 				if (!Number.isNaN(requested)) {
-					photonRoomId = (await getRoomInstance(c.env.DB, requested))?.photonRoomId ?? ''
+					const instance = await getRoomInstance(c.env.DB, requested)
+					roomInstanceId = instance?.roomInstanceId ?? 0
+					photonRoomId = instance?.photonRoomId ?? ''
 				}
 			}
+			// The instance's server, the same one every other player in it is handed.
+			const tachyon = tachyonServerFor(c.env, roomInstanceId)
 
 			// Identifies the player to Photon. Signed with the shared JWT secret; the token's
 			// `aud` is the realtime app it's for. Nothing verifies it while Photon is
@@ -2758,13 +2832,14 @@ const app = new Hono<App>()
 					photonAuthToken,
 					...apps,
 					photonRoomId,
-					// The Tachyon voice server, from the operator's vars — empty strings when
-					// unset (no separate voice server). Empty rather than null: the client's
+					// The Tachyon server this instance runs on, picked out of the operator's
+					// pool by {@link tachyonServerFor} — empty strings when the pool is empty
+					// or the caller is in no instance. Empty rather than null: the client's
 					// decoder is likelier to accept a missing-value string than a null on a
 					// string field. The presence payload's NULL_CONNECTION_INFO keeps its
 					// nulls — that one never carries credentials.
-					voiceConnectionInfo: varOr(c.env.TACHYON_HOST_PORT, ''),
-					voiceServerId: varOr(c.env.TACHYON_NAME, ''),
+					voiceConnectionInfo: tachyon.hostPort,
+					voiceServerId: tachyon.serverId,
 					experiments: PHOTON_EXPERIMENTS,
 				},
 				error: null,
