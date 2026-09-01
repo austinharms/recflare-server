@@ -119,12 +119,14 @@ export const SuccessErrorEnvelope = z.object({
 
 // ---- Config ----------------------------------------------------------------
 
-/** `GET /api/config/v1/amplitude` — analytics keys (all disabled on this server). */
+/** `GET /api/config/v1/amplitude` — the client's analytics keys (blank; RudderStack and StatSig off). */
 export const AmplitudeConfig = z.object({
 	AmplitudeKey: z.string(),
-	StatSigKey: z.string(),
-	RudderStackKey: z.string(),
 	UseRudderStack: z.boolean(),
+	RudderStackKey: z.string(),
+	UseStatSig: z.boolean(),
+	StatSigKey: z.string(),
+	StatSigEnvironment: z.number().int(),
 })
 
 /** `GET /api/config/v1/azurespeech` — speech-to-text config; `Enabled` is false here. */

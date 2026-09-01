@@ -213,10 +213,12 @@ describe('public endpoints', () => {
 		const res = await exports.default.fetch(`${ORIGIN}/api/config/v1/amplitude`)
 		expect(res.status).toBe(200)
 		expect(await res.json()).toEqual({
-			AmplitudeKey: 'a',
-			StatSigKey: 'a',
-			RudderStackKey: 'a',
+			AmplitudeKey: '',
 			UseRudderStack: false,
+			RudderStackKey: '',
+			UseStatSig: false,
+			StatSigKey: '',
+			StatSigEnvironment: 0,
 		})
 	})
 
