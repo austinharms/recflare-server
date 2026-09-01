@@ -18,6 +18,7 @@ import {
 	getExpiredPresenceInstanceIds,
 	getFriendIds,
 	getJoinableInstance,
+	getLatestRoomInviteBetween,
 	getMostActiveClubhouses,
 	getOrCreateDormRoom,
 	getPresence,
@@ -2110,6 +2111,129 @@ const app = new Hono<App>()
 			// presence, so the heartbeat replays it and their own friend fan-out fires.
 			await enterRoom(c, id, instance)
 			return matchmakeResult(c, 0, instance)
+		}
+	)
+
+	// The newer client's join-by-player (`/matchmake/v2/player/{playerId}`). Same move as
+	// the v1 follow above — land in the instance the target is standing in — but gated on
+	// the `room_invite` table rather than friendship: the caller must hold a standing
+	// invite FROM the target (the newer client's invite frame doesn't always carry a
+	// redeemable `InviteId` — the party fan-out sends 0 — so it redeems by player instead
+	// of by row id, and this is that path). Everything the target sent stays checkable:
+	// the newest row is enough, since any live row is authorization.
+	//
+	// Like the follow and invite paths, this hands out real Photon coordinates without
+	// going through resolveRoomInstance, so it carries its own ban and build checks.
+	// `/matchmake/v2/` answers the PascalCase envelope via `matchmakeResult`, as the v2
+	// room routes do.
+	.post(
+		'/matchmake/v2/player/:playerId{[0-9]+}',
+		describeRoute({
+			tags: ['Navigation', '2025'],
+			summary: 'Join the player who invited you (v2)',
+			description: [
+				'Places the caller into the room instance the target player is currently in, read from',
+				'the target’s stored presence. INVITEES ONLY: the caller must hold a `room_invite` row',
+				'FROM the target (as `POST /invite` writes them) — the newer client redeems an invite by',
+				'its sender when the frame carries no usable `RoomInviteId`. Answers 40',
+				'(RoomInviteExpired) when no invite stands (expiry deletes rows, so “never invited” and',
+				'“expired” are one answer), 2 (PlayerNotOnline) when the target isn’t in a room, 17',
+				'(AlreadyInTargetInstance) when the caller is already standing there, 3',
+				'(InsufficientSpace) when it filled up, and 55 (BannedFromRoom) when the caller is',
+				'banned from that room.',
+				'',
+				'2025-client route: it answers the PascalCase `ErrorCode`/`RoomInstance` envelope, as',
+				'the other `/matchmake/v2/*` routes do.',
+			].join(' '),
+			security: AUTHED,
+			requestBody: form(CorrelationIdRequest, 'The attempt’s CorrelationId'),
+			parameters: [
+				{
+					name: 'playerId',
+					in: 'path',
+					required: true,
+					description: 'The player to join (digits only)',
+					schema: { type: 'string', pattern: '^[0-9]+$' },
+				},
+			],
+			responses: {
+				200: json(
+					MatchmakeV2Response,
+					'The target’s instance, or a null RoomInstance with the refusal code'
+				),
+				401: UNAUTHORIZED_RESPONSE,
+			},
+		}),
+		async (c) => {
+			const id = await authedId(c)
+			if (id === null) return unauthorized(c)
+
+			const targetId = Number.parseInt(c.req.param('playerId'), 10)
+			// The gate: a standing invite from the target to the caller. No row means never
+			// invited or already swept — the same answer either way, since expiry deletes
+			// rows. This also refuses joining yourself: nobody holds a self-invite.
+			const invite = await getLatestRoomInviteBetween(c.env.DB, targetId, id)
+			if (invite === null) {
+				logger.info('v2 player matchmake refused: no invite from target', { targetId, id })
+				return matchmakeResult(c, MatchmakingErrorCode.RoomInviteExpired, null)
+			}
+
+			// Where the inviter is NOW, straight off their presence row — not the invite's
+			// stored RoomId, which records where they were when they sent it.
+			const targetPresence = await getPresence<RoomInstance>(c.env.DB, targetId)
+			const instance = targetPresence?.roomInstance ?? null
+			if (!instance) {
+				logger.info('v2 player matchmake refused: target is not in a room', { targetId, id })
+				return matchmakeResult(c, MatchmakingErrorCode.PlayerNotOnline, null)
+			}
+
+			// Already standing there: nothing to do, and re-entering would churn presence and
+			// re-fire the friend fan-out for a move that didn't happen.
+			const own = await getPresence<RoomInstance>(c.env.DB, id)
+			if (own?.roomInstance?.roomInstanceId === instance.roomInstanceId) {
+				return matchmakeResult(c, MatchmakingErrorCode.AlreadyInTargetInstance, null)
+			}
+
+			// Real Photon coordinates without resolveRoomInstance, so the room's bans have to
+			// be checked here — otherwise an invite is a way around one.
+			if (await isPlayerBannedFromRoom(c.env.DB, instance.roomId, id)) {
+				logger.info('v2 player matchmake refused: player banned from room', {
+					roomId: instance.roomId,
+					id,
+				})
+				return matchmakeResult(c, BANNED_FROM_ROOM, null)
+			}
+
+			// Nor the build scoping a room matchmake has by construction. Compared against the
+			// TARGET's presence — they're the person actually standing in there.
+			const refusal = crossBuildRefusal(
+				await callerGameVersion(c),
+				targetPresence?.appVersion ?? GAME_VERSION
+			)
+			if (refusal !== null) {
+				logger.info('v2 player matchmake refused: target is on another client build', {
+					roomInstanceId: instance.roomInstanceId,
+					targetId,
+					id,
+				})
+				return matchmakeResult(c, refusal, null)
+			}
+
+			// Fullness read fresh, like the invite path: joins off an invite cluster exactly
+			// when a nearly-full instance is still filling. Null means a synthetic instance
+			// with no row (a dorm), which has no head-count to check.
+			if ((await refreshInstanceFullness(c.env.DB, instance.roomInstanceId)) === true) {
+				logger.info('v2 player matchmake refused: instance is full', {
+					roomInstanceId: instance.roomInstanceId,
+					id,
+				})
+				return matchmakeResult(c, MatchmakingErrorCode.InsufficientSpace, null)
+			}
+
+			// Same instance, same Photon room, stored as the caller's presence so their
+			// heartbeat replays it and their own friend fan-out fires.
+			await enterRoom(c, id, instance)
+			return matchmakeResult(c, MatchmakingErrorCode.Success, instance)
 		}
 	)
 

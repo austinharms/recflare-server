@@ -2958,6 +2958,127 @@ describe('auth-gated endpoints', () => {
 		).toBe(401)
 	})
 
+	test('POST /matchmake/v2/player/:id joins the inviter, invite row required', async () => {
+		// 8811 stands in an instance and invites 8812 (writing the room_invite row).
+		const instance = await createRoomInstance(env.DB, {
+			ownerAccountId: 8811,
+			roomId: 2,
+			subRoomId: 2,
+			photonRoomId: crypto.randomUUID(),
+			name: '^RecCenter',
+			maxCapacity: 12,
+		})
+		await setPresence(env.DB, {
+			accountId: 8811,
+			roomInstance: instance,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 1,
+			platform: 0,
+			appVersion: GAME_VERSION,
+		})
+
+		const join = async (targetId: number, sub: string) =>
+			exports.default.fetch(`${ORIGIN}/matchmake/v2/player/${targetId}`, {
+				method: 'POST',
+				headers: {
+					...(await bearer(sub)),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: 'BypassMovementModeRestriction=False&LoginLock=40bacd8f-7c60-4d49-93f9-462b096602de&VoiceServerVersion=gameserver-2&CorrelationId=82c12c19-a3fc-4734-9abc-e912aeb1f351&MaxPersistenceVersion=227&PlayerIsPartyMember=False',
+			})
+
+		// No invite from the target yet → 40, and nothing about their state leaks.
+		expect(await (await join(8811, '8812')).json()).toMatchObject({
+			ErrorCode: 40,
+			RoomInstance: null,
+		})
+
+		await exports.default.fetch(`${ORIGIN}/invite`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('8811')),
+				'Content-Type': 'application/x-www-form-urlencoded',
+			},
+			body: `playerId=8812&roomInstanceId=${instance.roomInstanceId}`,
+		})
+
+		// An invite from a DIFFERENT player doesn't authorize this target: 8813 holds no
+		// invite from 8811.
+		expect(await (await join(8811, '8813')).json()).toMatchObject({
+			ErrorCode: 40,
+			RoomInstance: null,
+		})
+
+		// The invitee lands in the inviter's instance, in the PascalCase v2 envelope with
+		// the CorrelationId echoed back.
+		const ok = await join(8811, '8812')
+		expect(ok.status).toBe(200)
+		const okBody = (await ok.json()) as Record<string, unknown>
+		expect(okBody).toMatchObject({
+			ErrorCode: 0,
+			CorrelationId: '82c12c19-a3fc-4734-9abc-e912aeb1f351',
+			RoomInstance: {
+				RoomInstanceId: instance.roomInstanceId,
+				RoomId: 2,
+				Name: '^RecCenter',
+				MatchmakingPolicy: 0,
+			},
+		})
+		// The exact wire shape, confirmed against the live client: the three-key envelope
+		// and the 15-key v2 instance, nothing extra (no Photon coordinates, no DataBlob).
+		expect(Object.keys(okBody).sort()).toEqual(['CorrelationId', 'ErrorCode', 'RoomInstance'])
+		expect(Object.keys(okBody.RoomInstance as object).sort()).toEqual(
+			[
+				'RoomInstanceId',
+				'RoomId',
+				'SubRoomId',
+				'Location',
+				'EventId',
+				'ClubId',
+				'RoomCode',
+				'Name',
+				'MaxCapacity',
+				'IsFull',
+				'IsPrivate',
+				'IsInProgress',
+				'EncryptVoiceChat',
+				'RoomInstanceType',
+				'MatchmakingPolicy',
+			].sort()
+		)
+
+		// Standing there already is 17, not a second join.
+		expect(await (await join(8811, '8812')).json()).toMatchObject({
+			ErrorCode: 17,
+			RoomInstance: null,
+		})
+
+		// The inviter walking out leaves nothing to join: 2, PlayerNotOnline. (The invitee
+		// is moved out first so the AlreadyIn check doesn't answer ahead of it.)
+		await setPresence(env.DB, {
+			accountId: 8812,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 1,
+			platform: 0,
+			appVersion: GAME_VERSION,
+		})
+		await env.DB.prepare('DELETE FROM presence WHERE account_id = 8811').run()
+		expect(await (await join(8811, '8812')).json()).toMatchObject({
+			ErrorCode: 2,
+			RoomInstance: null,
+		})
+
+		// Unauthenticated is a 401, not a refusal code.
+		expect(
+			(
+				await exports.default.fetch(`${ORIGIN}/matchmake/v2/player/8811`, { method: 'POST' })
+			).status
+		).toBe(401)
+	})
+
 	test('GET /openapi.json documents every route', async () => {
 		const res = await exports.default.fetch(`${ORIGIN}/openapi.json`)
 		expect(res.status).toBe(200)
@@ -2998,6 +3119,7 @@ describe('auth-gated endpoints', () => {
 			'POST /matchmake/player/{playerId}',
 			'POST /matchmake/room/{roomId}',
 			'POST /matchmake/room/{roomId}/{subRoomId}',
+			'POST /matchmake/v2/player/{playerId}',
 			'POST /matchmake/v2/room/{roomId}',
 			'POST /matchmake/v2/room/{roomId}/{subRoomId}',
 			'POST /player/exclusivelogin',
