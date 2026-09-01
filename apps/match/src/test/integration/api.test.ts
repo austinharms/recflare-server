@@ -2914,6 +2914,14 @@ describe('auth-gated endpoints', () => {
 			RoomId: 2,
 		})
 
+		// The fan-out RECORDS each invite, like POST /invite: the row is what the invitee
+		// redeems the frame against, so a frame without one is expired on arrival.
+		const row = await env.DB.prepare(
+			'SELECT room_invite_id, room_id FROM room_invite WHERE from_player_id = 9850 AND to_player_id = 153'
+		).first<{ room_invite_id: number; room_id: number }>()
+		expect(row).not.toBeNull()
+		expect(row?.room_id).toBe(2)
+
 		// Multiple ids (repeated fields, not comma-separated), de-duplicated, and the leader
 		// themselves is skipped.
 		await reset()
@@ -2927,6 +2935,58 @@ describe('auth-gated endpoints', () => {
 		await reset()
 		await matchmake('JoinMode=0')
 		expect(await sent()).toEqual([])
+	})
+
+	test('a v2 party matchmake mints invites the members can actually redeem', async () => {
+		// The reported bug: /matchmake/v2/room/:id fanned the party out as frames with no
+		// `room_invite` row behind them, so the member's join answered 40 (RoomInviteExpired)
+		// while a manual POST /invite worked.
+		type Sent = { playerId: number; data: { Type: number; Data: string } }
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		const res = await exports.default.fetch(`${ORIGIN}/matchmake/v2/room/2`, {
+			method: 'POST',
+			headers: {
+				...(await bearer('9860', '20250718.01')),
+				'Content-Type': 'application/json',
+			},
+			body: JSON.stringify({
+				AdditionalPlayerIds: [9861],
+				CorrelationId: '3c60e657-21c4-46be-815c-57ee51add506',
+				JoinMode: 2,
+				InviteMode: 20,
+			}),
+		})
+		expect(res.status).toBe(200)
+		const leader = (await res.json()) as { RoomInstance: { RoomInstanceId: number } }
+
+		// The party member's frame is a v2 invite naming a REAL row id.
+		const frames = (await (await hub().fetch('http://do/all')).json()) as Sent[]
+		const invite = frames.find((f) => f.playerId === 9861)
+		expect(invite?.data.Type).toBe(6) // MessageType.GameInviteV2
+		const { InviteId } = JSON.parse(invite?.data.Data ?? '{}') as { InviteId: number }
+		expect(InviteId).toBeGreaterThan(0)
+
+		// Redeeming it puts the member in the leader's instance rather than answering 40.
+		const joined = (await (
+			await exports.default.fetch(`${ORIGIN}/matchmake/invite/${InviteId}`, {
+				method: 'POST',
+				headers: { ...(await bearer('9861', '20250718.01')) },
+			})
+		).json()) as { ErrorCode: number; RoomInstance: { RoomInstanceId: number } | null }
+		expect(joined.ErrorCode).toBe(0)
+		expect(joined.RoomInstance?.RoomInstanceId).toBe(leader.RoomInstance.RoomInstanceId)
+
+		// The by-sender redemption the newer client falls back to works off the same row.
+		await env.DB.prepare('DELETE FROM presence WHERE account_id = 9861').run()
+		const bySender = (await (
+			await exports.default.fetch(`${ORIGIN}/matchmake/v2/player/9860`, {
+				method: 'POST',
+				headers: { ...(await bearer('9861', '20250718.01')) },
+			})
+		).json()) as { ErrorCode: number }
+		expect(bySender.ErrorCode).toBe(0)
 	})
 
 	test('POST /matchmake/invite/:id lands the invitee in the inviter’s instance', async () => {

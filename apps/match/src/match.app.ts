@@ -788,14 +788,6 @@ async function gameInviteType(c: Context<App>): Promise<MessageType> {
  */
 const GAME_INVITE_V2_INVITE_MODE = InviteMode.PlayTogether
 
-/**
- * The placeholder `InviteId` on a v2 invite that has no `room_invite` row behind it — the
- * party fan-out, which invites without recording anything. What the client does with the
- * field isn't known yet; `POST /invite` passes the real row id (see {@link RoomInvite}),
- * which is the obvious candidate, and this stands in where there is no row to name.
- */
-const UNKNOWN_INVITE_ID = 0
-
 /** What an invite points at, in the shape both message versions need to describe it. */
 type GameInviteTarget = {
 	/** The raw roomInstanceId string — the WHOLE `Data` of a v1 invite. */
@@ -804,7 +796,7 @@ type GameInviteTarget = {
 	roomId: number | null
 	/** The instance's `^`-prefixed wire name, `''` when the instance didn't resolve. */
 	name: string
-	/** The `room_invite` row this came from, or {@link UNKNOWN_INVITE_ID}. */
+	/** The id of the `room_invite` row this came from — what the invitee redeems. */
 	inviteId: number
 }
 
@@ -1184,6 +1176,12 @@ async function readMatchmakeBody(
  * sends, pointing at this instance, so a party matchmake pulls the whole party along. The
  * leader is skipped (already in). Best-effort per member (sendGameInvite swallows its own
  * failures), and never blocks the matchmake beyond the sends themselves.
+ *
+ * Each member's invite is RECORDED, exactly as `POST /invite` records one, because the row
+ * is what the member redeems the frame against: the 2025 client joins off a party invite
+ * through `/matchmake/invite/{InviteId}` or `/matchmake/v2/player/{leaderId}`, and both
+ * resolve a `room_invite` row. A fan-out that only pushed the frame minted no row, so every
+ * party invite read as expired the moment it arrived while a manual `POST /invite` worked.
  */
 async function inviteParty(
 	c: Context<App>,
@@ -1191,21 +1189,33 @@ async function inviteParty(
 	playerIds: number[],
 	instance: RoomInstance
 ): Promise<void> {
-	// The leader's own instance, which every member is being pulled into. Nothing records
-	// a `room_invite` row on this path, so a v2 invite has no real id to name.
-	const target: GameInviteTarget = {
-		instanceId: String(instance.roomInstanceId),
-		roomId: instance.roomId,
-		name: instance.name,
-		inviteId: UNKNOWN_INVITE_ID,
-	}
 	// One read of the leader's token for the whole party — every member gets the same
 	// message, so the type can't differ between them.
 	const type = await gameInviteType(c)
 	await Promise.all(
 		playerIds
 			.filter((pid) => pid !== leaderId)
-			.map((pid) => sendGameInvite(c, leaderId, pid, target, type))
+			.map(async (pid) => {
+				// The row before the frame, as `POST /invite` does: the frame names the row's id,
+				// so an invite that couldn't be recorded has nothing to redeem and isn't sent.
+				const invite = await createRoomInvite(c.env.DB, leaderId, pid, instance.roomId)
+				if (invite === null) {
+					logger.error('failed to record party room invite', {
+						fromPlayerId: leaderId,
+						toPlayerId: pid,
+						roomId: instance.roomId,
+					})
+					return
+				}
+				// The leader's own instance, which every member is being pulled into.
+				const target: GameInviteTarget = {
+					instanceId: String(instance.roomInstanceId),
+					roomId: instance.roomId,
+					name: instance.name,
+					inviteId: invite.RoomInviteId,
+				}
+				await sendGameInvite(c, leaderId, pid, target, type)
+			})
 	)
 }
 
