@@ -925,7 +925,7 @@
 	},
 	{
 		"Key": "Statsig.Enabled",
-		"Value": "true",
+		"Value": "false",
 		"ActiveExperiments": null,
 		"StartTime": null,
 		"EndTime": null
