@@ -1818,6 +1818,90 @@ describe('rooms endpoints', () => {
 			.run()
 	})
 
+	it('POST/DELETE /rooms/:id/leaderboards/:lid configures and removes a room’s leaderboard slots', async () => {
+		// RecCenter (room 2) is owned by account 1, with account 2 as co-owner.
+		const del = async (path: string, sub?: string) =>
+			SELF.fetch(`${ORIGIN}${path}`, {
+				method: 'DELETE',
+				headers: sub ? await bearer(sub) : {},
+			})
+		const slotsOf = async (roomId: number) =>
+			(
+				await env.DB.prepare(
+					'SELECT leaderboard_id, leaderboard_title, stat_format, sort_ascending FROM room_leaderboard WHERE room_id = ?1 ORDER BY leaderboard_id'
+				)
+					.bind(roomId)
+					.all()
+			).results
+
+		// The real client body, verbatim.
+		const body = { leaderboardTitle: 'full name', statFormat: '1', sortAscending: 'False' }
+
+		// No token → 401 (auth gate).
+		expect((await postForm('/rooms/2/leaderboards/1', body)).status).toBe(401)
+		expect((await del('/rooms/2/leaderboards/1')).status).toBe(401)
+		// A valid token but no role on the room → 403.
+		expect((await postForm('/rooms/2/leaderboards/1', body, '999')).status).toBe(403)
+		expect((await del('/rooms/2/leaderboards/1', '999')).status).toBe(403)
+		// The envelope both routes answer — PascalCase `Success`/`Error`, lowercase
+		// `error_id`, no entity. NOT the room mutations' lowercase `{ success, error, value }`.
+		const OK = { Success: true, Error: null, error_id: null }
+
+		// Unknown room → failure envelope.
+		expect(await (await postForm('/rooms/99999/leaderboards/1', body, '1')).json()).toEqual({
+			Success: false,
+			Error: 'This room does not exist!',
+			error_id: null,
+		})
+
+		// The owner configures slot 1 — a bare success, with the row persisted.
+		const ok = await postForm('/rooms/2/leaderboards/1', body, '1')
+		expect(ok.status).toBe(200)
+		expect(await ok.json()).toEqual(OK)
+		expect(await slotsOf(2)).toEqual([
+			{ leaderboard_id: 1, leaderboard_title: 'full name', stat_format: 1, sort_ascending: 0 },
+		])
+
+		// Re-posting the slot reconfigures the one row rather than appending — and the
+		// co-owner may do it. `sortAscending=True` parses case-insensitively.
+		const rewrite = await postForm(
+			'/rooms/2/leaderboards/1',
+			{ leaderboardTitle: 'lap time', statFormat: '2', sortAscending: 'True' },
+			'2'
+		)
+		expect(rewrite.status).toBe(200)
+		expect(await rewrite.json()).toEqual(OK)
+		expect(await slotsOf(2)).toEqual([
+			{ leaderboard_id: 1, leaderboard_title: 'lap time', stat_format: 2, sort_ascending: 1 },
+		])
+
+		// Slots are per room: slot 2 here and slot 1 of another room are their own rows.
+		expect((await postForm('/rooms/2/leaderboards/2', body, '1')).status).toBe(200)
+		expect((await postForm('/rooms/3/leaderboards/1', body, '1')).status).toBe(200)
+		expect(await slotsOf(2)).toHaveLength(2)
+		expect(await slotsOf(3)).toHaveLength(1)
+
+		// DELETE removes exactly the named slot.
+		const removed = await del('/rooms/2/leaderboards/1', '1')
+		expect(removed.status).toBe(200)
+		expect(await removed.json()).toEqual(OK)
+		expect(await slotsOf(2)).toEqual([
+			{ leaderboard_id: 2, leaderboard_title: 'full name', stat_format: 1, sort_ascending: 0 },
+		])
+		expect(await slotsOf(3)).toHaveLength(1)
+
+		// Deleting a slot that isn't configured is a rejection, not an HTTP error — the
+		// client tears boards down by deleting every slot blindly.
+		expect(await (await del('/rooms/2/leaderboards/1', '1')).json()).toEqual({
+			Success: false,
+			Error: 'This room has no such leaderboard!',
+			error_id: null,
+		})
+
+		// Clean up the surviving rows so this test leaves no trace.
+		await env.DB.prepare('DELETE FROM room_leaderboard WHERE room_id IN (2, 3)').run()
+	})
+
 	it('POST /rooms/:id/bans kicks the banned player', async () => {
 		type Sent = { playerId: number; notificationType: string | number; data: unknown }
 		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
@@ -3972,6 +4056,7 @@ describe('rooms endpoints', () => {
 			'DELETE /rooms/{roomId}/bans/{playerId}',
 			'DELETE /rooms/{roomId}/interactionby/me/cheer',
 			'DELETE /rooms/{roomId}/interactionby/me/favorite',
+			'DELETE /rooms/{roomId}/leaderboards/{leaderboardId}',
 			'DELETE /rooms/{roomId}/subrooms/{subRoomId}',
 			'GET /',
 			'GET /Room_server/rooms/{roomId}/bans/{playerId}/isBanned',
@@ -4010,6 +4095,7 @@ describe('rooms endpoints', () => {
 			'POST /rooms/bulk',
 			'POST /rooms/{roomId}/bans',
 			'POST /rooms/{roomId}/clone',
+			'POST /rooms/{roomId}/leaderboards/{leaderboardId}',
 			'POST /rooms/{roomId}/subrooms',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/clone',
 			'POST /rooms/{roomId}/subrooms/{subRoomId}/data',

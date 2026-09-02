@@ -103,6 +103,21 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		PRIMARY KEY (room_id, banned_player_id)
 	)`,
 	`CREATE INDEX IF NOT EXISTS idx_room_ban_player ON room_ban (banned_player_id)`,
+	// Per-room leaderboard definitions (migrations/0016_room_leaderboard.sql). One row per
+	// (room, leaderboard): `leaderboard_id` is the client's slot number — small ordinals
+	// (1, 2, 3…), unique only within the room — so the pair is the key, and re-posting a
+	// slot reconfigures it in place rather than appending.
+	//
+	// Deliberately NOT in the room's `data` blob, same reasoning as `room_ban`: the blob is
+	// served verbatim as the room and the client doesn't read leaderboards off it.
+	`CREATE TABLE IF NOT EXISTS room_leaderboard (
+		room_id INTEGER NOT NULL,
+		leaderboard_id INTEGER NOT NULL,
+		leaderboard_title TEXT NOT NULL,
+		stat_format INTEGER NOT NULL DEFAULT 0,
+		sort_ascending INTEGER NOT NULL DEFAULT 0,
+		PRIMARY KEY (room_id, leaderboard_id)
+	)`,
 ]
 
 /**
@@ -284,6 +299,75 @@ export async function isPlayerBannedFromRoom(
 		.bind(roomId, playerId)
 		.first<{ hit: number }>()
 	return row !== null
+}
+
+/** A room's leaderboard definition — one configured slot (`leaderboard_id` is per-room). */
+export interface RoomLeaderboard {
+	RoomId: number
+	LeaderboardId: number
+	LeaderboardTitle: string
+	StatFormat: number
+	SortAscending: boolean
+}
+
+interface RoomLeaderboardRow {
+	room_id: number
+	leaderboard_id: number
+	leaderboard_title: string
+	stat_format: number
+	sort_ascending: number
+}
+
+const toRoomLeaderboard = (row: RoomLeaderboardRow): RoomLeaderboard => ({
+	RoomId: row.room_id,
+	LeaderboardId: row.leaderboard_id,
+	LeaderboardTitle: row.leaderboard_title,
+	StatFormat: row.stat_format,
+	SortAscending: row.sort_ascending === 1,
+})
+
+/**
+ * Create or reconfigure one of a room's leaderboard slots, returning the stored
+ * definition. One row per (room, leaderboard): re-posting a slot rewrites its title,
+ * format and direction rather than appending a second row, so the call is idempotent.
+ */
+export async function setRoomLeaderboard(
+	db: D1Database,
+	roomId: number,
+	leaderboardId: number,
+	leaderboardTitle: string,
+	statFormat: number,
+	sortAscending: boolean
+): Promise<RoomLeaderboard> {
+	const row = await db
+		.prepare(
+			`INSERT INTO room_leaderboard (room_id, leaderboard_id, leaderboard_title, stat_format, sort_ascending)
+			 VALUES (?1, ?2, ?3, ?4, ?5)
+			 ON CONFLICT(room_id, leaderboard_id) DO UPDATE SET
+				 leaderboard_title = ?3, stat_format = ?4, sort_ascending = ?5
+			 RETURNING *`
+		)
+		.bind(roomId, leaderboardId, leaderboardTitle, statFormat, sortAscending ? 1 : 0)
+		.first<RoomLeaderboardRow>()
+	// RETURNING always yields the upserted row.
+	return toRoomLeaderboard(row!)
+}
+
+/**
+ * Remove one of a room's leaderboard slots, returning the definition that was removed —
+ * or null when the slot wasn't configured, which lets the caller tell a real delete
+ * from a no-op.
+ */
+export async function deleteRoomLeaderboard(
+	db: D1Database,
+	roomId: number,
+	leaderboardId: number
+): Promise<RoomLeaderboard | null> {
+	const row = await db
+		.prepare('DELETE FROM room_leaderboard WHERE room_id = ?1 AND leaderboard_id = ?2 RETURNING *')
+		.bind(roomId, leaderboardId)
+		.first<RoomLeaderboardRow>()
+	return row ? toRoomLeaderboard(row) : null
 }
 
 /**
