@@ -30,5 +30,8 @@ The example stores all server data in `./data` volume, and expects your ssl `ser
 | RECFLARE_ECON_INSPECT_PORT | 9230                   | econ app wrangler inspect port                          |  
 | RECFLARE_IMG_APP_PORT      | 8789                   | img app server port                                     |  
 | RECFLARE_IMG_INSPECT_PORT  | 9231                   | img app wrangler inspect port                           |  
-
 **Bold** Options are **Required**
+
+Additional `.env` options can passed to the `entrypoint.sh` script.  
+Ex: `--var RECFLARE_MAX_ACCOUNTS_PER_PLATFORM_ID:"5"`  
+See [.env.example](../.env.example) for all available options.
