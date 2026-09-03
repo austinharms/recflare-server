@@ -33,7 +33,7 @@ envsubst '$RECFALRE_DOMAIN $RECFALRE_PORT $RECFALRE_SSL_CRT $RECFALRE_SSL_KEY $R
 # due to using wrangler dev scheduled items don't run, curl the schedule endpoint periodically to run the scheduled items
 exec concurrently --raw --kill-others-on-fail \
     'nginx -c "$(pwd)/docker/nginx.conf" -g "daemon off;"' \
-    'cd apps/mono && pnpm wrangler dev --var NAME:"mono" --port "$RECFLARE_MONO_APP_PORT" --inspector-port "$RECFLARE_MONO_INSPECT_PORT" --var DOMAIN:"$RECFALRE_DOMAIN" --var SUBDOMAINS:"{\"moderation\":\"api\"}"' \
-    'cd apps/econ && pnpm wrangler dev --var NAME:"econ" --port "$RECFLARE_ECON_APP_PORT" --inspector-port "$RECFLARE_ECON_INSPECT_PORT" --var DOMAIN:"$RECFALRE_DOMAIN"' \
-    'cd apps/img && pnpm wrangler dev --var NAME:"img" --port "$RECFLARE_IMG_APP_PORT" --inspector-port "$RECFLARE_IMG_INSPECT_PORT" --var DOMAIN:"$RECFALRE_DOMAIN"' \
+    'cd apps/mono && pnpm wrangler dev --var NAME:"mono" --port "$RECFLARE_MONO_APP_PORT" --inspector-port "$RECFLARE_MONO_INSPECT_PORT" --var DOMAIN:"$RECFALRE_DOMAIN" --var SUBDOMAINS:"{\"moderation\":\"api\"}" $@' \
+    'cd apps/econ && pnpm wrangler dev --var NAME:"econ" --port "$RECFLARE_ECON_APP_PORT" --inspector-port "$RECFLARE_ECON_INSPECT_PORT" --var DOMAIN:"$RECFALRE_DOMAIN" $@' \
+    'cd apps/img && pnpm wrangler dev --var NAME:"img" --port "$RECFLARE_IMG_APP_PORT" --inspector-port "$RECFLARE_IMG_INSPECT_PORT" --var DOMAIN:"$RECFALRE_DOMAIN" $@' \
     'sleep 30; while true; do curl --silent "http://localhost:$RECFLARE_MONO_APP_PORT/cdn-cgi/handler/scheduled"; sleep 300; done'
